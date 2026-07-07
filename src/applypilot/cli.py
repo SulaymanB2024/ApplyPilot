@@ -147,7 +147,17 @@ def apply(
     limit: Optional[int] = typer.Option(None, "--limit", "-l", help="Max applications to submit."),
     workers: int = typer.Option(1, "--workers", "-w", help="Number of parallel browser workers."),
     min_score: int = typer.Option(7, "--min-score", help="Minimum fit score for job selection."),
-    model: str = typer.Option("haiku", "--model", "-m", help="Claude model name."),
+    model: Optional[str] = typer.Option(None, "--model", "-m", help="Override agent executor model."),
+    agent_backend: Optional[str] = typer.Option(
+        None,
+        "--agent-backend",
+        help="Agent runner backend: claude or codex. Defaults to APPLYPILOT_AGENT_BACKEND or claude.",
+    ),
+    supervisor_model: Optional[str] = typer.Option(
+        None,
+        "--supervisor-model",
+        help="Supervisor model label written into the deterministic harness contract.",
+    ),
     continuous: bool = typer.Option(False, "--continuous", "-c", help="Run forever, polling for new jobs."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Preview actions without submitting."),
     headless: bool = typer.Option(False, "--headless", help="Run browsers in headless mode."),
@@ -164,7 +174,7 @@ def apply(
     from applypilot.config import check_tier, PROFILE_PATH as _profile_path
     from applypilot.database import get_connection
 
-    # --- Utility modes (no Chrome/Claude needed) ---
+    # --- Utility modes (no Chrome/agent needed) ---
 
     if mark_applied:
         from applypilot.apply.launcher import mark_job
@@ -185,9 +195,26 @@ def apply(
         return
 
     # --- Full apply mode ---
+    if agent_backend and agent_backend not in {"claude", "codex"}:
+        console.print("[red]Invalid --agent-backend.[/red] Choose: claude, codex")
+        raise typer.Exit(code=1)
 
-    # Check 1: Tier 3 required (Claude Code CLI + Chrome)
+    # Check 1: Tier 3 required (agent CLI + Chrome)
     check_tier(3, "auto-apply")
+
+    import shutil
+    from applypilot.apply.harness import load_settings as load_harness_settings
+    harness_settings = load_harness_settings(
+        agent_backend=agent_backend,
+        executor_model=model,
+        supervisor_model=supervisor_model,
+    )
+    if not shutil.which(harness_settings.agent_backend):
+        console.print(
+            f"[red]Missing {harness_settings.agent_backend} executable for selected "
+            f"--agent-backend {harness_settings.agent_backend}.[/red]"
+        )
+        raise typer.Exit(code=1)
 
     # Check 2: Profile exists
     if not _profile_path.exists():
@@ -210,24 +237,77 @@ def apply(
             )
             raise typer.Exit(code=1)
 
+    if (
+        not gen
+        and harness_settings.agent_backend == "codex"
+        and harness_settings.deterministic_controller
+    ):
+        from applypilot.apply.onepassword import (
+            OnePasswordClient,
+            OnePasswordError,
+            choose_chrome_profile_for_extension,
+        )
+
+        if (
+            headless
+            and harness_settings.onepassword_enabled
+            and harness_settings.allow_account_creation
+        ):
+            console.print(
+                "[red]Headless mode is not supported with 1Password-backed account creation.[/red]\n"
+                "Run without [bold]--headless[/bold] so the 1Password extension can operate."
+            )
+            raise typer.Exit(code=1)
+
+        if harness_settings.onepassword_enabled and harness_settings.allow_account_creation:
+            try:
+                OnePasswordClient(vault=harness_settings.onepassword_vault).require_ready()
+            except OnePasswordError as exc:
+                console.print(f"[red]1Password is not ready:[/red] {exc}")
+                raise typer.Exit(code=1)
+
+            profile_name = choose_chrome_profile_for_extension(
+                extension_id=harness_settings.onepassword_extension_id
+            )
+            if not profile_name:
+                console.print(
+                    "[red]1Password Chrome extension not found in any local Chrome profile.[/red]\n"
+                    "Install/unlock the extension, or set APPLYPILOT_CHROME_PROFILE_DIRECTORY "
+                    "to a profile that contains it."
+                )
+                raise typer.Exit(code=1)
+            console.print(f"[dim]1Password Chrome profile: {profile_name}[/dim]")
+
     if gen:
-        from applypilot.apply.launcher import gen_prompt, BASE_CDP_PORT
+        from applypilot.apply.launcher import gen_prompt
         target = url or ""
         if not target:
             console.print("[red]--gen requires --url to specify which job.[/red]")
             raise typer.Exit(code=1)
-        prompt_file = gen_prompt(target, min_score=min_score, model=model)
+        prompt_file = gen_prompt(
+            target,
+            min_score=min_score,
+            model=model,
+            agent_backend=agent_backend,
+            supervisor_model=supervisor_model,
+        )
         if not prompt_file:
             console.print("[red]No matching job found for that URL.[/red]")
             raise typer.Exit(code=1)
         mcp_path = _profile_path.parent / ".mcp-apply-0.json"
         console.print(f"[green]Wrote prompt to:[/green] {prompt_file}")
-        console.print(f"\n[bold]Run manually:[/bold]")
-        console.print(
-            f"  claude --model {model} -p "
-            f"--mcp-config {mcp_path} "
-            f"--permission-mode bypassPermissions < {prompt_file}"
-        )
+        console.print("\n[bold]Run manually:[/bold]")
+        if harness_settings.agent_backend == "codex":
+            console.print(
+                f"  codex exec --model {harness_settings.executor_model} "
+                f"--sandbox danger-full-access --ephemeral --cd {prompt_file.parent} < {prompt_file}"
+            )
+        else:
+            console.print(
+                f"  claude --model {harness_settings.executor_model} -p "
+                f"--mcp-config {mcp_path} "
+                f"--permission-mode bypassPermissions < {prompt_file}"
+            )
         return
 
     from applypilot.apply.launcher import main as apply_main
@@ -237,7 +317,9 @@ def apply(
     console.print("\n[bold blue]Launching Auto-Apply[/bold blue]")
     console.print(f"  Limit:    {'unlimited' if continuous else effective_limit}")
     console.print(f"  Workers:  {workers}")
-    console.print(f"  Model:    {model}")
+    console.print(f"  Backend:  {harness_settings.agent_backend}")
+    console.print(f"  Model:    {harness_settings.executor_model}")
+    console.print(f"  Supervisor: {harness_settings.supervisor_model}")
     console.print(f"  Headless: {headless}")
     console.print(f"  Dry run:  {dry_run}")
     if url:
@@ -250,6 +332,8 @@ def apply(
         min_score=min_score,
         headless=headless,
         model=model,
+        agent_backend=agent_backend,
+        supervisor_model=supervisor_model,
         dry_run=dry_run,
         continuous=continuous,
         workers=workers,
@@ -333,12 +417,104 @@ def dashboard() -> None:
 
 
 @app.command()
+def training_audit(
+    json_output: bool = typer.Option(False, "--json", help="Print the raw audit and manifest as JSON."),
+) -> None:
+    """Audit apply-agent training coverage for job boards, Workday, Runway, and email drafts."""
+    from applypilot.apply.prompt import build_training_manifest
+    from applypilot.apply.training_audit import audit_training_manifest
+
+    manifest = build_training_manifest()
+    audit = audit_training_manifest(manifest)
+
+    if json_output:
+        console.print_json(data={"audit": audit, "manifest": manifest})
+        if not audit["passed"]:
+            raise typer.Exit(code=1)
+        return
+
+    console.print()
+    console.print("[bold]ApplyPilot Training Audit[/bold]\n")
+
+    table = Table(title="Training Coverage", show_header=True, header_style="bold cyan")
+    table.add_column("Check", style="bold")
+    table.add_column("Status", justify="center")
+    table.add_column("Detail")
+
+    def status(ok: bool) -> str:
+        return "[green]PASS[/green]" if ok else "[red]FAIL[/red]"
+
+    missing_capabilities = audit["missing_capabilities"]
+    table.add_row(
+        "Capabilities",
+        status(not missing_capabilities),
+        "All required boundaries present"
+        if not missing_capabilities
+        else "Missing: " + ", ".join(missing_capabilities),
+    )
+
+    missing_scenarios = audit["missing_scenarios"]
+    table.add_row(
+        "Scenarios",
+        status(not missing_scenarios),
+        "Workday, email-only, Runway, aggregator, native, and external ATS drills present"
+        if not missing_scenarios
+        else "Missing: " + ", ".join(missing_scenarios),
+    )
+
+    table.add_row(
+        "Runway",
+        status(audit["has_runway_source"]),
+        audit["runway_url"] if audit["has_runway_source"] else "Missing Runway smart-extract source",
+    )
+    table.add_row(
+        "Email draft",
+        status(audit["email_draft_artifact_ok"]),
+        audit["email_draft_artifact"],
+    )
+
+    missing_result_codes = audit["missing_result_codes"]
+    table.add_row(
+        "Result codes",
+        status(not missing_result_codes),
+        "APPLIED, EMAIL_DRAFT, and FAILED contracts present"
+        if not missing_result_codes
+        else "Missing: " + ", ".join(missing_result_codes),
+    )
+
+    board_detail = f"{audit['configured_jobspy_boards']} configured JobSpy board(s)"
+    if audit["jobspy_boards_without_rules"]:
+        board_detail += "; missing specific rules: " + ", ".join(audit["jobspy_boards_without_rules"])
+    table.add_row(
+        "JobSpy boards",
+        "[yellow]WARN[/yellow]" if audit["jobspy_boards_without_rules"] else "[green]PASS[/green]",
+        board_detail,
+    )
+
+    table.add_row(
+        "Smart sources",
+        "[green]PASS[/green]" if audit["smart_extract_source_count"] else "[red]FAIL[/red]",
+        (
+            f"{audit['smart_extract_source_count']} total; "
+            f"{audit['search_source_count']} search, {audit['static_source_count']} static"
+        ),
+    )
+    table.add_row("Manual ATS", "[green]PASS[/green]", f"{audit['manual_ats_count']} configured domain(s)")
+
+    console.print(table)
+    console.print()
+
+    if not audit["passed"]:
+        raise typer.Exit(code=1)
+
+
+@app.command()
 def doctor() -> None:
     """Check your setup and diagnose missing requirements."""
     import shutil
     from applypilot.config import (
         load_env, PROFILE_PATH, RESUME_PATH, RESUME_PDF_PATH,
-        SEARCH_CONFIG_PATH, ENV_PATH, get_chrome_path,
+        SEARCH_CONFIG_PATH, ENV_PATH, get_chrome_path, get_secret,
     )
 
     load_env()
@@ -370,18 +546,18 @@ def doctor() -> None:
     else:
         results.append(("searches.yaml", warn_mark, "Will use example config — run 'applypilot init'"))
 
-    # jobspy (discovery dep installed separately)
+    # jobspy (optional discovery extra)
     try:
         import jobspy  # noqa: F401
         results.append(("python-jobspy", ok_mark, "Job board scraping available"))
     except ImportError:
         results.append(("python-jobspy", warn_mark,
-                        "pip install --no-deps python-jobspy && pip install pydantic tls-client requests markdownify regex"))
+                        "Install discovery extra: pip install 'applypilot[discovery]'"))
 
     # --- Tier 2 checks ---
     import os
-    has_gemini = bool(os.environ.get("GEMINI_API_KEY"))
-    has_openai = bool(os.environ.get("OPENAI_API_KEY"))
+    has_gemini = bool(get_secret("GEMINI_API_KEY"))
+    has_openai = bool(get_secret("OPENAI_API_KEY"))
     has_local = bool(os.environ.get("LLM_URL"))
     if has_gemini:
         model = os.environ.get("LLM_MODEL", "gemini-2.0-flash")
@@ -393,16 +569,23 @@ def doctor() -> None:
         results.append(("LLM API key", ok_mark, f"Local: {os.environ.get('LLM_URL')}"))
     else:
         results.append(("LLM API key", fail_mark,
-                        "Set GEMINI_API_KEY in ~/.applypilot/.env (run 'applypilot init')"))
+                        f"Set GEMINI_API_KEY in {ENV_PATH} or OS keyring (run 'applypilot init')"))
 
     # --- Tier 3 checks ---
-    # Claude Code CLI
+    # Agent CLIs
     claude_bin = shutil.which("claude")
     if claude_bin:
         results.append(("Claude Code CLI", ok_mark, claude_bin))
     else:
-        results.append(("Claude Code CLI", fail_mark,
-                        "Install from https://claude.ai/code (needed for auto-apply)"))
+        results.append(("Claude Code CLI", warn_mark,
+                        "Install from https://claude.ai/code for Claude backend"))
+
+    codex_bin = shutil.which("codex")
+    if codex_bin:
+        results.append(("Codex CLI", ok_mark, codex_bin))
+    else:
+        results.append(("Codex CLI", warn_mark,
+                        "Install Codex CLI for codex backend"))
 
     # Chrome
     try:
@@ -421,12 +604,83 @@ def doctor() -> None:
                         "Install Node.js 18+ from nodejs.org (needed for auto-apply)"))
 
     # CapSolver (optional)
-    capsolver = os.environ.get("CAPSOLVER_API_KEY")
+    capsolver = get_secret("CAPSOLVER_API_KEY")
     if capsolver:
         results.append(("CapSolver API key", ok_mark, "CAPTCHA solving enabled"))
     else:
         results.append(("CapSolver API key", "[dim]optional[/dim]",
-                        "Set CAPSOLVER_API_KEY in .env for CAPTCHA solving"))
+                        "Set CAPSOLVER_API_KEY in .env or OS keyring for CAPTCHA solving"))
+
+    from applypilot.apply.harness import load_settings
+    harness_settings = load_settings()
+    codex_settings = load_settings(agent_backend="codex")
+    results.append(("Harness backend", ok_mark, harness_settings.agent_backend))
+    results.append(("Executor model", ok_mark, harness_settings.executor_model))
+    results.append(("Supervisor model", ok_mark, harness_settings.supervisor_model))
+    results.append((
+        "Deterministic controller",
+        ok_mark if harness_settings.deterministic_controller else warn_mark,
+        "enabled" if harness_settings.deterministic_controller else "disabled",
+    ))
+
+    if codex_bin:
+        if codex_settings.executor_model == "gpt-5.5":
+            results.append(("Codex model readiness", ok_mark, "configured for gpt-5.5"))
+        else:
+            results.append((
+                "Codex model readiness",
+                warn_mark,
+                f"configured for {codex_settings.executor_model}; gpt-5.5 is recommended",
+            ))
+
+    from applypilot.apply.onepassword import (
+        OnePasswordClient,
+        OnePasswordError,
+        chrome_profiles_with_extension,
+        choose_chrome_profile_for_extension,
+    )
+
+    op_bin = shutil.which("op")
+    if op_bin:
+        try:
+            OnePasswordClient(vault=harness_settings.onepassword_vault).require_ready()
+            results.append(("1Password CLI", ok_mark, f"{op_bin} (signed in)"))
+        except OnePasswordError as exc:
+            results.append(("1Password CLI", fail_mark, str(exc)))
+    elif harness_settings.onepassword_enabled:
+        results.append(("1Password CLI", fail_mark, "Install 1Password CLI `op` and run `op signin`"))
+    else:
+        results.append(("1Password CLI", warn_mark, "disabled by APPLYPILOT_ONEPASSWORD_ENABLED=0"))
+
+    profiles = chrome_profiles_with_extension(
+        extension_id=harness_settings.onepassword_extension_id
+    )
+    selected_profile = choose_chrome_profile_for_extension(
+        extension_id=harness_settings.onepassword_extension_id
+    )
+    if selected_profile:
+        results.append((
+            "1Password extension",
+            ok_mark,
+            f"profile {selected_profile}; found in {', '.join(profiles)}",
+        ))
+    elif harness_settings.onepassword_enabled:
+        results.append((
+            "1Password extension",
+            fail_mark,
+            f"Chrome extension {harness_settings.onepassword_extension_id} not found",
+        ))
+    else:
+        results.append(("1Password extension", warn_mark, "disabled"))
+
+    if harness_settings.onepassword_enabled and harness_settings.allow_account_creation:
+        results.append((
+            "Headless apply",
+            warn_mark,
+            "disabled for 1Password-backed account creation",
+        ))
+    else:
+        results.append(("Headless apply", ok_mark, "available"))
 
     # --- Render results ---
     console.print()
@@ -446,9 +700,9 @@ def doctor() -> None:
 
     if tier == 1:
         console.print("[dim]  → Tier 2 unlocks: scoring, tailoring, cover letters (needs LLM API key)[/dim]")
-        console.print("[dim]  → Tier 3 unlocks: auto-apply (needs Claude Code CLI + Chrome + Node.js)[/dim]")
+        console.print("[dim]  → Tier 3 unlocks: auto-apply (needs agent CLI + Chrome + Node.js)[/dim]")
     elif tier == 2:
-        console.print("[dim]  → Tier 3 unlocks: auto-apply (needs Claude Code CLI + Chrome + Node.js)[/dim]")
+        console.print("[dim]  → Tier 3 unlocks: auto-apply (needs agent CLI + Chrome + Node.js)[/dim]")
 
     console.print()
 

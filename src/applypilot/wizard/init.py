@@ -1,6 +1,6 @@
 """ApplyPilot first-time setup wizard.
 
-Interactive flow that creates ~/.applypilot/ with:
+Interactive flow that creates the ApplyPilot data directory with:
   - resume.txt (and optionally resume.pdf)
   - profile.json
   - searches.yaml
@@ -13,7 +13,6 @@ import json
 import shutil
 from pathlib import Path
 
-import typer
 from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Confirm, Prompt
@@ -26,9 +25,20 @@ from applypilot.config import (
     RESUME_PDF_PATH,
     SEARCH_CONFIG_PATH,
     ensure_dirs,
+    set_secret,
 )
 
 console = Console()
+
+
+def _secret_env_line(name: str, value: str, label: str) -> str | None:
+    """Store a secret in keyring when possible; otherwise return .env line."""
+    if Confirm.ask(f"Store {label} in the OS keyring instead of .env?", default=True):
+        if set_secret(name, value):
+            console.print(f"[green]{label} saved to OS keyring.[/green]")
+            return None
+        console.print("[yellow]OS keyring unavailable. Saving to .env instead.[/yellow]")
+    return f"{name}={value}"
 
 
 # ---------------------------------------------------------------------------
@@ -101,7 +111,7 @@ def _setup_profile() -> dict:
         "github_url": Prompt.ask("GitHub URL (optional)", default=""),
         "portfolio_url": Prompt.ask("Portfolio URL (optional)", default=""),
         "website_url": Prompt.ask("Personal website URL (optional)", default=""),
-        "password": Prompt.ask("Job site password (used for login walls during auto-apply)", password=True, default=""),
+        "password": "",
     }
 
     # -- Work Authorization --
@@ -257,12 +267,16 @@ def _setup_ai_features() -> None:
     if provider == "gemini":
         api_key = Prompt.ask("Gemini API key (from aistudio.google.com)")
         model = Prompt.ask("Model", default="gemini-2.0-flash")
-        env_lines.append(f"GEMINI_API_KEY={api_key}")
+        secret_line = _secret_env_line("GEMINI_API_KEY", api_key, "Gemini API key")
+        if secret_line:
+            env_lines.append(secret_line)
         env_lines.append(f"LLM_MODEL={model}")
     elif provider == "openai":
         api_key = Prompt.ask("OpenAI API key")
         model = Prompt.ask("Model", default="gpt-4o-mini")
-        env_lines.append(f"OPENAI_API_KEY={api_key}")
+        secret_line = _secret_env_line("OPENAI_API_KEY", api_key, "OpenAI API key")
+        if secret_line:
+            env_lines.append(secret_line)
         env_lines.append(f"LLM_MODEL={model}")
     elif provider == "local":
         url = Prompt.ask("Local LLM endpoint URL", default="http://localhost:8080/v1")
@@ -280,44 +294,48 @@ def _setup_ai_features() -> None:
 # ---------------------------------------------------------------------------
 
 def _setup_auto_apply() -> None:
-    """Configure autonomous job application (requires Claude Code CLI)."""
+    """Configure autonomous job application (requires an agent CLI)."""
     console.print(Panel(
         "[bold]Step 5: Auto-Apply (optional)[/bold]\n"
         "ApplyPilot can autonomously fill and submit job applications\n"
-        "using Claude Code as the browser agent."
+        "using an agent CLI as the browser executor."
     ))
 
     if not Confirm.ask("Enable autonomous job applications?", default=True):
         console.print("[dim]You can apply manually using the tailored resumes ApplyPilot generates.[/dim]")
         return
 
-    # Check for Claude Code CLI
+    # Check for agent CLI
     if shutil.which("claude"):
         console.print("[green]Claude Code CLI detected.[/green]")
+    elif shutil.which("codex"):
+        console.print("[green]Codex CLI detected.[/green]")
     else:
         console.print(
-            "[yellow]Claude Code CLI not found on PATH.[/yellow]\n"
-            "Install it from: [bold]https://claude.ai/code[/bold]\n"
-            "Auto-apply won't work until Claude Code is installed."
+            "[yellow]No supported agent CLI found on PATH.[/yellow]\n"
+            "Install Claude Code or Codex CLI.\n"
+            "Auto-apply won't work until an agent CLI is installed."
         )
 
     # Optional: CapSolver for CAPTCHAs
     console.print("\n[dim]Some job sites use CAPTCHAs. CapSolver can handle them automatically.[/dim]")
     if Confirm.ask("Configure CapSolver API key? (optional)", default=False):
         capsolver_key = Prompt.ask("CapSolver API key")
-        # Append to existing .env or create
-        if ENV_PATH.exists():
-            existing = ENV_PATH.read_text(encoding="utf-8")
-            if "CAPSOLVER_API_KEY" not in existing:
-                ENV_PATH.write_text(
-                    existing.rstrip() + f"\nCAPSOLVER_API_KEY={capsolver_key}\n",
-                    encoding="utf-8",
-                )
-        else:
-            ENV_PATH.write_text(f"# ApplyPilot configuration\nCAPSOLVER_API_KEY={capsolver_key}\n", encoding="utf-8")
-        console.print("[green]CapSolver key saved.[/green]")
+        secret_line = _secret_env_line("CAPSOLVER_API_KEY", capsolver_key, "CapSolver API key")
+        if secret_line:
+            # Append to existing .env or create
+            if ENV_PATH.exists():
+                existing = ENV_PATH.read_text(encoding="utf-8")
+                if "CAPSOLVER_API_KEY" not in existing:
+                    ENV_PATH.write_text(
+                        existing.rstrip() + f"\n{secret_line}\n",
+                        encoding="utf-8",
+                    )
+            else:
+                ENV_PATH.write_text(f"# ApplyPilot configuration\n{secret_line}\n", encoding="utf-8")
+            console.print("[green]CapSolver key saved.[/green]")
     else:
-        console.print("[dim]Skipped. Add CAPSOLVER_API_KEY to .env later if needed.[/dim]")
+        console.print("[dim]Skipped. Add CAPSOLVER_API_KEY to .env or OS keyring later if needed.[/dim]")
 
 
 # ---------------------------------------------------------------------------
@@ -356,7 +374,7 @@ def run_wizard() -> None:
     _setup_ai_features()
     console.print()
 
-    # Step 5: Auto-apply (Claude Code detection)
+    # Step 5: Auto-apply (agent CLI detection)
     _setup_auto_apply()
     console.print()
 
@@ -380,7 +398,7 @@ def run_wizard() -> None:
     if tier == 1:
         unlock_hint = "\n[dim]To unlock Tier 2: configure an LLM API key (re-run [bold]applypilot init[/bold]).[/dim]"
     elif tier == 2:
-        unlock_hint = "\n[dim]To unlock Tier 3: install Claude Code CLI + Chrome.[/dim]"
+        unlock_hint = "\n[dim]To unlock Tier 3: install an agent CLI + Chrome.[/dim]"
 
     console.print(
         Panel.fit(

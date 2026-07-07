@@ -14,6 +14,7 @@ import time
 from pathlib import Path
 
 from applypilot import config
+from applypilot.apply.onepassword import DEFAULT_EXTENSION_ID, choose_chrome_profile_for_extension
 
 logger = logging.getLogger(__name__)
 
@@ -186,14 +187,21 @@ def _suppress_restore_nag(profile_dir: Path) -> None:
 # Chrome launch / kill
 # ---------------------------------------------------------------------------
 
-def launch_chrome(worker_id: int, port: int | None = None,
-                  headless: bool = False) -> subprocess.Popen:
+def launch_chrome(
+    worker_id: int,
+    port: int | None = None,
+    headless: bool = False,
+    profile_directory: str | None = None,
+    onepassword_extension_id: str = DEFAULT_EXTENSION_ID,
+) -> subprocess.Popen:
     """Launch a Chrome instance with remote debugging for a worker.
 
     Args:
         worker_id: Numeric worker identifier.
         port: CDP port. Defaults to BASE_CDP_PORT + worker_id.
         headless: Run Chrome in headless mode (no visible window).
+        profile_directory: Chrome profile directory inside the user-data root.
+        onepassword_extension_id: Extension id used for automatic profile choice.
 
     Returns:
         subprocess.Popen handle for the Chrome process.
@@ -210,12 +218,17 @@ def launch_chrome(worker_id: int, port: int | None = None,
     _suppress_restore_nag(profile_dir)
 
     chrome_exe = config.get_chrome_path()
+    launch_profile = (
+        profile_directory
+        or choose_chrome_profile_for_extension(profile_dir, onepassword_extension_id)
+        or config.get_chrome_profile_directory()
+    )
 
     cmd = [
         chrome_exe,
         f"--remote-debugging-port={port}",
         f"--user-data-dir={profile_dir}",
-        "--profile-directory=Default",
+        f"--profile-directory={launch_profile}",
         "--no-first-run",
         "--no-default-browser-check",
         "--window-size=1024,768",

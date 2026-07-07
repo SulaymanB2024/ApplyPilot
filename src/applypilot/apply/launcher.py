@@ -1,7 +1,7 @@
-"""Apply orchestration: acquire jobs, spawn Claude Code sessions, track results.
+"""Apply orchestration: acquire jobs, spawn agent sessions, track results.
 
 This is the main entry point for the apply pipeline. It pulls jobs from
-the database, launches Chrome + Claude Code for each one, parses the
+the database, launches Chrome + an agent executor for each one, parses the
 result, and updates the database. Supports parallel workers via --workers.
 """
 
@@ -25,7 +25,7 @@ from rich.live import Live
 
 from applypilot import config
 from applypilot.database import get_connection
-from applypilot.apply import chrome, dashboard, prompt as prompt_mod
+from applypilot.apply import harness, prompt as prompt_mod
 from applypilot.apply.chrome import (
     launch_chrome, cleanup_worker, kill_all_chrome,
     reset_worker_dir, cleanup_on_exit, _kill_process_tree,
@@ -49,7 +49,7 @@ POLL_INTERVAL = config.DEFAULTS["poll_interval"]
 # Thread-safe shutdown coordination
 _stop_event = threading.Event()
 
-# Track active Claude Code processes for skip (Ctrl+C) handling
+# Track active agent processes for skip (Ctrl+C) handling
 _claude_procs: dict[int, subprocess.Popen] = {}
 _claude_lock = threading.Lock()
 
@@ -125,7 +125,7 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                 params.extend(blocked_sites)
             url_clauses = ""
             if blocked_patterns:
-                url_clauses = " ".join(f"AND url NOT LIKE ?" for _ in blocked_patterns)
+                url_clauses = " ".join("AND url NOT LIKE ?" for _ in blocked_patterns)
                 params.extend(blocked_patterns)
             row = conn.execute(f"""
                 SELECT url, title, site, application_url, tailored_resume_path,
@@ -211,8 +211,10 @@ def release_lock(url: str) -> None:
 # ---------------------------------------------------------------------------
 
 def gen_prompt(target_url: str, min_score: int = 7,
-               model: str = "sonnet", worker_id: int = 0) -> Path | None:
-    """Generate a prompt file and print the Claude CLI command for manual debugging.
+               model: str | None = None, worker_id: int = 0,
+               agent_backend: str | None = None,
+               supervisor_model: str | None = None) -> Path | None:
+    """Generate a prompt file and print the agent CLI command for manual debugging.
 
     Returns:
         Path to the generated prompt file, or None if no job found.
@@ -228,7 +230,13 @@ def gen_prompt(target_url: str, min_score: int = 7,
     if txt_path and txt_path.exists():
         resume_text = txt_path.read_text(encoding="utf-8")
 
+    settings = harness.load_settings(
+        agent_backend=agent_backend,
+        executor_model=model,
+        supervisor_model=supervisor_model,
+    )
     prompt = prompt_mod.build_prompt(job=job, tailored_resume=resume_text)
+    prompt = f"{harness.prompt_header(settings)}\n\n{prompt}"
 
     # Release the lock so the job stays available
     release_lock(job["url"])
@@ -238,6 +246,11 @@ def gen_prompt(target_url: str, min_score: int = 7,
     site_slug = (job.get("site") or "unknown")[:20].replace(" ", "_")
     prompt_file = config.LOG_DIR / f"prompt_{site_slug}_{job['title'][:30].replace(' ', '_')}.txt"
     prompt_file.write_text(prompt, encoding="utf-8")
+    training_manifest_path = prompt_file.with_name(f"{prompt_file.stem}_training_manifest.json")
+    training_manifest_path.write_text(
+        json.dumps(prompt_mod.build_training_manifest(), indent=2),
+        encoding="utf-8",
+    )
 
     # Write MCP config for reference
     port = BASE_CDP_PORT + worker_id
@@ -290,19 +303,112 @@ def reset_failed() -> int:
     return cursor.rowcount
 
 
+def _run_deterministic_job(
+    job: dict,
+    port: int,
+    worker_id: int,
+    settings: harness.HarnessSettings,
+    dry_run: bool,
+) -> tuple[str, int]:
+    """Run the code-first Codex apply controller for one job."""
+    from applypilot.apply.controller import run_deterministic_controller
+
+    mcp_config_path = config.APP_DIR / f".mcp-apply-{worker_id}.json"
+    mcp_config_path.write_text(json.dumps(_make_mcp_config(port)), encoding="utf-8")
+
+    worker_dir = reset_worker_dir(worker_id)
+    controller_plan_path = worker_dir / "deterministic_controller_plan.json"
+    controller_plan_path.write_text(
+        json.dumps(
+            {
+                "mode": "deterministic_controller",
+                "codex_fallback_model": settings.executor_model,
+                "dry_run": dry_run,
+                "job_url": job.get("application_url") or job.get("url"),
+                "account_creation_allowed": settings.allow_account_creation,
+                "onepassword_enabled": settings.onepassword_enabled,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    training_manifest_path = worker_dir / "apply_training_manifest.json"
+    training_manifest_path.write_text(
+        json.dumps(prompt_mod.build_training_manifest(), indent=2),
+        encoding="utf-8",
+    )
+    contract_path = harness.write_contract(
+        worker_dir=worker_dir,
+        worker_id=worker_id,
+        port=port,
+        job=job,
+        settings=settings,
+        prompt_path=controller_plan_path,
+        mcp_config_path=mcp_config_path,
+        training_manifest_path=training_manifest_path,
+    )
+
+    update_state(worker_id, status="applying", job_title=job["title"],
+                 company=job.get("site", ""), score=job.get("fit_score", 0),
+                 start_time=time.time(), actions=0, last_action="deterministic controller")
+    add_event(f"[W{worker_id}] Deterministic controller: {job['title'][:40]} @ {job.get('site', '')}")
+
+    result = run_deterministic_controller(
+        job=job,
+        port=port,
+        worker_dir=worker_dir,
+        settings=settings,
+        dry_run=dry_run,
+    )
+    elapsed = max(result.duration_ms // 1000, 0)
+    status = result.launcher_status()
+    update_state(worker_id, status=result.status, last_action=f"{status} ({elapsed}s)")
+    add_event(f"[W{worker_id}] {status.upper()} ({elapsed}s): {job['title'][:30]}")
+
+    worker_log = config.LOG_DIR / f"worker-{worker_id}.log"
+    with open(worker_log, "a", encoding="utf-8") as lf:
+        lf.write(
+            f"\n{'=' * 60}\n"
+            f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {job['title']} @ {job.get('site', '')}\n"
+            f"URL: {job.get('application_url') or job['url']}\n"
+            f"Agent: deterministic-controller / {settings.executor_model}\n"
+            f"Contract: {contract_path}\n"
+            f"Result: {status}\n"
+            f"Artifacts: {json.dumps(result.artifacts, indent=2)}\n"
+            f"Evidence: {json.dumps(result.evidence, indent=2)}\n"
+        )
+    return status, result.duration_ms
+
+
 # ---------------------------------------------------------------------------
 # Per-job execution
 # ---------------------------------------------------------------------------
 
 def run_job(job: dict, port: int, worker_id: int = 0,
-            model: str = "sonnet", dry_run: bool = False) -> tuple[str, int]:
-    """Spawn a Claude Code session for one job application.
+            model: str | None = None, dry_run: bool = False,
+            agent_backend: str | None = None,
+            supervisor_model: str | None = None) -> tuple[str, int]:
+    """Spawn an agent session for one job application.
 
     Returns:
         Tuple of (status_string, duration_ms). Status is one of:
         'applied', 'expired', 'captcha', 'login_issue',
         'failed:reason', or 'skipped'.
     """
+    settings = harness.load_settings(
+        agent_backend=agent_backend,
+        executor_model=model,
+        supervisor_model=supervisor_model,
+    )
+    if settings.agent_backend == "codex" and settings.deterministic_controller:
+        return _run_deterministic_job(
+            job=job,
+            port=port,
+            worker_id=worker_id,
+            settings=settings,
+            dry_run=dry_run,
+        )
+
     # Read tailored resume text
     resume_path = job.get("tailored_resume_path")
     txt_path = Path(resume_path).with_suffix(".txt") if resume_path else None
@@ -316,38 +422,70 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         tailored_resume=resume_text,
         dry_run=dry_run,
     )
+    agent_prompt = f"{harness.prompt_header(settings)}\n\n{agent_prompt}"
 
     # Write per-worker MCP config
     mcp_config_path = config.APP_DIR / f".mcp-apply-{worker_id}.json"
     mcp_config_path.write_text(json.dumps(_make_mcp_config(port)), encoding="utf-8")
-
-    # Build claude command
-    cmd = [
-        "claude",
-        "--model", model,
-        "-p",
-        "--mcp-config", str(mcp_config_path),
-        "--permission-mode", "bypassPermissions",
-        "--no-session-persistence",
-        "--disallowedTools", (
-            "mcp__gmail__draft_email,mcp__gmail__modify_email,"
-            "mcp__gmail__delete_email,mcp__gmail__download_attachment,"
-            "mcp__gmail__batch_modify_emails,mcp__gmail__batch_delete_emails,"
-            "mcp__gmail__create_label,mcp__gmail__update_label,"
-            "mcp__gmail__delete_label,mcp__gmail__get_or_create_label,"
-            "mcp__gmail__list_email_labels,mcp__gmail__create_filter,"
-            "mcp__gmail__list_filters,mcp__gmail__get_filter,"
-            "mcp__gmail__delete_filter"
-        ),
-        "--output-format", "stream-json",
-        "--verbose", "-",
-    ]
 
     env = os.environ.copy()
     env.pop("CLAUDECODE", None)
     env.pop("CLAUDE_CODE_ENTRYPOINT", None)
 
     worker_dir = reset_worker_dir(worker_id)
+    prompt_path = worker_dir / "input_prompt.md"
+    prompt_path.write_text(agent_prompt, encoding="utf-8")
+    training_manifest_path = worker_dir / "apply_training_manifest.json"
+    training_manifest_path.write_text(
+        json.dumps(prompt_mod.build_training_manifest(), indent=2),
+        encoding="utf-8",
+    )
+    contract_path = harness.write_contract(
+        worker_dir=worker_dir,
+        worker_id=worker_id,
+        port=port,
+        job=job,
+        settings=settings,
+        prompt_path=prompt_path,
+        mcp_config_path=mcp_config_path,
+        training_manifest_path=training_manifest_path,
+    )
+
+    codex_output_path = worker_dir / "codex-last-message.txt"
+    if settings.agent_backend == "claude":
+        cmd = [
+            "claude",
+            "--model", settings.executor_model,
+            "-p",
+            "--mcp-config", str(mcp_config_path),
+            "--permission-mode", "bypassPermissions",
+            "--no-session-persistence",
+            "--disallowedTools", (
+                "mcp__gmail__send_email,mcp__gmail__reply_email,"
+                "mcp__gmail__forward_email,"
+                "mcp__gmail__draft_email,mcp__gmail__modify_email,"
+                "mcp__gmail__delete_email,mcp__gmail__download_attachment,"
+                "mcp__gmail__batch_modify_emails,mcp__gmail__batch_delete_emails,"
+                "mcp__gmail__create_label,mcp__gmail__update_label,"
+                "mcp__gmail__delete_label,mcp__gmail__get_or_create_label,"
+                "mcp__gmail__list_email_labels,mcp__gmail__create_filter,"
+                "mcp__gmail__list_filters,mcp__gmail__get_filter,"
+                "mcp__gmail__delete_filter"
+            ),
+            "--output-format", "stream-json",
+            "--verbose", "-",
+        ]
+    else:
+        cmd = [
+            "codex",
+            "exec",
+            "--model", settings.executor_model,
+            "--sandbox", "danger-full-access",
+            "--ephemeral",
+            "--cd", str(worker_dir),
+            "--output-last-message", str(codex_output_path),
+            "-",
+        ]
 
     update_state(worker_id, status="applying", job_title=job["title"],
                  company=job.get("site", ""), score=job.get("fit_score", 0),
@@ -361,6 +499,9 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         f"[{ts_header}] {job['title']} @ {job.get('site', '')}\n"
         f"URL: {job.get('application_url') or job['url']}\n"
         f"Score: {job.get('fit_score', 'N/A')}/10\n"
+        f"Agent: {settings.agent_backend} / {settings.executor_model}\n"
+        f"Supervisor: {settings.supervisor_model} ({settings.supervisor_poll_seconds}s poll)\n"
+        f"Contract: {contract_path}\n"
         f"{'=' * 60}\n"
     )
 
@@ -445,6 +586,9 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         returncode = proc.returncode
         proc = None
 
+        if settings.agent_backend == "codex" and codex_output_path.exists():
+            text_parts.append(codex_output_path.read_text(encoding="utf-8"))
+
         if returncode and returncode < 0:
             return "skipped", int((time.time() - start) * 1000)
 
@@ -453,7 +597,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         duration_ms = int((time.time() - start) * 1000)
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        job_log = config.LOG_DIR / f"claude_{ts}_w{worker_id}_{job.get('site', 'unknown')[:20]}.txt"
+        job_log = config.LOG_DIR / f"{settings.agent_backend}_{ts}_w{worker_id}_{job.get('site', 'unknown')[:20]}.txt"
         job_log.write_text(output, encoding="utf-8")
 
         if stats:
@@ -465,7 +609,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         def _clean_reason(s: str) -> str:
             return re.sub(r'[*`"]+$', '', s).strip()
 
-        for result_status in ["APPLIED", "EXPIRED", "CAPTCHA", "LOGIN_ISSUE"]:
+        for result_status in ["APPLIED", "EMAIL_DRAFT", "EXPIRED", "CAPTCHA", "LOGIN_ISSUE"]:
             if f"RESULT:{result_status}" in output:
                 add_event(f"[W{worker_id}] {result_status} ({elapsed}s): {job['title'][:30]}")
                 update_state(worker_id, status=result_status.lower(),
@@ -520,11 +664,12 @@ def run_job(job: dict, port: int, worker_id: int = 0,
 # ---------------------------------------------------------------------------
 
 PERMANENT_FAILURES: set[str] = {
-    "expired", "captcha", "login_issue",
+    "expired", "captcha", "login_issue", "email_draft",
     "not_eligible_location", "not_eligible_salary",
     "already_applied", "account_required",
     "not_a_job_application", "unsafe_permissions",
     "unsafe_verification", "sso_required",
+    "mfa_required", "payment_or_tax_info",
     "site_blocked", "cloudflare_blocked", "blocked_by_cloudflare",
 }
 
@@ -548,7 +693,9 @@ def _is_permanent_failure(result: str) -> bool:
 def worker_loop(worker_id: int = 0, limit: int = 1,
                 target_url: str | None = None,
                 min_score: int = 7, headless: bool = False,
-                model: str = "sonnet", dry_run: bool = False) -> tuple[int, int]:
+                model: str | None = None, dry_run: bool = False,
+                agent_backend: str | None = None,
+                supervisor_model: str | None = None) -> tuple[int, int]:
     """Run jobs sequentially until limit is reached or queue is empty.
 
     Args:
@@ -557,8 +704,10 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
         target_url: Apply to a specific URL.
         min_score: Minimum fit_score threshold.
         headless: Run Chrome headless.
-        model: Claude model name.
+        model: Agent model name.
         dry_run: Don't click Submit.
+        agent_backend: Agent runner backend.
+        supervisor_model: Optional supervisor model label for the harness contract.
 
     Returns:
         Tuple of (applied_count, failed_count).
@@ -599,10 +748,31 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
         chrome_proc = None
         try:
             add_event(f"[W{worker_id}] Launching Chrome...")
-            chrome_proc = launch_chrome(worker_id, port=port, headless=headless)
+            worker_settings = harness.load_settings(
+                agent_backend=agent_backend,
+                executor_model=model,
+                supervisor_model=supervisor_model,
+            )
+            if (
+                headless
+                and worker_settings.agent_backend == "codex"
+                and worker_settings.deterministic_controller
+                and worker_settings.onepassword_enabled
+                and worker_settings.allow_account_creation
+            ):
+                raise RuntimeError("headless_not_supported_with_1password_account_creation")
+            chrome_proc = launch_chrome(
+                worker_id,
+                port=port,
+                headless=headless,
+                profile_directory=os.environ.get("APPLYPILOT_CHROME_PROFILE_DIRECTORY"),
+                onepassword_extension_id=worker_settings.onepassword_extension_id,
+            )
 
             result, duration_ms = run_job(job, port=port, worker_id=worker_id,
-                                            model=model, dry_run=dry_run)
+                                            model=model, dry_run=dry_run,
+                                            agent_backend=agent_backend,
+                                            supervisor_model=supervisor_model)
 
             if result == "skipped":
                 release_lock(job["url"])
@@ -612,6 +782,12 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                 mark_result(job["url"], "applied", duration_ms=duration_ms)
                 applied += 1
                 update_state(worker_id, jobs_applied=applied,
+                             jobs_done=applied + failed)
+            elif result == "email_draft":
+                mark_result(job["url"], "email_draft", "email draft required",
+                            permanent=True, duration_ms=duration_ms)
+                failed += 1
+                update_state(worker_id, jobs_failed=failed,
                              jobs_done=applied + failed)
             else:
                 reason = result.split(":", 1)[-1] if ":" in result else result
@@ -651,9 +827,11 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
 # ---------------------------------------------------------------------------
 
 def main(limit: int = 1, target_url: str | None = None,
-         min_score: int = 7, headless: bool = False, model: str = "sonnet",
+         min_score: int = 7, headless: bool = False, model: str | None = None,
          dry_run: bool = False, continuous: bool = False,
-         poll_interval: int = 60, workers: int = 1) -> None:
+         poll_interval: int = 60, workers: int = 1,
+         agent_backend: str | None = None,
+         supervisor_model: str | None = None) -> None:
     """Launch the apply pipeline.
 
     Args:
@@ -661,11 +839,13 @@ def main(limit: int = 1, target_url: str | None = None,
         target_url: Apply to a specific URL.
         min_score: Minimum fit_score threshold.
         headless: Run Chrome in headless mode.
-        model: Claude model name.
+        model: Agent model name.
         dry_run: Don't click Submit.
         continuous: Run forever, polling for new jobs.
         poll_interval: Seconds between DB polls when queue is empty.
         workers: Number of parallel workers (default 1).
+        agent_backend: Agent runner backend.
+        supervisor_model: Optional supervisor model label for harness contracts.
     """
     global POLL_INTERVAL
     POLL_INTERVAL = poll_interval
@@ -697,7 +877,7 @@ def main(limit: int = 1, target_url: str | None = None,
         _ctrl_c_count += 1
         if _ctrl_c_count == 1:
             console.print("\n[yellow]Skipping current job(s)... (Ctrl+C again to STOP)[/yellow]")
-            # Kill all active Claude processes to skip current jobs
+            # Kill all active agent processes to skip current jobs
             with _claude_lock:
                 for wid, cproc in list(_claude_procs.items()):
                     if cproc.poll() is None:
@@ -737,6 +917,8 @@ def main(limit: int = 1, target_url: str | None = None,
                     headless=headless,
                     model=model,
                     dry_run=dry_run,
+                    agent_backend=agent_backend,
+                    supervisor_model=supervisor_model,
                 )
             else:
                 # Multi-worker — distribute limit across workers
@@ -760,6 +942,8 @@ def main(limit: int = 1, target_url: str | None = None,
                             headless=headless,
                             model=model,
                             dry_run=dry_run,
+                            agent_backend=agent_backend,
+                            supervisor_model=supervisor_model,
                         ): i
                         for i in range(workers)
                     }

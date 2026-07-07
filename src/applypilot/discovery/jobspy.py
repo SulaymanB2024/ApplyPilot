@@ -9,13 +9,13 @@ search configuration YAML (searches.yaml) rather than being hardcoded.
 
 import logging
 import sqlite3
-import time
 from datetime import datetime, timezone
 
 from jobspy import scrape_jobs
+from tenacity import Retrying, retry_if_exception, stop_after_attempt, wait_exponential
 
 from applypilot import config
-from applypilot.database import get_connection, init_db, store_jobs
+from applypilot.database import get_connection, init_db
 
 log = logging.getLogger(__name__)
 
@@ -58,20 +58,33 @@ def parse_proxy(proxy_str: str) -> dict:
 
 # -- Retry wrapper -----------------------------------------------------------
 
+def _is_transient_scrape_error(exc: BaseException) -> bool:
+    err = str(exc).lower()
+    return any(k in err for k in ("timeout", "429", "proxy", "connection", "reset", "refused"))
+
+
 def _scrape_with_retry(kwargs: dict, max_retries: int = 2, backoff: float = 5.0):
     """Call scrape_jobs with retry on transient failures."""
-    for attempt in range(max_retries + 1):
-        try:
+    def _before_sleep(retry_state):
+        exc = retry_state.outcome.exception() if retry_state.outcome else None
+        log.warning(
+            "Retry %d/%d in %.0fs: %s",
+            retry_state.attempt_number,
+            max_retries,
+            retry_state.next_action.sleep if retry_state.next_action else backoff,
+            exc,
+        )
+
+    attempts = max_retries + 1
+    for attempt in Retrying(
+        stop=stop_after_attempt(attempts),
+        wait=wait_exponential(multiplier=backoff, min=backoff, max=60),
+        retry=retry_if_exception(_is_transient_scrape_error),
+        before_sleep=_before_sleep,
+        reraise=True,
+    ):
+        with attempt:
             return scrape_jobs(**kwargs)
-        except Exception as e:
-            err = str(e).lower()
-            transient = any(k in err for k in ("timeout", "429", "proxy", "connection", "reset", "refused"))
-            if transient and attempt < max_retries:
-                wait = backoff * (attempt + 1)
-                log.warning("Retry %d/%d in %.0fs: %s", attempt + 1, max_retries, wait, e)
-                time.sleep(wait)
-            else:
-                raise
 
 
 # -- Location filtering ------------------------------------------------------
@@ -129,7 +142,6 @@ def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str) -> tup
             continue
 
         title = str(row.get("title", "")) if str(row.get("title", "")) != "nan" else None
-        company = str(row.get("company", "")) if str(row.get("company", "")) != "nan" else None
         location_str = str(row.get("location", "")) if str(row.get("location", "")) != "nan" else None
 
         # Build salary string from min/max
