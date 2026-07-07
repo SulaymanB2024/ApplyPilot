@@ -15,6 +15,8 @@ import time
 
 import httpx
 
+from applypilot import config
+
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -27,8 +29,8 @@ def _detect_provider() -> tuple[str, str, str]:
     Reads env at call time (not module import time) so that load_env() called
     in _bootstrap() is always visible here.
     """
-    gemini_key = os.environ.get("GEMINI_API_KEY", "")
-    openai_key = os.environ.get("OPENAI_API_KEY", "")
+    gemini_key = config.get_secret("GEMINI_API_KEY")
+    openai_key = config.get_secret("OPENAI_API_KEY")
     local_url = os.environ.get("LLM_URL", "")
     model_override = os.environ.get("LLM_MODEL", "")
 
@@ -50,7 +52,7 @@ def _detect_provider() -> tuple[str, str, str]:
         return (
             local_url.rstrip("/"),
             model_override or "local-model",
-            os.environ.get("LLM_API_KEY", ""),
+            config.get_secret("LLM_API_KEY"),
         )
 
     raise RuntimeError(
@@ -207,7 +209,7 @@ class LLMClient:
 
                 return self._chat_compat(messages, temperature, max_tokens)
 
-            except _GeminiCompatForbidden as exc:
+            except _GeminiCompatForbidden:
                 # Model not available on OpenAI-compat layer — switch to native.
                 log.warning(
                     "Gemini compat endpoint returned 403 for model '%s'. "

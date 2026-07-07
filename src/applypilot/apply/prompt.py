@@ -6,7 +6,6 @@ personal data is loaded from the user's profile -- nothing is hardcoded.
 """
 
 import logging
-import os
 import shutil
 from datetime import datetime
 from pathlib import Path
@@ -196,7 +195,6 @@ def _build_hard_rules(profile: dict) -> str:
     display_name = f"{preferred_name} {preferred_last}".strip() if preferred_last else preferred_name
 
     # Build work auth rule dynamically
-    auth_info = work_auth.get("legally_authorized_to_work", "")
     sponsorship = work_auth.get("require_sponsorship", "")
     permit_type = work_auth.get("work_permit_type", "")
 
@@ -214,6 +212,288 @@ def _build_hard_rules(profile: dict) -> str:
 3. {name_rule}"""
 
 
+_BOARD_LABELS = {
+    "indeed": "Indeed",
+    "linkedin": "LinkedIn",
+    "glassdoor": "Glassdoor",
+    "zip_recruiter": "ZipRecruiter",
+    "ziprecruiter": "ZipRecruiter",
+    "google": "Google Jobs",
+    "google_jobs": "Google Jobs",
+}
+
+_JOBSPY_BOARD_RULES = {
+    "indeed": (
+        "Indeed: prefer employer apply links over profile-building flows. "
+        "Use Indeed Apply only when it is clearly a direct application for this role; "
+        "skip assessments or account/profile setup that is not part of the application."
+    ),
+    "linkedin": (
+        "LinkedIn: Easy Apply is acceptable only for the exact role. If redirected to "
+        "an employer site, continue there. Do not treat saving a job, following a company, "
+        "or editing the LinkedIn profile as applying."
+    ),
+    "glassdoor": (
+        "Glassdoor: treat primarily as a discovery/referral source. Open the employer "
+        "apply link when available; if Glassdoor blocks access, loops login, or only offers "
+        "reviews/salary/profile prompts, stop with RESULT:FAILED:site_blocked."
+    ),
+    "zip_recruiter": (
+        "ZipRecruiter: one-click apply is acceptable only when it submits this role with "
+        "the uploaded resume. Otherwise follow the employer apply link and continue on the ATS."
+    ),
+    "google": (
+        "Google Jobs: this is an aggregator. Never treat bookmarking, sharing, or choosing "
+        "an apply-provider link as submission. Pick the most direct company/ATS apply link."
+    ),
+    "google_jobs": (
+        "Google Jobs: this is an aggregator. Never treat bookmarking, sharing, or choosing "
+        "an apply-provider link as submission. Pick the most direct company/ATS apply link."
+    ),
+}
+
+_SMART_SOURCE_RULES = """Smart-extract source rules:
+- Search result/listing pages: inspect cards, open the best matching job detail, find the Apply/External Apply/Company Site link, then continue on the employer ATS.
+- Static/fresh-role boards: treat date/freshness, company, location, and title as discovery metadata. They are not application evidence.
+- Remote boards: verify the role is full-time salaried and not a contractor marketplace or talent-network profile before applying.
+- If a configured source sends you to a blocked source, blocked SSO domain, unsolvable manual ATS, or challenge wall before the employer application is visible, stop with the matching RESULT:FAILED reason."""
+
+_SCENARIO_DRILLS = """Scenario drills:
+- Workday drill: choose the role, start a fresh application, upload the tailored resume, wait for parsing, repair parsed fields, complete each page, expand Review sections, verify facts, then submit.
+- Email-only drill: do not send mail. Write email_application_draft.md with To, Subject, Attachments, Body, and Evidence fields, then output RESULT:EMAIL_DRAFT.
+- Runway drill: use https://app.joinrunway.io/explore as a fresh-role discovery surface. Use filters/match scores/job details to reach the employer apply link; Save/Get Match Scores/signup prompts are not applications.
+- Aggregator drill: Google Jobs, Runway, Glassdoor, and many remote boards are discovery surfaces. The successful endpoint is the employer confirmation page, not the aggregator page.
+- Native apply drill: Indeed, LinkedIn, or ZipRecruiter native apply is allowed only when it submits this exact role with the candidate's current tailored resume and no unrelated public-profile/assessment setup.
+- External ATS drill: Greenhouse, Lever, Ashby, SmartRecruiters, iCIMS, Taleo, Workable, Jobvite, BambooHR, and company career sites are application surfaces. Fill required fields, upload files, answer questions, review, and submit."""
+
+_TRAINING_SCENARIOS = (
+    {
+        "name": "Workday resume parser review",
+        "signals": "URL contains myworkdayjobs.com; page has My Information, My Experience, Application Questions, Review",
+        "actions": (
+            "start a fresh application, upload the tailored resume, wait for parser completion, "
+            "compare parsed fields against profile/resume, expand Review sections, fix mismatches before submit"
+        ),
+        "result": "RESULT:APPLIED only after Workday shows a submitted/thank-you confirmation",
+    },
+    {
+        "name": "Email-only application",
+        "signals": "posting says email resume/CV to an address and no web form exists",
+        "actions": (
+            "write email_application_draft.md in the working directory with To, Subject, "
+            "Attachments, Body, and Evidence fields; attach paths are local references only"
+        ),
+        "result": "RESULT:EMAIL_DRAFT; never send email or create an external email draft",
+    },
+    {
+        "name": "Runway fresh-role discovery",
+        "signals": "URL is app.joinrunway.io/explore; page shows filters, fresh roles, company, location, date, match score, save",
+        "actions": (
+            "use filters/match score/job detail to identify a role, open the employer apply link, "
+            "continue on the employer ATS; ignore Save/Get Match Scores as application evidence"
+        ),
+        "result": "continue to employer ATS or RESULT:LOGIN_ISSUE if Runway login blocks role inspection",
+    },
+    {
+        "name": "Aggregator to employer ATS",
+        "signals": "Google Jobs, Glassdoor, Runway, or remote-board listing offers multiple apply/provider links",
+        "actions": (
+            "choose the most direct company or ATS apply link, avoid sponsored/profile/setup flows, "
+            "then classify the destination as ATS/application page"
+        ),
+        "result": "do not output RESULT:APPLIED until an employer/ATS confirmation page appears",
+    },
+    {
+        "name": "Native easy apply",
+        "signals": "Indeed Apply, LinkedIn Easy Apply, or ZipRecruiter one-click apply is available",
+        "actions": (
+            "use native apply only for the exact role and current tailored resume; "
+            "reject public-profile setup, assessments, or unrelated talent-network flows"
+        ),
+        "result": "RESULT:APPLIED only after native apply confirms submission for this role",
+    },
+    {
+        "name": "External ATS form",
+        "signals": "Greenhouse, Lever, Ashby, SmartRecruiters, iCIMS, Taleo, Workable, Jobvite, BambooHR, or company career form",
+        "actions": (
+            "fill required fields, upload tailored resume, paste/upload cover letter when asked, "
+            "answer screening questions from profile facts, review visible values before submit"
+        ),
+        "result": "RESULT:APPLIED only after confirmation; otherwise use the specific failure code",
+    },
+)
+
+
+def _compact_list(values: list[str], empty: str = "none configured") -> str:
+    """Render a compact comma-separated list for prompt context."""
+    cleaned = [v for v in values if v]
+    return ", ".join(cleaned) if cleaned else empty
+
+
+def _build_source_catalog(search_config: dict) -> str:
+    """Build a prompt-visible catalog from discovery configuration."""
+    board_codes = search_config.get("boards") or search_config.get("sites") or []
+    jobspy_boards = [
+        _BOARD_LABELS.get(str(code).lower(), str(code))
+        for code in board_codes
+    ]
+
+    sites_cfg = config.load_sites_config()
+    searchable_sources: list[str] = []
+    static_sources: list[str] = []
+    for site in sites_cfg.get("sites", []):
+        name = site.get("name")
+        if not name:
+            continue
+        if site.get("type") == "search":
+            searchable_sources.append(name)
+        else:
+            static_sources.append(name)
+
+    blocked_cfg = sites_cfg.get("blocked", {})
+    blocked_sites = blocked_cfg.get("sites", [])
+    blocked_patterns = blocked_cfg.get("url_patterns", [])
+    manual_ats = sites_cfg.get("manual_ats", [])
+
+    return f"""Configured discovery and routing catalog:
+- JobSpy boards from searches.yaml: {_compact_list(jobspy_boards)}
+- Searchable smart-extract sources from sites.yaml: {_compact_list(searchable_sources)}
+- Static/fresh-role smart-extract sources from sites.yaml: {_compact_list(static_sources)}
+- Manual-only ATS domains: {_compact_list(manual_ats)}
+- Blocked/problematic source names: {_compact_list(blocked_sites)}
+- Blocked/problematic URL patterns: {_compact_list(blocked_patterns)}
+
+If the current page is one of the configured discovery sources above, use it to find the employer apply link. Do not confuse saving, matching, filtering, or profile setup on a discovery source with submitting an application."""
+
+
+def _build_jobspy_board_rules(search_config: dict) -> str:
+    """Build board-specific execution rules for configured JobSpy boards."""
+    board_codes = search_config.get("boards") or search_config.get("sites") or []
+    rules: list[str] = []
+    seen: set[str] = set()
+    for code in board_codes:
+        key = str(code).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        rule = _JOBSPY_BOARD_RULES.get(key)
+        if rule:
+            rules.append(f"- {rule}")
+    if not rules:
+        return "Configured JobSpy board rules: none configured."
+    return "Configured JobSpy board rules:\n" + "\n".join(rules)
+
+
+def _build_training_scenarios() -> str:
+    """Build concrete offline scenarios for the apply agent prompt."""
+    lines = ["== TRAINING SCENARIOS =="]
+    for idx, scenario in enumerate(_TRAINING_SCENARIOS, start=1):
+        lines.extend([
+            f"{idx}. {scenario['name']}",
+            f"   Signals: {scenario['signals']}",
+            f"   Actions: {scenario['actions']}",
+            f"   Expected result: {scenario['result']}",
+        ])
+    return "\n".join(lines)
+
+
+def build_training_manifest(search_config: dict | None = None) -> dict:
+    """Build machine-readable training coverage metadata for each run."""
+    if search_config is None:
+        search_config = config.load_search_config()
+
+    sites_cfg = config.load_sites_config()
+    board_codes = search_config.get("boards") or search_config.get("sites") or []
+    jobspy_boards = [
+        {
+            "code": str(code),
+            "label": _BOARD_LABELS.get(str(code).lower(), str(code)),
+            "has_rule": str(code).lower() in _JOBSPY_BOARD_RULES,
+        }
+        for code in board_codes
+    ]
+    smart_sources = [
+        {
+            "name": site.get("name"),
+            "type": site.get("type", "static"),
+            "url": site.get("url"),
+        }
+        for site in sites_cfg.get("sites", [])
+        if site.get("name")
+    ]
+
+    return {
+        "version": "apply-training-v1",
+        "required_capabilities": [
+            "workday_application_flow",
+            "email_only_local_draft",
+            "runway_fresh_role_discovery",
+            "aggregator_to_employer_ats_handoff",
+            "native_easy_apply_boundary",
+            "external_ats_form_completion",
+            "configured_job_board_catalog",
+        ],
+        "scenario_names": [scenario["name"] for scenario in _TRAINING_SCENARIOS],
+        "jobspy_boards": jobspy_boards,
+        "smart_extract_sources": smart_sources,
+        "manual_ats_domains": sites_cfg.get("manual_ats", []),
+        "blocked_sources": sites_cfg.get("blocked", {}),
+        "email_draft_artifact": "email_application_draft.md",
+        "runway_url": "https://app.joinrunway.io/explore",
+        "result_codes": {
+            "submitted": "RESULT:APPLIED",
+            "email_draft": "RESULT:EMAIL_DRAFT",
+            "expired": "RESULT:EXPIRED",
+            "captcha": "RESULT:CAPTCHA",
+            "login_issue": "RESULT:LOGIN_ISSUE",
+            "sso_required": "RESULT:FAILED:sso_required",
+            "not_a_job_application": "RESULT:FAILED:not_a_job_application",
+            "generic_failure": "RESULT:FAILED:reason",
+        },
+    }
+
+
+def _build_job_board_playbook(search_config: dict | None = None) -> str:
+    """Build board/ATS-specific navigation instructions for the apply agent."""
+    if search_config is None:
+        search_config = config.load_search_config()
+    source_catalog = _build_source_catalog(search_config)
+    board_rules = _build_jobspy_board_rules(search_config)
+
+    return f"""== JOB BOARD AND ATS PLAYBOOK ==
+{source_catalog}
+
+{board_rules}
+
+{_SMART_SOURCE_RULES}
+
+{_SCENARIO_DRILLS}
+
+First classify the page you are on:
+- Discovery/job-board page: Runway, Indeed, LinkedIn, Glassdoor, ZipRecruiter, Google Jobs, Dice, Otta, Wellfound, BuiltIn, RemoteOK, WeWorkRemotely, or any configured source in the catalog. These pages help find jobs; they are not proof of an application submission unless they have a native Easy Apply flow. Open the role, identify the employer application link, and continue on the employer/ATS page.
+- ATS/application page: Workday, Greenhouse, Lever, Ashby, SmartRecruiters, iCIMS, Taleo, Workable, Jobvite, BambooHR, or a company career site. Fill the actual application there.
+
+Runway (https://app.joinrunway.io/explore):
+- Treat Runway as a job-discovery source. Use filters, fresh-role tables, match scores, and job detail links to find a role.
+- Do not treat "Save", "Get Match Scores", or Runway signup/profile prompts as an application submission.
+- If Runway opens or links to an employer application, continue on that employer URL and apply there.
+- If Runway requires login only to inspect recommendations and no credentials are available in the profile, output RESULT:LOGIN_ISSUE. Do not create an unrelated profile.
+
+Workday:
+- Workday is a multi-page ATS. Expect sign-in/create-account, resume upload/parser, My Information, My Experience, Application Questions, voluntary disclosures, and Review pages.
+- Prefer "Apply Manually", "Apply", or "Start Application" over "Use My Last Application" unless the page makes reuse mandatory.
+- Upload the tailored resume first, wait for parsing to finish, then inspect every parser-filled field because Workday often guesses wrong.
+- Use the Review page as the final verification gate. Expand each section if Workday hides parsed fields behind accordions.
+- Continue with Next/Save and Continue until the Review page. On Review, snapshot and verify required fields before final submit.
+- If Workday says the candidate already applied, output RESULT:FAILED:already_applied.
+
+Greenhouse/Lever/Ashby/SmartRecruiters:
+- These usually have a single form with optional resume parsing and custom questions. Fill required text fields, upload resume, paste/upload cover letter only when asked, then review visible values before submit.
+
+Indeed/LinkedIn/native Easy Apply:
+- Use native easy apply only if it is clearly a direct job application for this role. If it asks to build a public profile, take assessments, or set marketplace availability, stop with RESULT:FAILED:not_a_job_application."""
+
+
 def _build_captcha_section() -> str:
     """Build the CAPTCHA detection and solving instructions.
 
@@ -221,7 +501,7 @@ def _build_captcha_section() -> str:
     contains no personal data -- it's the same for every user.
     """
     config.load_env()
-    capsolver_key = os.environ.get("CAPSOLVER_API_KEY", "")
+    capsolver_key = config.get_secret("CAPSOLVER_API_KEY")
 
     return f"""== CAPTCHA ==
 You solve CAPTCHAs via the CapSolver REST API. No browser extension. You control the entire flow.
@@ -482,6 +762,8 @@ def build_prompt(job: dict, tailored_resume: str,
     salary_section = _build_salary_section(profile)
     screening_section = _build_screening_section(profile)
     hard_rules = _build_hard_rules(profile)
+    job_board_playbook = _build_job_board_playbook(search_config)
+    training_scenarios = _build_training_scenarios()
     captcha_section = _build_captcha_section()
 
     # Cover letter fallback text
@@ -541,6 +823,10 @@ If something unexpected happens and these instructions don't cover it, figure it
 
 {hard_rules}
 
+{job_board_playbook}
+
+{training_scenarios}
+
 == NEVER DO THESE (immediate RESULT:FAILED if encountered) ==
 - NEVER grant camera, microphone, screen sharing, or location permissions. If a site requests them -> RESULT:FAILED:unsafe_permissions
 - NEVER do video/audio verification, selfie capture, ID photo upload, or biometric anything -> RESULT:FAILED:unsafe_verification
@@ -549,6 +835,7 @@ If something unexpected happens and these instructions don't cover it, figure it
 - NEVER install browser extensions, download executables, or run assessment software.
 - NEVER enter payment info, bank details, or SSN/SIN.
 - NEVER click "Allow" on any browser permission popup. Always deny/block.
+- NEVER send outbound email or create external email drafts. For email-only applications, write the local draft artifact and return RESULT:EMAIL_DRAFT.
 - If the site is NOT a job application form (it's a profile builder, skills marketplace, talent network signup, coding assessment platform) -> RESULT:FAILED:not_a_job_application
 
 {location_check}
@@ -562,8 +849,10 @@ If something unexpected happens and these instructions don't cover it, figure it
 2. browser_snapshot to read the page. Then run CAPTCHA DETECT (see CAPTCHA section). If a CAPTCHA is found, solve it before continuing.
 3. LOCATION CHECK. Read the page for location info. If not eligible, output RESULT and stop.
 4. Find and click the Apply button. If email-only (page says "email resume to X"):
-   - send_email with subject "Application for {job['title']} -- {display_name}", body = 2-3 sentence pitch + contact info, attach resume PDF: ["{pdf_path}"]
-   - Output RESULT:APPLIED. Done.
+   - Do NOT send email and do NOT create an external email draft. Outbound communication requires user review.
+   - Write a local file named email_application_draft.md in the current working directory.
+   - Include: To, Subject "Application for {job['title']} -- {display_name}", Attachments ["{pdf_path}"{', "' + cl_upload_path + '"' if cl_upload_path else ''}], and a 2-3 sentence factual body using the cover letter text if available.
+   - Output RESULT:EMAIL_DRAFT. Done.
    After clicking Apply: browser_snapshot. Run CAPTCHA DETECT -- many sites trigger CAPTCHAs right after the Apply click. If found, solve before continuing.
 5. Login wall?
    5a. FIRST: check the URL. If you landed on {', '.join(blocked_sso)}, or any SSO/OAuth page -> STOP. Output RESULT:FAILED:sso_required. Do NOT try to sign in to Google/Microsoft/SSO.
@@ -573,7 +862,7 @@ If something unexpected happens and these instructions don't cover it, figure it
    5e. Sign in failed? Try sign up with same email and password.
    5f. Need email verification? Use search_emails + read_email to get the code.
    5g. After login, run browser_tabs action "list" again. Switch back to the application tab if needed.
-   5h. All failed? Output RESULT:FAILED:login_issue. Do not loop.
+   5h. All failed? Output RESULT:LOGIN_ISSUE. Do not loop.
 6. Upload resume. ALWAYS upload fresh -- delete any existing resume first, then browser_file_upload with the PDF path above. This is the tailored resume for THIS job. Non-negotiable.
 7. Upload cover letter if there's a field for it. Text field -> paste the cover letter text. File upload -> use the cover letter PDF path.
 8. Check ALL pre-filled fields. ATS systems parse your resume and auto-fill -- it's often WRONG.
@@ -586,6 +875,7 @@ If something unexpected happens and these instructions don't cover it, figure it
 
 == RESULT CODES (output EXACTLY one) ==
 RESULT:APPLIED -- submitted successfully
+RESULT:EMAIL_DRAFT -- email-only application needs user-reviewed outbound email; draft saved to email_application_draft.md
 RESULT:EXPIRED -- job closed or no longer accepting applications
 RESULT:CAPTCHA -- blocked by unsolvable captcha
 RESULT:LOGIN_ISSUE -- could not sign in or create account

@@ -3,10 +3,35 @@
 import os
 import platform
 import shutil
+from copy import deepcopy
 from pathlib import Path
 
+from platformdirs import user_data_path
+
 # User data directory — all user-specific files live here
-APP_DIR = Path(os.environ.get("APPLYPILOT_DIR", Path.home() / ".applypilot"))
+APP_NAME = "ApplyPilot"
+APP_AUTHOR = "Pickle-Pixel"
+LEGACY_APP_DIR = Path.home() / ".applypilot"
+KEYRING_SERVICE = "applypilot"
+SECRET_ENV_KEYS = (
+    "GEMINI_API_KEY",
+    "OPENAI_API_KEY",
+    "LLM_API_KEY",
+    "CAPSOLVER_API_KEY",
+)
+
+
+def _resolve_app_dir() -> Path:
+    """Resolve user data location, preserving the historical default."""
+    env_path = os.environ.get("APPLYPILOT_DIR")
+    if env_path:
+        return Path(env_path).expanduser()
+    if LEGACY_APP_DIR.exists():
+        return LEGACY_APP_DIR
+    return user_data_path(APP_NAME, APP_AUTHOR, ensure_exists=False)
+
+
+APP_DIR = _resolve_app_dir()
 
 # Core paths
 DB_PATH = APP_DIR / "applypilot.db"
@@ -85,6 +110,11 @@ def get_chrome_user_data() -> Path:
         return Path.home() / ".config" / "google-chrome"
 
 
+def get_chrome_profile_directory() -> str:
+    """Chrome profile directory to launch inside the user-data root."""
+    return os.environ.get("APPLYPILOT_CHROME_PROFILE_DIRECTORY", "Default")
+
+
 def ensure_dirs():
     """Create all required directories."""
     for d in [APP_DIR, TAILORED_DIR, COVER_LETTER_DIR, LOG_DIR, CHROME_WORKER_DIR, APPLY_WORKER_DIR]:
@@ -92,7 +122,7 @@ def ensure_dirs():
 
 
 def load_profile() -> dict:
-    """Load user profile from ~/.applypilot/profile.json."""
+    """Load user profile from the ApplyPilot data directory."""
     import json
     if not PROFILE_PATH.exists():
         raise FileNotFoundError(
@@ -101,16 +131,68 @@ def load_profile() -> dict:
     return json.loads(PROFILE_PATH.read_text(encoding="utf-8"))
 
 
+def _jobspy_country(value: str | None) -> str:
+    """Normalize user-facing country labels to JobSpy's country_indeed values."""
+    if not value:
+        return "usa"
+    normalized = value.strip().lower()
+    aliases = {
+        "us": "usa",
+        "u.s.": "usa",
+        "u.s.a.": "usa",
+        "united states": "usa",
+        "united states of america": "usa",
+        "usa": "usa",
+        "canada": "canada",
+        "ca": "canada",
+    }
+    return aliases.get(normalized, normalized)
+
+
+def normalize_search_config(raw: dict | None) -> dict:
+    """Normalize historical and example search config shapes.
+
+    Older generated configs and the shipped example use user-facing names like
+    ``boards`` and ``location.accept_patterns``. Discovery modules read
+    ``sites``, ``location_accept``, and ``location_reject_non_remote``. Keep
+    both shapes populated so every discovery backend receives the same intent.
+    """
+    if not raw:
+        return {}
+
+    cfg = deepcopy(raw)
+    defaults = cfg.setdefault("defaults", {})
+
+    if "sites" not in cfg and cfg.get("boards"):
+        cfg["sites"] = list(cfg["boards"])
+    if "boards" not in cfg and cfg.get("sites"):
+        cfg["boards"] = list(cfg["sites"])
+
+    if "country_indeed" not in defaults:
+        defaults["country_indeed"] = _jobspy_country(cfg.get("country", "USA"))
+
+    location = cfg.setdefault("location", {})
+    accept_patterns = location.get("accept_patterns") or cfg.get("location_accept") or []
+    reject_patterns = location.get("reject_patterns") or cfg.get("location_reject_non_remote") or []
+
+    cfg.setdefault("location_accept", list(accept_patterns))
+    cfg.setdefault("location_reject_non_remote", list(reject_patterns))
+    location.setdefault("accept_patterns", list(cfg.get("location_accept", [])))
+    location.setdefault("reject_patterns", list(cfg.get("location_reject_non_remote", [])))
+
+    return cfg
+
+
 def load_search_config() -> dict:
-    """Load search configuration from ~/.applypilot/searches.yaml."""
+    """Load search configuration from the ApplyPilot data directory."""
     import yaml
     if not SEARCH_CONFIG_PATH.exists():
         # Fall back to package-shipped example
         example = CONFIG_DIR / "searches.example.yaml"
         if example.exists():
-            return yaml.safe_load(example.read_text(encoding="utf-8"))
+            return normalize_search_config(yaml.safe_load(example.read_text(encoding="utf-8")))
         return {}
-    return yaml.safe_load(SEARCH_CONFIG_PATH.read_text(encoding="utf-8"))
+    return normalize_search_config(yaml.safe_load(SEARCH_CONFIG_PATH.read_text(encoding="utf-8")))
 
 
 def load_sites_config() -> dict:
@@ -171,13 +253,50 @@ DEFAULTS = {
 }
 
 
+def _read_keyring_secret(name: str) -> str | None:
+    """Read a secret from the OS keyring if a backend is available."""
+    try:
+        import keyring
+        return keyring.get_password(KEYRING_SERVICE, name)
+    except Exception:
+        return None
+
+
+def set_secret(name: str, value: str) -> bool:
+    """Store a secret in the OS keyring and mirror it into this process."""
+    try:
+        import keyring
+        keyring.set_password(KEYRING_SERVICE, name, value)
+    except Exception:
+        return False
+    os.environ[name] = value
+    return True
+
+
+def get_secret(name: str, default: str = "") -> str:
+    """Get an environment secret, falling back to the OS keyring."""
+    value = os.environ.get(name)
+    if value:
+        return value
+    value = _read_keyring_secret(name)
+    if value:
+        os.environ[name] = value
+        return value
+    return default
+
+
 def load_env():
-    """Load environment variables from ~/.applypilot/.env if it exists."""
+    """Load environment variables from ApplyPilot config and the OS keyring."""
     from dotenv import load_dotenv
     if ENV_PATH.exists():
         load_dotenv(ENV_PATH)
     # Also try CWD .env as fallback
     load_dotenv()
+    for key in SECRET_ENV_KEYS:
+        if not os.environ.get(key):
+            value = _read_keyring_secret(key)
+            if value:
+                os.environ[key] = value
 
 
 # ---------------------------------------------------------------------------
@@ -202,22 +321,22 @@ def get_tier() -> int:
 
     Tier 1 (Discovery):            Python + pip
     Tier 2 (AI Scoring & Tailoring): + LLM API key
-    Tier 3 (Full Auto-Apply):       + Claude Code CLI + Chrome
+    Tier 3 (Full Auto-Apply):       + agent CLI + Chrome
     """
     load_env()
 
-    has_llm = any(os.environ.get(k) for k in ("GEMINI_API_KEY", "OPENAI_API_KEY", "LLM_URL"))
+    has_llm = any(get_secret(k) for k in ("GEMINI_API_KEY", "OPENAI_API_KEY")) or bool(os.environ.get("LLM_URL"))
     if not has_llm:
         return 1
 
-    has_claude = shutil.which("claude") is not None
+    has_agent = shutil.which("claude") is not None or shutil.which("codex") is not None
     try:
         get_chrome_path()
         has_chrome = True
     except FileNotFoundError:
         has_chrome = False
 
-    if has_claude and has_chrome:
+    if has_agent and has_chrome:
         return 3
 
     return 2
@@ -238,11 +357,14 @@ def check_tier(required: int, feature: str) -> None:
     _console = Console(stderr=True)
 
     missing: list[str] = []
-    if required >= 2 and not any(os.environ.get(k) for k in ("GEMINI_API_KEY", "OPENAI_API_KEY", "LLM_URL")):
+    if required >= 2 and not (
+        any(get_secret(k) for k in ("GEMINI_API_KEY", "OPENAI_API_KEY"))
+        or os.environ.get("LLM_URL")
+    ):
         missing.append("LLM API key — run [bold]applypilot init[/bold] or set GEMINI_API_KEY")
     if required >= 3:
-        if not shutil.which("claude"):
-            missing.append("Claude Code CLI — install from [bold]https://claude.ai/code[/bold]")
+        if not shutil.which("claude") and not shutil.which("codex"):
+            missing.append("Agent CLI — install Claude Code or Codex CLI")
         try:
             get_chrome_path()
         except FileNotFoundError:

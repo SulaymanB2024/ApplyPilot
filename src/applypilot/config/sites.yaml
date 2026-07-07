@@ -52,6 +52,7 @@ base_urls:
   "Himalayas": "https://himalayas.app"
   "Techstars Jobs": "https://www.techstars.com"
   "Randstad Canada": "https://www.randstad.ca/jobs/search/"
+  "Runway": "https://app.joinrunway.io"
 
 sites:
   # ── Searchable sites (URL includes query + location params) ──────────
@@ -102,6 +103,11 @@ sites:
     type: search
 
   # ── Static sites (no query params, scraped once) ─────────────────────
+  # Early-career / fresh-role aggregators
+  - name: "Runway"
+    url: "https://app.joinrunway.io/explore"
+    type: static
+
   # Remote-first boards
   - name: "RemoteOK"
     url: "https://remoteok.com/remote-dev-jobs"

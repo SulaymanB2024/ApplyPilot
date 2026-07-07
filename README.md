@@ -22,30 +22,30 @@ https://github.com/user-attachments/assets/7ee3417f-43d4-4245-9952-35df1e77f2df
 
 ## What It Does
 
-ApplyPilot is a 6-stage autonomous job application pipeline. It discovers jobs across 5+ boards, scores them against your resume with AI, tailors your resume per job, writes cover letters, and **submits applications for you**. It navigates forms, uploads documents, answers screening questions, all hands-free.
+ApplyPilot is a 6-stage autonomous job application pipeline. It discovers jobs across 5+ boards plus Runway, scores them against your resume with AI, tailors your resume per job, writes cover letters, and **submits applications for you**. It navigates forms, uploads documents, answers screening questions, all hands-free.
 
 Three commands. That's it.
 
 ```bash
-pip install applypilot
-pip install --no-deps python-jobspy && pip install pydantic tls-client requests markdownify regex
+pip install 'applypilot[discovery]'
 applypilot init          # one-time setup: resume, profile, preferences, API keys
 applypilot doctor        # verify your setup — shows what's installed and what's missing
 applypilot run           # discover > enrich > score > tailor > cover letters
 applypilot run -w 4      # same but parallel (4 threads for discovery/enrichment)
+applypilot training-audit  # verify Workday, email draft, Runway, and board coverage
 applypilot apply         # autonomous browser-driven submission
 applypilot apply -w 3    # parallel apply (3 Chrome instances)
 applypilot apply --dry-run  # fill forms without submitting
 ```
 
-> **Why two install commands?** `python-jobspy` pins an exact numpy version in its metadata that conflicts with pip's resolver, but works fine at runtime with any modern numpy. The `--no-deps` flag bypasses the resolver; the second command installs jobspy's actual runtime dependencies. Everything except `python-jobspy` installs normally.
+> **Discovery extra:** `applypilot[discovery]` installs JobSpy and its runtime scraping dependencies. If your environment hits a JobSpy resolver conflict, `applypilot doctor` will show the fallback install command.
 
 ---
 
 ## Two Paths
 
 ### Full Pipeline (recommended)
-**Requires:** Python 3.11+, Node.js (for npx), Gemini API key (free), Claude Code CLI, Chrome
+**Requires:** Python 3.11+, Node.js (for npx), Gemini API key (free), an agent CLI (Claude Code or Codex), Chrome
 
 Runs all 6 stages, from job discovery to autonomous application submission. This is the full power of ApplyPilot.
 
@@ -60,12 +60,12 @@ Runs stages 1-5: discovers jobs, scores them, tailors your resume, generates cov
 
 | Stage | What Happens |
 |-------|-------------|
-| **1. Discover** | Scrapes 5 job boards (Indeed, LinkedIn, Glassdoor, ZipRecruiter, Google Jobs) + 48 Workday employer portals + 30 direct career sites |
+| **1. Discover** | Scrapes 5 job boards (Indeed, LinkedIn, Glassdoor, ZipRecruiter, Google Jobs) + Runway + 48 Workday employer portals + 30 direct career sites |
 | **2. Enrich** | Fetches full job descriptions via JSON-LD, CSS selectors, or AI-powered extraction |
 | **3. Score** | AI rates every job 1-10 based on your resume and preferences. Only high-fit jobs proceed |
 | **4. Tailor** | AI rewrites your resume per job: reorganizes, emphasizes relevant experience, adds keywords. Never fabricates |
 | **5. Cover Letter** | AI generates a targeted cover letter per job |
-| **6. Auto-Apply** | Claude Code navigates application forms, fills fields, uploads documents, answers questions, and submits |
+| **6. Auto-Apply** | An agent CLI navigates application forms, fills fields, uploads documents, answers questions, and submits |
 
 Each stage is independent. Run them all or pick what you need.
 
@@ -75,11 +75,11 @@ Each stage is independent. Run them all or pick what you need.
 
 | Feature | ApplyPilot | AIHawk | Manual |
 |---------|-----------|--------|--------|
-| Job discovery | 5 boards + Workday + direct sites | LinkedIn only | One board at a time |
+| Job discovery | 5 boards + Runway + Workday + direct sites | LinkedIn only | One board at a time |
 | AI scoring | 1-10 fit score per job | Basic filtering | Your gut feeling |
 | Resume tailoring | Per-job AI rewrite | Template-based | Hours per application |
 | Auto-apply | Full form navigation + submission | LinkedIn Easy Apply only | Click, type, repeat |
-| Supported sites | Indeed, LinkedIn, Glassdoor, ZipRecruiter, Google Jobs, 46 Workday portals, 28 direct sites | LinkedIn | Whatever you open |
+| Supported sites | Indeed, LinkedIn, Glassdoor, ZipRecruiter, Google Jobs, Runway, 46 Workday portals, 28 direct sites | LinkedIn | Whatever you open |
 | License | AGPL-3.0 | MIT | N/A |
 
 ---
@@ -92,7 +92,8 @@ Each stage is independent. Run them all or pick what you need.
 | Node.js 18+ | Auto-apply | Needed for `npx` to run Playwright MCP server |
 | Gemini API key | Scoring, tailoring, cover letters | Free tier (15 RPM / 1M tokens/day) is enough |
 | Chrome/Chromium | Auto-apply | Auto-detected on most systems |
-| Claude Code CLI | Auto-apply | Install from [claude.ai/code](https://claude.ai/code) |
+| Agent CLI | Auto-apply | Claude Code is the default executor; Codex CLI can be selected with `--agent-backend codex` |
+| 1Password CLI + Chrome extension | Codex auto-apply account creation | Stores job-site logins created during autonomous applications |
 
 **Gemini API key is free.** Get one at [aistudio.google.com](https://aistudio.google.com). OpenAI and local models (Ollama/llama.cpp) are also supported.
 
@@ -101,8 +102,9 @@ Each stage is independent. Run them all or pick what you need.
 | Component | What It Does |
 |-----------|-------------|
 | CapSolver API key | Solves CAPTCHAs during auto-apply (hCaptcha, reCAPTCHA, Turnstile, FunCaptcha). Without it, CAPTCHA-blocked applications just fail gracefully |
+| OS keyring | Stores API keys outside `.env` on macOS, Windows, and supported Linux desktops |
 
-> **Note:** python-jobspy is installed separately with `--no-deps` because it pins an exact numpy version in its metadata that conflicts with pip's resolver. It works fine with modern numpy at runtime.
+> **Note:** API keys can live in `.env` or the OS keyring. `applypilot init` asks where to store new keys.
 
 ---
 
@@ -117,7 +119,7 @@ Your personal data in one structured file: contact info, work authorization, com
 Job search queries, target titles, locations, boards. Run multiple searches with different parameters.
 
 ### `.env`
-API keys and runtime config: `GEMINI_API_KEY`, `LLM_MODEL`, `CAPSOLVER_API_KEY` (optional).
+API keys and runtime config: `GEMINI_API_KEY`, `LLM_MODEL`, `CAPSOLVER_API_KEY` (optional), plus harness overrides such as `APPLYPILOT_AGENT_BACKEND`, `APPLYPILOT_EXECUTOR_MODEL`, `APPLYPILOT_SUPERVISOR_MODEL`, `APPLYPILOT_DETERMINISTIC_CONTROLLER`, `APPLYPILOT_ALLOW_ACCOUNT_CREATION`, `APPLYPILOT_ONEPASSWORD_ENABLED`, `APPLYPILOT_ONEPASSWORD_VAULT`, `APPLYPILOT_ONEPASSWORD_EXTENSION_ID`, and `APPLYPILOT_CHROME_PROFILE_DIRECTORY`. API secret values can also be stored in the OS keyring.
 
 ### Package configs (shipped with ApplyPilot)
 - `config/employers.yaml` - Workday employer registry (48 preconfigured)
@@ -129,7 +131,7 @@ API keys and runtime config: `GEMINI_API_KEY`, `LLM_MODEL`, `CAPSOLVER_API_KEY` 
 ## How Stages Work
 
 ### Discover
-Queries Indeed, LinkedIn, Glassdoor, ZipRecruiter, Google Jobs via JobSpy. Scrapes 48 Workday employer portals (configurable in `employers.yaml`). Hits 30 direct career sites with custom extractors. Deduplicates by URL.
+Queries Indeed, LinkedIn, Glassdoor, ZipRecruiter, Google Jobs via JobSpy. Scrapes Runway's explore page as a smart-extract source. Scrapes 48 Workday employer portals (configurable in `employers.yaml`). Hits 30 direct career sites with custom extractors. Deduplicates by URL.
 
 ### Enrich
 Visits each job URL and extracts the full description. 3-tier cascade: JSON-LD structured data, then CSS selector patterns, then AI-powered extraction for unknown layouts.
@@ -144,12 +146,17 @@ Generates a custom resume per job: reorders experience, emphasizes relevant skil
 Writes a targeted cover letter per job referencing the specific company, role, and how your experience maps to their requirements.
 
 ### Auto-Apply
-Claude Code launches a Chrome instance, navigates to each application page, detects the form type, fills personal information and work history, uploads the tailored resume and cover letter, answers screening questions with AI, and submits. A live dashboard shows progress in real-time.
+ApplyPilot launches Chrome and an agent executor, writes a deterministic per-job harness contract, navigates each application page, detects the form type, fills personal information and work history, uploads the tailored resume and cover letter, answers screening questions with AI, and submits. If a role only accepts email applications, the harness writes a local `email_application_draft.md` for user review instead of sending email. A live dashboard shows progress in real-time.
 
-The Playwright MCP server is configured automatically at runtime per worker. No manual MCP setup needed.
+The Claude backend configures Playwright MCP automatically at runtime per worker. The Codex backend can be selected with `--agent-backend codex`; it defaults to `gpt-5.5` and uses a deterministic Python/Playwright controller for navigation, form detection, uploads, submit gates, screenshots, and result parsing. Codex 5.5 is only used as a fallback for ambiguous fields or screening questions that the controller cannot resolve from profile facts.
+
+For autonomous account creation, the Codex controller requires 1Password CLI (`op`) to be installed and signed in, plus the 1Password Chrome extension installed and unlocked in the Chrome profile used by ApplyPilot. New employer/ATS logins are stored in 1Password with generated passwords and ApplyPilot metadata. API keys stay in `.env` or the OS keyring; 1Password storage is for job-site logins only. Headless mode fails closed when 1Password-backed account creation is enabled.
+
+Each run records `deterministic_controller_plan.json`, `apply_harness_contract.json`, `apply_training_manifest.json`, screenshots, and a redacted `deterministic_controller_result.json` in the worker directory.
 
 ```bash
-# Utility modes (no Chrome/Claude needed)
+# Utility modes (no Chrome/agent needed)
+applypilot training-audit             # audit Workday/email/Runway/board training coverage
 applypilot apply --mark-applied URL    # manually mark a job as applied
 applypilot apply --mark-failed URL     # manually mark a job as failed
 applypilot apply --reset-failed        # reset all failed jobs for retry
@@ -170,12 +177,16 @@ applypilot run --min-score 8            # Override score threshold
 applypilot run --dry-run                # Preview without executing
 applypilot run --validation lenient     # Relax validation (recommended for Gemini free tier)
 applypilot run --validation strict      # Strictest validation (retries on any banned word)
+applypilot training-audit               # Audit apply-agent training coverage
 applypilot apply                        # Launch auto-apply
 applypilot apply --workers 3            # Parallel browser workers
 applypilot apply --dry-run              # Fill forms without submitting
 applypilot apply --continuous           # Run forever, polling for new jobs
 applypilot apply --headless             # Headless browser mode
 applypilot apply --url URL              # Apply to a specific job
+applypilot apply --agent-backend codex   # Use Codex executor profile
+applypilot apply --model gpt-5.5 --agent-backend codex
+applypilot apply --supervisor-model gpt-5.5
 applypilot status                       # Pipeline statistics
 applypilot dashboard                    # Open HTML results dashboard
 ```
