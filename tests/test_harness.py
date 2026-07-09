@@ -2,16 +2,19 @@ import json
 
 from applypilot.apply.harness import load_settings, prompt_header
 from applypilot.apply.harness import write_contract
+from applypilot.apply import launcher
 from applypilot.apply.launcher import _is_permanent_failure
 from applypilot.apply import prompt as prompt_mod
 from applypilot.apply.prompt import (
     _build_job_board_playbook,
+    _build_captcha_section,
     _build_training_scenarios,
     build_training_manifest,
 )
 from applypilot.apply.training_audit import audit_training_manifest
 from applypilot.cli import app
 from applypilot.config import load_sites_config, normalize_search_config
+from applypilot.database import close_connection, init_db
 from typer.testing import CliRunner
 
 runner = CliRunner()
@@ -47,6 +50,16 @@ def test_prompt_header_keeps_email_submissions_at_draft_boundary():
     assert "never send outbound email" in header
     assert "email_application_draft.md" in header
     assert "RESULT:EMAIL_DRAFT" in header
+
+
+def test_captcha_section_fails_closed_without_solver_recipe():
+    section = _build_captcha_section()
+
+    assert "RESULT:CAPTCHA" in section
+    assert "CapSolver" not in section
+    assert "createTask" not in section
+    assert "getTaskResult" not in section
+    assert "g-recaptcha-response" not in section
 
 
 def test_job_board_playbook_trains_runway_and_workday_paths():
@@ -249,6 +262,38 @@ def test_job_board_playbook_includes_configured_smart_extract_sources():
 
 def test_email_draft_result_is_permanent_handoff_status():
     assert _is_permanent_failure("email_draft")
+
+
+def test_submitted_unconfirmed_and_required_unresolved_are_permanent():
+    assert _is_permanent_failure("submitted_unconfirmed")
+    assert _is_permanent_failure("failed:required_field_unresolved")
+
+
+def test_dry_run_verified_releases_lock_without_applied_at(monkeypatch, tmp_path):
+    db_path = tmp_path / "applypilot.db"
+    conn = init_db(db_path)
+    conn.execute(
+        "INSERT INTO jobs (url, title, tailored_resume_path, application_url, apply_status, agent_id) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        ("https://example.com/job", "Engineer", "/tmp/resume.txt", "https://example.com/apply", "in_progress", "w0"),
+    )
+    conn.commit()
+    monkeypatch.setattr(launcher, "get_connection", lambda: conn)
+
+    launcher.mark_dry_run_verified("https://example.com/job", duration_ms=1234)
+
+    row = conn.execute(
+        "SELECT apply_status, applied_at, apply_duration_ms, verification_confidence, agent_id "
+        "FROM jobs WHERE url = ?",
+        ("https://example.com/job",),
+    ).fetchone()
+    close_connection(db_path)
+
+    assert row["apply_status"] is None
+    assert row["applied_at"] is None
+    assert row["apply_duration_ms"] == 1234
+    assert row["verification_confidence"] == "dry_run"
+    assert row["agent_id"] is None
 
 
 def test_search_config_normalizes_board_and_location_aliases():

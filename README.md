@@ -33,6 +33,7 @@ applypilot doctor        # verify your setup — shows what's installed and what
 applypilot run           # discover > enrich > score > tailor > cover letters
 applypilot run -w 4      # same but parallel (4 threads for discovery/enrichment)
 applypilot training-audit  # verify Workday, email draft, Runway, and board coverage
+applypilot improve plan --scope apply --out .applypilot-dev/exp-001  # bounded self-improvement packet
 applypilot apply         # autonomous browser-driven submission
 applypilot apply -w 3    # parallel apply (3 Chrome instances)
 applypilot apply --dry-run  # fill forms without submitting
@@ -101,7 +102,6 @@ Each stage is independent. Run them all or pick what you need.
 
 | Component | What It Does |
 |-----------|-------------|
-| CapSolver API key | Solves CAPTCHAs during auto-apply (hCaptcha, reCAPTCHA, Turnstile, FunCaptcha). Without it, CAPTCHA-blocked applications just fail gracefully |
 | OS keyring | Stores API keys outside `.env` on macOS, Windows, and supported Linux desktops |
 
 > **Note:** API keys can live in `.env` or the OS keyring. `applypilot init` asks where to store new keys.
@@ -119,7 +119,7 @@ Your personal data in one structured file: contact info, work authorization, com
 Job search queries, target titles, locations, boards. Run multiple searches with different parameters.
 
 ### `.env`
-API keys and runtime config: `GEMINI_API_KEY`, `LLM_MODEL`, `CAPSOLVER_API_KEY` (optional), plus harness overrides such as `APPLYPILOT_AGENT_BACKEND`, `APPLYPILOT_EXECUTOR_MODEL`, `APPLYPILOT_SUPERVISOR_MODEL`, `APPLYPILOT_DETERMINISTIC_CONTROLLER`, `APPLYPILOT_ALLOW_ACCOUNT_CREATION`, `APPLYPILOT_ONEPASSWORD_ENABLED`, `APPLYPILOT_ONEPASSWORD_VAULT`, `APPLYPILOT_ONEPASSWORD_EXTENSION_ID`, and `APPLYPILOT_CHROME_PROFILE_DIRECTORY`. API secret values can also be stored in the OS keyring.
+API keys and runtime config: `GEMINI_API_KEY`, `LLM_MODEL`, plus harness overrides such as `APPLYPILOT_AGENT_BACKEND`, `APPLYPILOT_EXECUTOR_MODEL`, `APPLYPILOT_SUPERVISOR_MODEL`, `APPLYPILOT_DETERMINISTIC_CONTROLLER`, `APPLYPILOT_ALLOW_ACCOUNT_CREATION`, `APPLYPILOT_ONEPASSWORD_ENABLED`, `APPLYPILOT_ONEPASSWORD_VAULT`, `APPLYPILOT_ONEPASSWORD_EXTENSION_ID`, and `APPLYPILOT_CHROME_PROFILE_DIRECTORY`. The self-improvement development harness uses separate optional settings: `APPLYPILOT_DEV_MODE`, `APPLYPILOT_DEV_WORKER_MODEL`, `APPLYPILOT_DEV_REVIEWER_MODEL`, and `APPLYPILOT_DEV_FORBIDDEN_MODELS`. API secret values can also be stored in the OS keyring.
 
 ### Package configs (shipped with ApplyPilot)
 - `config/employers.yaml` - Workday employer registry (48 preconfigured)
@@ -148,11 +148,11 @@ Writes a targeted cover letter per job referencing the specific company, role, a
 ### Auto-Apply
 ApplyPilot launches Chrome and an agent executor, writes a deterministic per-job harness contract, navigates each application page, detects the form type, fills personal information and work history, uploads the tailored resume and cover letter, answers screening questions with AI, and submits. If a role only accepts email applications, the harness writes a local `email_application_draft.md` for user review instead of sending email. A live dashboard shows progress in real-time.
 
-The Claude backend configures Playwright MCP automatically at runtime per worker. The Codex backend can be selected with `--agent-backend codex`; it defaults to `gpt-5.5` and uses a deterministic Python/Playwright controller for navigation, form detection, uploads, submit gates, screenshots, and result parsing. Codex 5.5 is only used as a fallback for ambiguous fields or screening questions that the controller cannot resolve from profile facts.
+The Claude backend configures Playwright MCP automatically at runtime per worker. The Codex backend can be selected with `--agent-backend codex`; it defaults to `gpt-5.5` and uses a deterministic Python/Playwright controller for navigation, form detection, uploads, submit gates, screenshots, and result parsing. Codex 5.5 is only used as a schema-constrained fallback for ambiguous required fields or screening questions that the controller cannot resolve from profile facts. CAPTCHA, MFA, SSO, payment/tax, and identity-verification surfaces fail closed instead of attempting bypass.
 
 For autonomous account creation, the Codex controller requires 1Password CLI (`op`) to be installed and signed in, plus the 1Password Chrome extension installed and unlocked in the Chrome profile used by ApplyPilot. New employer/ATS logins are stored in 1Password with generated passwords and ApplyPilot metadata. API keys stay in `.env` or the OS keyring; 1Password storage is for job-site logins only. Headless mode fails closed when 1Password-backed account creation is enabled.
 
-Each run records `deterministic_controller_plan.json`, `apply_harness_contract.json`, `apply_training_manifest.json`, screenshots, and a redacted `deterministic_controller_result.json` in the worker directory.
+The apply queue stores canonical job IDs to avoid duplicate submissions, schedules retryable failures with capped full-jitter backoff, and opens a per-domain circuit breaker after repeated fail-closed outcomes such as CAPTCHA or SSO blocks. Each run records `deterministic_controller_plan.json`, `apply_harness_contract.json`, `apply_training_manifest.json`, screenshots, and a redacted `deterministic_controller_result.json` in the worker directory.
 
 ```bash
 # Utility modes (no Chrome/agent needed)
@@ -187,9 +187,28 @@ applypilot apply --url URL              # Apply to a specific job
 applypilot apply --agent-backend codex   # Use Codex executor profile
 applypilot apply --model gpt-5.5 --agent-backend codex
 applypilot apply --supervisor-model gpt-5.5
+applypilot improve plan --scope apply --out .applypilot-dev/exp-001
+applypilot improve worker --artifact .applypilot-dev/exp-001/plan.json --dry-run
+applypilot improve validate --artifact .applypilot-dev/exp-001/plan.json
+applypilot improve review --artifact .applypilot-dev/exp-001/proposal.json
 applypilot status                       # Pipeline statistics
 applypilot dashboard                    # Open HTML results dashboard
 ```
+
+`applypilot improve` is a bounded development harness, not an auto-patcher. It
+writes local artifacts (`plan.json`, prompts, `knowledge_index.json`,
+`knowledge_cards/`, `research_queue.json`, `proposal.json`, `results.json`,
+`review.json`, and `decision.md`) so a worker can propose changes and a reviewer
+can gate them against deterministic checks. The v1 worker is dry-run only,
+forbids recursive delegation, keeps file reads scoped to declared allowlists,
+and rejects `gpt-5.3-codex-spark` by default through
+`APPLYPILOT_DEV_FORBIDDEN_MODELS`.
+
+The improve harness uses progressive reveal for Codex context. Worker prompts
+receive a compact knowledge index first; full case cards are opened only when a
+task matches their `when_to_open` trigger. Broader research needs go into
+`research_queue.json` for ChatGPT Web or manual research, then come back as
+curated source-backed cards instead of raw transcripts.
 
 ---
 

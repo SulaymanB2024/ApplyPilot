@@ -23,7 +23,6 @@ dependencies = [
     "httpx>=0.24",
     "beautifulsoup4>=4.12",
     "playwright>=1.40",
-    "capsolver>=1.0.7",
     "keyring>=25.0",
     "platformdirs>=4.0",
     "pydantic>=2.0",

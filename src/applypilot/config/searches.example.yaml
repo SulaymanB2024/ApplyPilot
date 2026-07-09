@@ -1,5 +1,5 @@
 # ApplyPilot search configuration
-# Copy to ~/.applypilot/searches.yaml and customize for your job search.
+# Copy to your ApplyPilot user data directory as searches.yaml and customize.
 # The wizard (applypilot init) generates a basic version automatically.
 
 # Search queries -- each has a query string and priority tier.

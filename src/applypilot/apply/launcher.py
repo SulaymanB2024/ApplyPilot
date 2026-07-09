@@ -31,6 +31,14 @@ from applypilot.apply.chrome import (
     reset_worker_dir, cleanup_on_exit, _kill_process_tree,
     BASE_CDP_PORT,
 )
+from applypilot.apply.runtime import (
+    breaker_open_until,
+    canonical_job_id,
+    domain_from_job_url,
+    isoformat_utc,
+    next_retry_at,
+    should_open_breaker,
+)
 from applypilot.apply.dashboard import (
     init_worker, update_state, add_event, get_state,
     render_full, get_totals,
@@ -102,22 +110,31 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
     conn = get_connection()
     try:
         conn.execute("BEGIN IMMEDIATE")
+        now = isoformat_utc()
 
         if target_url:
             like = f"%{target_url.split('?')[0].rstrip('/')}%"
+            canonical_target = canonical_job_id(target_url)
             row = conn.execute("""
-                SELECT url, title, site, application_url, tailored_resume_path,
-                       fit_score, location, full_description, cover_letter_path
+                SELECT jobs.url, jobs.title, jobs.site, jobs.application_url,
+                       jobs.tailored_resume_path, jobs.fit_score, jobs.location,
+                       jobs.full_description, jobs.cover_letter_path,
+                       jobs.canonical_job_id, jobs.apply_domain
                 FROM jobs
-                WHERE (url = ? OR application_url = ? OR application_url LIKE ? OR url LIKE ?)
-                  AND tailored_resume_path IS NOT NULL
-                  AND apply_status != 'in_progress'
+                LEFT JOIN apply_domain_circuit_breakers breaker
+                  ON breaker.domain = jobs.apply_domain
+                WHERE (jobs.url = ? OR jobs.application_url = ? OR jobs.application_url LIKE ? OR jobs.url LIKE ?
+                       OR jobs.canonical_job_id = ?)
+                  AND jobs.tailored_resume_path IS NOT NULL
+                  AND jobs.apply_status != 'in_progress'
+                  AND (jobs.next_apply_attempt_at IS NULL OR jobs.next_apply_attempt_at <= ?)
+                  AND (breaker.opened_until IS NULL OR breaker.opened_until <= ?)
                 LIMIT 1
-            """, (target_url, target_url, like, like)).fetchone()
+            """, (target_url, target_url, like, like, canonical_target, now, now)).fetchone()
         else:
             blocked_sites, blocked_patterns = _load_blocked()
             # Build parameterized filters to avoid SQL injection
-            params: list = [min_score]
+            params: list = [now, min_score]
             site_clause = ""
             if blocked_sites:
                 placeholders = ",".join("?" * len(blocked_sites))
@@ -128,18 +145,23 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                 url_clauses = " ".join("AND url NOT LIKE ?" for _ in blocked_patterns)
                 params.extend(blocked_patterns)
             row = conn.execute(f"""
-                SELECT url, title, site, application_url, tailored_resume_path,
-                       fit_score, location, full_description, cover_letter_path
+                SELECT jobs.url, jobs.title, jobs.site, jobs.application_url, jobs.tailored_resume_path,
+                       jobs.fit_score, jobs.location, jobs.full_description, jobs.cover_letter_path,
+                       jobs.canonical_job_id, jobs.apply_domain
                 FROM jobs
-                WHERE tailored_resume_path IS NOT NULL
-                  AND (apply_status IS NULL OR apply_status = 'failed')
-                  AND (apply_attempts IS NULL OR apply_attempts < ?)
-                  AND fit_score >= ?
+                LEFT JOIN apply_domain_circuit_breakers breaker
+                  ON breaker.domain = jobs.apply_domain
+                WHERE jobs.tailored_resume_path IS NOT NULL
+                  AND (jobs.apply_status IS NULL OR jobs.apply_status = 'failed')
+                  AND (jobs.apply_attempts IS NULL OR jobs.apply_attempts < ?)
+                  AND (jobs.next_apply_attempt_at IS NULL OR jobs.next_apply_attempt_at <= ?)
+                  AND (breaker.opened_until IS NULL OR breaker.opened_until <= ?)
+                  AND jobs.fit_score >= ?
                   {site_clause}
                   {url_clauses}
-                ORDER BY fit_score DESC, url
+                ORDER BY jobs.fit_score DESC, jobs.url
                 LIMIT 1
-            """, [config.DEFAULTS["max_apply_attempts"]] + params).fetchone()
+            """, [config.DEFAULTS["max_apply_attempts"], now] + params).fetchone()
 
         if not row:
             conn.rollback()
@@ -150,7 +172,8 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
         apply_url = row["application_url"] or row["url"]
         if is_manual_ats(apply_url):
             conn.execute(
-                "UPDATE jobs SET apply_status = 'manual', apply_error = 'manual ATS' WHERE url = ?",
+                "UPDATE jobs SET apply_status = 'manual', apply_error = 'manual ATS', "
+                "apply_error_class = 'permanent', next_apply_attempt_at = NULL WHERE url = ?",
                 (row["url"],),
             )
             conn.commit()
@@ -161,9 +184,17 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
         conn.execute("""
             UPDATE jobs SET apply_status = 'in_progress',
                            agent_id = ?,
-                           last_attempted_at = ?
+                           last_attempted_at = ?,
+                           canonical_job_id = COALESCE(NULLIF(canonical_job_id, ''), ?),
+                           apply_domain = COALESCE(NULLIF(apply_domain, ''), ?)
             WHERE url = ?
-        """, (f"worker-{worker_id}", now, row["url"]))
+        """, (
+            f"worker-{worker_id}",
+            now,
+            row["canonical_job_id"] or canonical_job_id(row["url"], row["application_url"]),
+            row["apply_domain"] or domain_from_job_url(row["application_url"] or row["url"]),
+            row["url"],
+        ))
         conn.commit()
 
         return dict(row)
@@ -174,25 +205,76 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
 
 def mark_result(url: str, status: str, error: str | None = None,
                 permanent: bool = False, duration_ms: int | None = None,
-                task_id: str | None = None) -> None:
+                task_id: str | None = None,
+                verification_confidence: str | None = None) -> None:
     """Update a job's apply status in the database."""
     conn = get_connection()
     now = datetime.now(timezone.utc).isoformat()
+    row = conn.execute(
+        "SELECT apply_attempts, application_url, apply_domain FROM jobs WHERE url = ?",
+        (url,),
+    ).fetchone()
+    attempts_before = int(row["apply_attempts"] or 0) if row else 0
+    attempts_after = attempts_before + (0 if status == "applied" else 1)
+    domain = (
+        (row["apply_domain"] if row else None)
+        or domain_from_job_url((row["application_url"] if row else None) or url)
+    )
     if status == "applied":
         conn.execute("""
             UPDATE jobs SET apply_status = 'applied', applied_at = ?,
                            apply_error = NULL, agent_id = NULL,
-                           apply_duration_ms = ?, apply_task_id = ?
+                           apply_duration_ms = ?, apply_task_id = ?,
+                           verification_confidence = ?,
+                           next_apply_attempt_at = NULL,
+                           apply_error_class = NULL
             WHERE url = ?
-        """, (now, duration_ms, task_id, url))
+        """, (now, duration_ms, task_id, verification_confidence, url))
+        _record_domain_success(conn, domain)
     else:
         attempts = 99 if permanent else "COALESCE(apply_attempts, 0) + 1"
+        retry_at = None if permanent else next_retry_at(attempts_after)
+        error_class = "permanent" if permanent else "retryable"
         conn.execute(f"""
             UPDATE jobs SET apply_status = ?, apply_error = ?,
                            apply_attempts = {attempts}, agent_id = NULL,
-                           apply_duration_ms = ?, apply_task_id = ?
+                           apply_duration_ms = ?, apply_task_id = ?,
+                           verification_confidence = ?,
+                           next_apply_attempt_at = ?,
+                           apply_error_class = ?
             WHERE url = ?
-        """, (status, error or "unknown", duration_ms, task_id, url))
+        """, (
+            status,
+            error or "unknown",
+            duration_ms,
+            task_id,
+            verification_confidence,
+            retry_at,
+            error_class,
+            url,
+        ))
+        if should_open_breaker(error or status):
+            _record_domain_failure(conn, domain, error or status)
+    conn.commit()
+
+
+def mark_dry_run_verified(url: str, duration_ms: int | None = None) -> None:
+    """Release an apply lock after a verified dry run without marking applied."""
+    conn = get_connection()
+    conn.execute("""
+        UPDATE jobs SET apply_status = NULL, apply_error = NULL,
+                       agent_id = NULL, apply_duration_ms = ?,
+                       verification_confidence = 'dry_run',
+                       next_apply_attempt_at = NULL,
+                       apply_error_class = NULL
+        WHERE url = ?
+    """, (duration_ms, url))
+    domain_row = conn.execute("SELECT apply_domain, application_url FROM jobs WHERE url = ?", (url,)).fetchone()
+    domain = (
+        (domain_row["apply_domain"] if domain_row else None)
+        or domain_from_job_url((domain_row["application_url"] if domain_row else None) or url)
+    )
+    _record_domain_success(conn, domain)
     conn.commit()
 
 
@@ -204,6 +286,39 @@ def release_lock(url: str) -> None:
         (url,),
     )
     conn.commit()
+
+
+def _record_domain_failure(conn, domain: str, reason: str) -> None:
+    """Increment and possibly open a domain circuit breaker."""
+    if not domain:
+        return
+    now = isoformat_utc()
+    row = conn.execute(
+        "SELECT failure_count FROM apply_domain_circuit_breakers WHERE domain = ?",
+        (domain,),
+    ).fetchone()
+    failure_count = (int(row["failure_count"] or 0) if row else 0) + 1
+    opened_until = breaker_open_until() if failure_count >= 3 else None
+    conn.execute("""
+        INSERT INTO apply_domain_circuit_breakers
+            (domain, failure_count, opened_until, last_reason, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(domain) DO UPDATE SET
+            failure_count = excluded.failure_count,
+            opened_until = excluded.opened_until,
+            last_reason = excluded.last_reason,
+            updated_at = excluded.updated_at
+    """, (domain, failure_count, opened_until, reason, now))
+
+
+def _record_domain_success(conn, domain: str) -> None:
+    """Clear a domain breaker after a confirmed healthy apply path."""
+    if not domain:
+        return
+    conn.execute("""
+        DELETE FROM apply_domain_circuit_breakers
+        WHERE domain = ?
+    """, (domain,))
 
 
 # ---------------------------------------------------------------------------
@@ -273,13 +388,19 @@ def mark_job(url: str, status: str, reason: str | None = None) -> None:
     if status == "applied":
         conn.execute("""
             UPDATE jobs SET apply_status = 'applied', applied_at = ?,
-                           apply_error = NULL, agent_id = NULL
+                           apply_error = NULL, agent_id = NULL,
+                           next_apply_attempt_at = NULL,
+                           apply_error_class = NULL,
+                           verification_confidence = 'manual'
             WHERE url = ?
         """, (now, url))
     else:
         conn.execute("""
             UPDATE jobs SET apply_status = 'failed', apply_error = ?,
-                           apply_attempts = 99, agent_id = NULL
+                           apply_attempts = 99, agent_id = NULL,
+                           next_apply_attempt_at = NULL,
+                           apply_error_class = 'permanent',
+                           verification_confidence = 'manual'
             WHERE url = ?
         """, (reason or "manual", url))
     conn.commit()
@@ -294,7 +415,9 @@ def reset_failed() -> int:
     conn = get_connection()
     cursor = conn.execute("""
         UPDATE jobs SET apply_status = NULL, apply_error = NULL,
-                       apply_attempts = 0, agent_id = NULL
+                       apply_attempts = 0, agent_id = NULL,
+                       next_apply_attempt_at = NULL,
+                       apply_error_class = NULL
         WHERE apply_status = 'failed'
           OR (apply_status IS NOT NULL AND apply_status != 'applied'
               AND apply_status != 'in_progress')
@@ -671,6 +794,7 @@ PERMANENT_FAILURES: set[str] = {
     "unsafe_verification", "sso_required",
     "mfa_required", "payment_or_tax_info",
     "site_blocked", "cloudflare_blocked", "blocked_by_cloudflare",
+    "required_field_unresolved", "submitted_unconfirmed",
 }
 
 PERMANENT_PREFIXES: tuple[str, ...] = ("site_blocked", "cloudflare", "blocked_by")
@@ -779,21 +903,41 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                 add_event(f"[W{worker_id}] Skipped: {job['title'][:30]}")
                 continue
             elif result == "applied":
-                mark_result(job["url"], "applied", duration_ms=duration_ms)
+                mark_result(
+                    job["url"],
+                    "applied",
+                    duration_ms=duration_ms,
+                    verification_confidence="confirmed",
+                )
                 applied += 1
                 update_state(worker_id, jobs_applied=applied,
                              jobs_done=applied + failed)
+            elif result == "dry_run_verified":
+                mark_dry_run_verified(job["url"], duration_ms=duration_ms)
+                add_event(f"[W{worker_id}] DRY RUN VERIFIED: {job['title'][:30]}")
+                update_state(worker_id, jobs_done=applied + failed)
             elif result == "email_draft":
                 mark_result(job["url"], "email_draft", "email draft required",
-                            permanent=True, duration_ms=duration_ms)
+                            permanent=True, duration_ms=duration_ms,
+                            verification_confidence="failed_closed")
+                failed += 1
+                update_state(worker_id, jobs_failed=failed,
+                             jobs_done=applied + failed)
+            elif result == "submitted_unconfirmed":
+                mark_result(job["url"], "submitted_unconfirmed", "submitted_unconfirmed",
+                            permanent=True, duration_ms=duration_ms,
+                            verification_confidence="unconfirmed")
                 failed += 1
                 update_state(worker_id, jobs_failed=failed,
                              jobs_done=applied + failed)
             else:
                 reason = result.split(":", 1)[-1] if ":" in result else result
-                mark_result(job["url"], "failed", reason,
+                confidence = "unconfirmed" if reason == "submitted_unconfirmed" else "failed_closed"
+                status = "submitted_unconfirmed" if reason == "submitted_unconfirmed" else "failed"
+                mark_result(job["url"], status, reason,
                             permanent=_is_permanent_failure(result),
-                            duration_ms=duration_ms)
+                            duration_ms=duration_ms,
+                            verification_confidence=confidence)
                 failed += 1
                 update_state(worker_id, jobs_failed=failed,
                              jobs_done=applied + failed)

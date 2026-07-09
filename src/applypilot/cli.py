@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Optional
 
 import typer
@@ -22,6 +23,12 @@ app = typer.Typer(
     help="AI-powered end-to-end job application pipeline.",
     no_args_is_help=True,
 )
+improve_app = typer.Typer(
+    name="improve",
+    help="Bounded self-improvement development harness.",
+    no_args_is_help=True,
+)
+app.add_typer(improve_app, name="improve")
 console = Console()
 log = logging.getLogger(__name__)
 
@@ -41,6 +48,14 @@ def _bootstrap() -> None:
     load_env()
     ensure_dirs()
     init_db()
+
+
+def _bootstrap_config_only() -> None:
+    """Load env and create user data directories without opening the jobs DB."""
+    from applypilot.config import load_env, ensure_dirs
+
+    load_env()
+    ensure_dirs()
 
 
 def _version_callback(value: bool) -> None:
@@ -416,6 +431,86 @@ def dashboard() -> None:
     open_dashboard()
 
 
+@improve_app.command("plan")
+def improve_plan(
+    scope: str = typer.Option("apply", "--scope", help="Improvement scope label."),
+    out: Optional[Path] = typer.Option(None, "--out", help="Output directory for the improve run."),
+    goal: Optional[str] = typer.Option(None, "--goal", help="Specific improvement goal for this run."),
+    allowed_file: Optional[list[str]] = typer.Option(
+        None,
+        "--allowed-file",
+        help="Allowed file or glob pattern. Repeat to override the default allowlist.",
+    ),
+) -> None:
+    """Create a bounded self-improvement plan and prompt packet."""
+    _bootstrap_config_only()
+
+    from applypilot.dev_harness.runner import create_plan
+
+    plan_path = create_plan(
+        scope=scope,
+        out_dir=out,
+        goal=goal,
+        allowed_files=tuple(allowed_file) if allowed_file else None,
+    )
+    console.print(f"[green]Wrote improve plan:[/green] {plan_path}")
+    console.print(f"[dim]Worker prompt: {plan_path.parent / 'worker_prompt.md'}[/dim]")
+    console.print(f"[dim]Reviewer prompt: {plan_path.parent / 'reviewer_prompt.md'}[/dim]")
+
+
+@improve_app.command("worker")
+def improve_worker(
+    artifact: Path = typer.Option(..., "--artifact", help="Path to plan.json."),
+    dry_run: bool = typer.Option(True, "--dry-run/--no-dry-run", help="Write proposal artifact without editing files."),
+) -> None:
+    """Create a worker proposal artifact from an improve plan."""
+    _bootstrap_config_only()
+
+    from applypilot.dev_harness.runner import create_worker_proposal
+
+    try:
+        proposal_path = create_worker_proposal(plan_path=artifact, dry_run=dry_run)
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+    console.print(f"[green]Wrote worker proposal:[/green] {proposal_path}")
+
+
+@improve_app.command("review")
+def improve_review(
+    artifact: Path = typer.Option(..., "--artifact", help="Path to proposal.json."),
+) -> None:
+    """Review a worker proposal against its improve plan."""
+    _bootstrap_config_only()
+
+    from applypilot.dev_harness.artifacts import read_json
+    from applypilot.dev_harness.reviewer import review_proposal
+
+    review_path = review_proposal(proposal_path=artifact)
+    review = read_json(review_path)
+    verdict = "approved" if review.get("approved") else "not approved"
+    console.print(f"[green]Wrote improve review:[/green] {review_path}")
+    console.print(f"Verdict: [bold]{verdict}[/bold]")
+
+
+@improve_app.command("validate")
+def improve_validate(
+    artifact: Path = typer.Option(..., "--artifact", help="Path to plan.json."),
+    timeout_seconds: int = typer.Option(300, "--timeout-seconds", help="Per-command validation timeout."),
+) -> None:
+    """Run deterministic validation commands from an improve plan."""
+    _bootstrap_config_only()
+
+    from applypilot.dev_harness.artifacts import read_json
+    from applypilot.dev_harness.runner import run_validation
+
+    results_path = run_validation(plan_path=artifact, timeout_seconds=timeout_seconds)
+    results = read_json(results_path)
+    status = "passed" if results.get("passed") else "failed"
+    console.print(f"[green]Wrote validation results:[/green] {results_path}")
+    console.print(f"Validation: [bold]{status}[/bold]")
+
+
 @app.command()
 def training_audit(
     json_output: bool = typer.Option(False, "--json", help="Print the raw audit and manifest as JSON."),
@@ -603,13 +698,7 @@ def doctor() -> None:
         results.append(("Node.js (npx)", fail_mark,
                         "Install Node.js 18+ from nodejs.org (needed for auto-apply)"))
 
-    # CapSolver (optional)
-    capsolver = get_secret("CAPSOLVER_API_KEY")
-    if capsolver:
-        results.append(("CapSolver API key", ok_mark, "CAPTCHA solving enabled"))
-    else:
-        results.append(("CapSolver API key", "[dim]optional[/dim]",
-                        "Set CAPSOLVER_API_KEY in .env or OS keyring for CAPTCHA solving"))
+    results.append(("CAPTCHA policy", ok_mark, "fail closed; solver APIs are not used"))
 
     from applypilot.apply.harness import load_settings
     harness_settings = load_settings()

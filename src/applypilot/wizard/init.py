@@ -317,25 +317,7 @@ def _setup_auto_apply() -> None:
             "Auto-apply won't work until an agent CLI is installed."
         )
 
-    # Optional: CapSolver for CAPTCHAs
-    console.print("\n[dim]Some job sites use CAPTCHAs. CapSolver can handle them automatically.[/dim]")
-    if Confirm.ask("Configure CapSolver API key? (optional)", default=False):
-        capsolver_key = Prompt.ask("CapSolver API key")
-        secret_line = _secret_env_line("CAPSOLVER_API_KEY", capsolver_key, "CapSolver API key")
-        if secret_line:
-            # Append to existing .env or create
-            if ENV_PATH.exists():
-                existing = ENV_PATH.read_text(encoding="utf-8")
-                if "CAPSOLVER_API_KEY" not in existing:
-                    ENV_PATH.write_text(
-                        existing.rstrip() + f"\n{secret_line}\n",
-                        encoding="utf-8",
-                    )
-            else:
-                ENV_PATH.write_text(f"# ApplyPilot configuration\n{secret_line}\n", encoding="utf-8")
-            console.print("[green]CapSolver key saved.[/green]")
-    else:
-        console.print("[dim]Skipped. Add CAPSOLVER_API_KEY to .env or OS keyring later if needed.[/dim]")
+    console.print("[dim]CAPTCHA and anti-bot challenges fail closed during auto-apply.[/dim]")
 
 
 # ---------------------------------------------------------------------------

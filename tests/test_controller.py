@@ -5,6 +5,7 @@ from applypilot.apply.controller import (
     first_email,
     is_email_only_posting,
 )
+from applypilot.apply.safety import PageInput, PageState
 from applypilot.apply.onepassword import OnePasswordLogin
 
 
@@ -43,7 +44,15 @@ def resolve(label, field_type="text", credential=None):
 
 def test_classify_page_state_fails_closed_for_sso_and_verification():
     assert classify_page_state("https://accounts.google.com/o/oauth", "") == "sso_required"
-    assert classify_page_state("https://example.com", "Check your email for a verification code") == "mfa_required"
+    assert (
+        classify_page_state(
+            PageState(
+                url="https://example.com",
+                inputs=(PageInput(type="text", autocomplete="one-time-code"),),
+            )
+        )
+        == "mfa_required"
+    )
     assert classify_page_state("https://example.com", "Allow camera to continue") == "unsafe_permissions"
 
 
@@ -69,13 +78,13 @@ def test_field_value_for_password_uses_1password_credential():
         item_id="item123",
         title="Example",
         username="candidate@example.com",
-        password="generated-secret",
+        password="pw-test",
         url="https://example.com",
         domain="example.com",
     )
     resolved = resolve("Password", field_type="password", credential=credential)
 
-    assert resolved.value == "generated-secret"
+    assert resolved.value == "pw-test"
     assert resolved.sensitive is True
     assert resolved.source == "1password"
 
