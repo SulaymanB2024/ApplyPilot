@@ -449,7 +449,9 @@ def _run_deterministic_job(
                 "dry_run": dry_run,
                 "job_url": job.get("application_url") or job.get("url"),
                 "account_creation_allowed": settings.allow_account_creation,
-                "onepassword_enabled": settings.onepassword_enabled,
+                "credential_provider": settings.credential_provider,
+                "google_password_manager": settings.uses_google_password_manager,
+                "onepassword_enabled": settings.uses_onepassword,
             },
             indent=2,
         ),
@@ -881,7 +883,7 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                 headless
                 and worker_settings.agent_backend == "codex"
                 and worker_settings.deterministic_controller
-                and worker_settings.onepassword_enabled
+                and worker_settings.uses_onepassword
                 and worker_settings.allow_account_creation
             ):
                 raise RuntimeError("headless_not_supported_with_1password_account_creation")
@@ -890,6 +892,9 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                 port=port,
                 headless=headless,
                 profile_directory=os.environ.get("APPLYPILOT_CHROME_PROFILE_DIRECTORY"),
+                credential_provider=(
+                    "onepassword" if worker_settings.uses_onepassword else worker_settings.credential_provider
+                ),
                 onepassword_extension_id=worker_settings.onepassword_extension_id,
             )
 

@@ -253,6 +253,7 @@ _JOBSPY_BOARD_RULES = {
 }
 
 _SMART_SOURCE_RULES = """Smart-extract source rules:
+- Direct-source mode: prefer employer-owned career pages and ATS-native pages (Workday, Greenhouse, Lever, Ashby, SmartRecruiters, iCIMS, Workable, Jobvite, BambooHR) over aggregators.
 - Search result/listing pages: inspect cards, open the best matching job detail, find the Apply/External Apply/Company Site link, then continue on the employer ATS.
 - Static/fresh-role boards: treat date/freshness, company, location, and title as discovery metadata. They are not application evidence.
 - Remote boards: verify the role is full-time salaried and not a contractor marketplace or talent-network profile before applying.
@@ -337,14 +338,27 @@ def _build_source_catalog(search_config: dict) -> str:
         _BOARD_LABELS.get(str(code).lower(), str(code))
         for code in board_codes
     ]
+    discovery_mode = str(search_config.get("discovery_mode", "hybrid"))
+    if config.uses_direct_source_mode(search_config):
+        jobspy_label = "skipped in direct_sources mode"
+    else:
+        jobspy_label = _compact_list(jobspy_boards)
+    direct_ats_sources = [
+        str(source.get("name") or source.get("slug") or source.get("url"))
+        for source in search_config.get("direct_ats_sources", []) or []
+        if source.get("name") or source.get("slug") or source.get("url")
+    ]
 
     sites_cfg = config.load_sites_config()
+    direct_sources: list[str] = []
     searchable_sources: list[str] = []
     static_sources: list[str] = []
     for site in sites_cfg.get("sites", []):
         name = site.get("name")
         if not name:
             continue
+        if site.get("direct_source") is True:
+            direct_sources.append(name)
         if site.get("type") == "search":
             searchable_sources.append(name)
         else:
@@ -356,7 +370,10 @@ def _build_source_catalog(search_config: dict) -> str:
     manual_ats = sites_cfg.get("manual_ats", [])
 
     return f"""Configured discovery and routing catalog:
-- JobSpy boards from searches.yaml: {_compact_list(jobspy_boards)}
+- Discovery mode: {discovery_mode}
+- Configured direct ATS sources from searches.yaml: {_compact_list(direct_ats_sources)}
+- Direct employer/ATS sources from sites.yaml: {_compact_list(direct_sources)}
+- JobSpy boards from searches.yaml: {jobspy_label}
 - Searchable smart-extract sources from sites.yaml: {_compact_list(searchable_sources)}
 - Static/fresh-role smart-extract sources from sites.yaml: {_compact_list(static_sources)}
 - Manual-only ATS domains: {_compact_list(manual_ats)}
@@ -412,6 +429,26 @@ def build_training_manifest(search_config: dict | None = None) -> dict:
         }
         for code in board_codes
     ]
+    direct_sources = [
+        {
+            "name": site.get("name"),
+            "type": site.get("type", "static"),
+            "url": site.get("url"),
+            "source_kind": site.get("source_kind", "direct_ats"),
+        }
+        for site in sites_cfg.get("sites", [])
+        if site.get("name") and site.get("direct_source") is True
+    ]
+    direct_ats_sources = [
+        {
+            "name": source.get("name") or source.get("slug"),
+            "url": source.get("url"),
+            "ats": source.get("ats"),
+            "slug": source.get("slug"),
+        }
+        for source in search_config.get("direct_ats_sources", []) or []
+        if source.get("name") or source.get("url")
+    ]
     smart_sources = [
         {
             "name": site.get("name"),
@@ -424,6 +461,8 @@ def build_training_manifest(search_config: dict | None = None) -> dict:
 
     return {
         "version": "apply-training-v1",
+        "discovery_mode": search_config.get("discovery_mode", "hybrid"),
+        "direct_source_focus": config.uses_direct_source_mode(search_config),
         "required_capabilities": [
             "workday_application_flow",
             "email_only_local_draft",
@@ -435,6 +474,8 @@ def build_training_manifest(search_config: dict | None = None) -> dict:
         ],
         "scenario_names": [scenario["name"] for scenario in _TRAINING_SCENARIOS],
         "jobspy_boards": jobspy_boards,
+        "direct_ats_sources": direct_ats_sources,
+        "direct_sources": direct_sources,
         "smart_extract_sources": smart_sources,
         "manual_ats_domains": sites_cfg.get("manual_ats", []),
         "blocked_sources": sites_cfg.get("blocked", {}),

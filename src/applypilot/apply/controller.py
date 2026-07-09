@@ -117,8 +117,13 @@ class DeterministicApplyController:
         self.events: list[str] = []
         self.artifacts: dict[str, str] = {}
         self._secrets: list[str] = []
-        self._op = onepassword_client or onepassword.OnePasswordClient(
-            vault=settings.onepassword_vault
+        self._op = (
+            onepassword_client
+            or (
+                onepassword.OnePasswordClient(vault=settings.onepassword_vault)
+                if settings.uses_onepassword
+                else None
+            )
         )
         self._resolver = CodexResolver(model=settings.executor_model, worker_dir=worker_dir)
 
@@ -146,8 +151,14 @@ class DeterministicApplyController:
             )
 
     def _preflight(self) -> None:
-        if self.settings.onepassword_enabled and self.settings.allow_account_creation:
+        if self.settings.uses_onepassword and self.settings.allow_account_creation:
+            if self._op is None:
+                raise RuntimeError("onepassword_required_for_account_creation")
             self._op.require_ready()
+        if self.settings.uses_google_password_manager:
+            self._record(
+                "using Google Password Manager via Chrome profile; credentials are browser-managed"
+            )
 
     def _run_browser(self, *, uploads: dict[str, str], start: float) -> ControllerResult:
         try:
@@ -260,7 +271,7 @@ class DeterministicApplyController:
                 f"{verification.reason}; evidence={list(verification.evidence)}"
             )
             if verification.status == "submitted_confirmed":
-                if credential and credential.pending:
+                if credential and credential.pending and self._op:
                     self._op.mark_created(credential.item_id)
                 return self._finish(
                     "applied",
@@ -304,11 +315,18 @@ class DeterministicApplyController:
                 uploads["cover_letter"] = str(cover_out)
         return uploads
 
-    def _credential_for_page(self, page: Any) -> onepassword.OnePasswordLogin:
+    def _credential_for_page(self, page: Any) -> onepassword.OnePasswordLogin | None:
+        if self.settings.uses_google_password_manager:
+            domain = onepassword.domain_from_url(page.url)
+            self._record(
+                f"using Google Password Manager browser autofill for {domain}; "
+                "no password values are read or generated"
+            )
+            return None
         if not self.settings.allow_account_creation:
             raise RuntimeError("account_required")
-        if not self.settings.onepassword_enabled:
-            raise RuntimeError("onepassword_required_for_account_creation")
+        if not self.settings.uses_onepassword or self._op is None:
+            raise RuntimeError("credential_provider_required_for_account_creation")
 
         email = str(self.profile.get("personal", {}).get("email", ""))
         domain = onepassword.domain_from_url(page.url)
@@ -420,7 +438,7 @@ class DeterministicApplyController:
         ).strip()
         return bool(desired and (desired == current or desired in current.split()))
 
-    def _fill_login_or_account(self, page: Any, credential: onepassword.OnePasswordLogin) -> None:
+    def _fill_login_or_account(self, page: Any, credential: onepassword.OnePasswordLogin | None) -> None:
         filled = self._fill_application_form(page, uploads={"resume": ""}, credential=credential)
         self._record(f"filled {filled} login/account field(s)")
         if not self._click_button_by_text(page, ("continue", "next", "sign in", "log in", "create account", "sign up")):

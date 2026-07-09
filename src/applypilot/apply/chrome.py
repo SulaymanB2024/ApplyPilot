@@ -14,6 +14,11 @@ import time
 from pathlib import Path
 
 from applypilot import config
+from applypilot.apply.google_passwords import (
+    PROVIDER_NAME as GOOGLE_PASSWORD_MANAGER,
+    choose_chrome_profile_for_google_passwords,
+    configure_google_password_preferences,
+)
 from applypilot.apply.onepassword import DEFAULT_EXTENSION_ID, choose_chrome_profile_for_extension
 
 logger = logging.getLogger(__name__)
@@ -160,13 +165,18 @@ def setup_worker_profile(worker_id: int) -> Path:
     return profile_dir
 
 
-def _suppress_restore_nag(profile_dir: Path) -> None:
+def _patch_chrome_preferences(
+    profile_dir: Path,
+    *,
+    profile_directory: str,
+    credential_provider: str,
+) -> None:
     """Clear Chrome's 'restore pages' nag by fixing Preferences.
 
     Chrome writes exit_type=Crashed when killed, which triggers a
     'Restore pages?' prompt on next launch. This patches it out.
     """
-    prefs_file = profile_dir / "Default" / "Preferences"
+    prefs_file = profile_dir / profile_directory / "Preferences"
     if not prefs_file.exists():
         return
 
@@ -175,10 +185,17 @@ def _suppress_restore_nag(profile_dir: Path) -> None:
         prefs.setdefault("profile", {})["exit_type"] = "Normal"
         prefs.setdefault("session", {})["restore_on_startup"] = 4  # 4 = open blank
         prefs.setdefault("session", {}).pop("startup_urls", None)
-        prefs["credentials_enable_service"] = False
-        prefs.setdefault("password_manager", {})["saving_enabled"] = False
-        prefs.setdefault("autofill", {})["profile_enabled"] = False
+        if credential_provider == GOOGLE_PASSWORD_MANAGER:
+            prefs["credentials_enable_service"] = True
+            prefs.setdefault("password_manager", {})["saving_enabled"] = True
+            prefs.setdefault("autofill", {})["profile_enabled"] = True
+        else:
+            prefs["credentials_enable_service"] = False
+            prefs.setdefault("password_manager", {})["saving_enabled"] = False
+            prefs.setdefault("autofill", {})["profile_enabled"] = False
         prefs_file.write_text(json.dumps(prefs), encoding="utf-8")
+        if credential_provider == GOOGLE_PASSWORD_MANAGER:
+            configure_google_password_preferences(profile_dir / profile_directory)
     except Exception:
         logger.debug("Could not patch Chrome preferences", exc_info=True)
 
@@ -192,6 +209,7 @@ def launch_chrome(
     port: int | None = None,
     headless: bool = False,
     profile_directory: str | None = None,
+    credential_provider: str = GOOGLE_PASSWORD_MANAGER,
     onepassword_extension_id: str = DEFAULT_EXTENSION_ID,
 ) -> subprocess.Popen:
     """Launch a Chrome instance with remote debugging for a worker.
@@ -201,6 +219,7 @@ def launch_chrome(
         port: CDP port. Defaults to BASE_CDP_PORT + worker_id.
         headless: Run Chrome in headless mode (no visible window).
         profile_directory: Chrome profile directory inside the user-data root.
+        credential_provider: Job-site credential provider.
         onepassword_extension_id: Extension id used for automatic profile choice.
 
     Returns:
@@ -214,15 +233,32 @@ def launch_chrome(
     # Kill any zombie Chrome from a previous run on this port
     _kill_on_port(port)
 
-    # Patch preferences to suppress restore nag
-    _suppress_restore_nag(profile_dir)
-
     chrome_exe = config.get_chrome_path()
-    launch_profile = (
-        profile_directory
-        or choose_chrome_profile_for_extension(profile_dir, onepassword_extension_id)
-        or config.get_chrome_profile_directory()
+    if credential_provider == "onepassword":
+        launch_profile = (
+            profile_directory
+            or choose_chrome_profile_for_extension(profile_dir, onepassword_extension_id)
+            or config.get_chrome_profile_directory()
+        )
+    elif credential_provider == GOOGLE_PASSWORD_MANAGER:
+        launch_profile = (
+            profile_directory
+            or choose_chrome_profile_for_google_passwords(profile_dir)
+            or config.get_chrome_profile_directory()
+        )
+    else:
+        launch_profile = profile_directory or config.get_chrome_profile_directory()
+
+    # Patch preferences to suppress restore nag and honor credential provider.
+    _patch_chrome_preferences(
+        profile_dir,
+        profile_directory=launch_profile,
+        credential_provider=credential_provider,
     )
+
+    disable_features = ["InfiniteSessionRestore"]
+    if credential_provider != GOOGLE_PASSWORD_MANAGER:
+        disable_features.append("PasswordManagerOnboarding")
 
     cmd = [
         chrome_exe,
@@ -233,11 +269,9 @@ def launch_chrome(
         "--no-default-browser-check",
         "--window-size=1024,768",
         "--disable-session-crashed-bubble",
-        "--disable-features=InfiniteSessionRestore,PasswordManagerOnboarding",
+        f"--disable-features={','.join(disable_features)}",
         "--hide-crash-restore-bubble",
         "--noerrdialogs",
-        "--password-store=basic",
-        "--disable-save-password-bubble",
         "--disable-popup-blocking",
         # Block dangerous permissions at browser level
         "--use-fake-device-for-media-stream",
@@ -245,6 +279,11 @@ def launch_chrome(
         "--deny-permission-prompts",
         "--disable-notifications",
     ]
+    if credential_provider != GOOGLE_PASSWORD_MANAGER:
+        cmd.extend([
+            "--password-store=basic",
+            "--disable-save-password-bubble",
+        ])
     if headless:
         cmd.append("--headless=new")
 

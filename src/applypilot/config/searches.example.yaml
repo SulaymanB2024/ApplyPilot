@@ -2,6 +2,50 @@
 # Copy to your ApplyPilot user data directory as searches.yaml and customize.
 # The wizard (applypilot init) generates a basic version automatically.
 
+# Discovery mode:
+#   hybrid         = direct sources plus configured JobSpy boards (default)
+#   direct_sources = Workday + sites.yaml entries marked direct_source: true only
+#   job_boards     = configured JobSpy boards only
+discovery_mode: hybrid
+
+direct_sources:
+  workday: true
+  direct_ats: true
+  smartextract: true
+
+jobspy_enabled: true
+
+# Optional employer-owned Greenhouse, Lever, and Ashby boards.
+# In direct_sources mode these run without JobSpy or aggregators.
+direct_ats_sources:
+  - name: "Anthropic Greenhouse"
+    url: "https://job-boards.greenhouse.io/anthropic"
+  - name: "OpenAI Ashby"
+    url: "https://jobs.ashbyhq.com/openai"
+  - name: "AccuWeather Greenhouse"
+    url: "https://job-boards.greenhouse.io/accuweather"
+  - name: "NuvoAir Lever"
+    url: "https://jobs.lever.co/NuvoAir"
+  - name: "Phamily Greenhouse"
+    url: "https://job-boards.greenhouse.io/jobsatphamily"
+  - name: "TPG Greenhouse"
+    url: "https://job-boards.greenhouse.io/tpgcareers"
+  - name: "Enova Greenhouse"
+    url: "https://job-boards.greenhouse.io/enova"
+  - name: "Cohere Ashby"
+    url: "https://jobs.ashbyhq.com/cohere"
+  - name: "Waabi Lever"
+    url: "https://jobs.lever.co/waabi"
+
+direct_ats_title_keywords:
+  - "intern"
+  - "internship"
+  - "analyst"
+  - "new grad"
+  - "graduate"
+
+workday_title_filter: true
+
 # Search queries -- each has a query string and priority tier.
 # Tier 1: High-priority exact matches (searched first, highest precision)
 # Tier 2: Strong matches, broader scope

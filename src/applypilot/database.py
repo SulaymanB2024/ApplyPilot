@@ -8,9 +8,10 @@ without migration ordering issues.
 import sqlite3
 import threading
 from datetime import datetime, timezone
+from hashlib import sha1
 from pathlib import Path
 
-from applypilot.apply.runtime import canonical_job_id, domain_from_job_url
+from applypilot.apply.runtime import canonical_job_id, domain_from_job_url, normalized_url_value
 from applypilot.config import DB_PATH
 
 # Thread-local connection storage — each thread gets its own connection
@@ -243,19 +244,53 @@ def backfill_runtime_columns(conn: sqlite3.Connection | None = None) -> int:
         FROM jobs
         WHERE canonical_job_id IS NULL OR canonical_job_id = ''
            OR apply_domain IS NULL OR apply_domain = ''
+           OR LOWER(TRIM(COALESCE(application_url, ''))) IN ('none', 'null', 'nan', 'n/a', 'na', '')
     """).fetchall()
     updated = 0
     for row in rows:
-        canonical = row["canonical_job_id"] or canonical_job_id(row["url"], row["application_url"])
-        domain = row["apply_domain"] or domain_from_job_url(row["application_url"] or row["url"])
+        application_url = normalized_url_value(row["application_url"]) or None
+        canonical = row["canonical_job_id"] or canonical_job_id(row["url"], application_url)
+        canonical = _unique_canonical_job_id(conn, row["url"], application_url, canonical)
+        target_url = normalized_url_value(application_url) or normalized_url_value(row["url"])
+        domain = row["apply_domain"] or domain_from_job_url(target_url)
         conn.execute(
-            "UPDATE jobs SET canonical_job_id = ?, apply_domain = ? WHERE url = ?",
-            (canonical, domain, row["url"]),
+            "UPDATE jobs SET application_url = ?, canonical_job_id = ?, apply_domain = ? WHERE url = ?",
+            (application_url, canonical, domain, row["url"]),
         )
         updated += 1
     if updated:
         conn.commit()
     return updated
+
+
+def _unique_canonical_job_id(
+    conn: sqlite3.Connection,
+    url: str,
+    application_url: str | None,
+    preferred: str,
+) -> str:
+    """Return a deterministic canonical ID that will not violate legacy DB indexes."""
+    if not preferred:
+        return ""
+
+    if not _canonical_exists_for_other_url(conn, preferred, url):
+        return preferred
+
+    fallback = canonical_job_id(url)
+    if fallback and not _canonical_exists_for_other_url(conn, fallback, url):
+        return fallback
+
+    digest = sha1(url.encode("utf-8")).hexdigest()[:12]
+    base = fallback or canonical_job_id(application_url) or "job"
+    return f"{base}#source-{digest}"
+
+
+def _canonical_exists_for_other_url(conn: sqlite3.Connection, canonical: str, url: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM jobs WHERE canonical_job_id = ? AND url != ? LIMIT 1",
+        (canonical, url),
+    ).fetchone()
+    return row is not None
 
 
 def ensure_runtime_indexes(conn: sqlite3.Connection | None = None) -> None:
@@ -423,7 +458,8 @@ def store_jobs(conn: sqlite3.Connection, jobs: list[dict],
             continue
         try:
             canonical = canonical_job_id(url, job.get("application_url"))
-            domain = domain_from_job_url(job.get("application_url") or url)
+            target_url = normalized_url_value(job.get("application_url")) or normalized_url_value(url)
+            domain = domain_from_job_url(target_url)
             conn.execute(
                 "INSERT INTO jobs (url, title, salary, description, location, site, strategy, discovered_at, "
                 "canonical_job_id, apply_domain) "

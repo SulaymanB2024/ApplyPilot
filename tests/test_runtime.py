@@ -1,6 +1,6 @@
 from applypilot.apply import launcher
-from applypilot.apply.runtime import canonical_job_id, full_jitter_delay_seconds
-from applypilot.database import close_connection, init_db, store_jobs
+from applypilot.apply.runtime import canonical_job_id, domain_from_job_url, full_jitter_delay_seconds
+from applypilot.database import backfill_runtime_columns, close_connection, init_db, store_jobs
 
 
 def test_canonical_job_id_strips_tracking_and_preserves_job_keys():
@@ -10,6 +10,14 @@ def test_canonical_job_id_strips_tracking_and_preserves_job_keys():
     )
     assert canonical_job_id("https://boards.greenhouse.io/acme/jobs/456?gh_src=abc") == "greenhouse:456"
     assert canonical_job_id("https://jobs.lever.co/acme/abc-def?utm_campaign=x") == "lever:acme:abc-def"
+
+
+def test_canonical_job_id_ignores_provider_null_sentinels():
+    assert (
+        canonical_job_id("https://www.linkedin.com/jobs/view/4434598539", "None")
+        == "linkedin.com/jobs/view/4434598539"
+    )
+    assert domain_from_job_url("nan") == ""
 
 
 def test_full_jitter_delay_is_capped_with_seeded_rng():
@@ -36,6 +44,32 @@ def test_store_jobs_skips_duplicate_canonical_job_ids(tmp_path):
 
     assert new_count == 1
     assert duplicate_count == 1
+
+
+def test_runtime_backfill_handles_legacy_duplicate_canonical_ids(tmp_path):
+    db_path = tmp_path / "applypilot.db"
+    conn = init_db(db_path)
+    conn.executemany(
+        "INSERT INTO jobs (url, title, application_url) VALUES (?, ?, ?)",
+        [
+            ("https://www.linkedin.com/jobs/view/111?utm_source=a", "Analyst", "None"),
+            ("https://www.linkedin.com/jobs/view/222?utm_source=b", "Analyst 2", "None"),
+            ("https://source.example.com/job?id=1&utm_source=a", "Duplicate A", "https://jobs.example.com/apply?id=1"),
+            ("https://source.example.com/job?id=1&utm_source=b", "Duplicate B", "https://jobs.example.com/apply?id=1"),
+        ],
+    )
+    conn.commit()
+
+    assert backfill_runtime_columns(conn) == 4
+    rows = conn.execute(
+        "SELECT canonical_job_id, apply_domain FROM jobs ORDER BY url"
+    ).fetchall()
+    close_connection(db_path)
+
+    canonical_ids = [row["canonical_job_id"] for row in rows]
+    assert len(canonical_ids) == len(set(canonical_ids))
+    assert "none/" not in canonical_ids
+    assert all(row["apply_domain"] for row in rows)
 
 
 def test_acquire_job_skips_future_retry_and_open_breaker(monkeypatch, tmp_path):

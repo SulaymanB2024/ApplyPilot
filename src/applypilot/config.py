@@ -149,6 +149,46 @@ def _jobspy_country(value: str | None) -> str:
     return aliases.get(normalized, normalized)
 
 
+def normalize_discovery_mode(value: str | None) -> str:
+    """Normalize discovery mode labels used by searches.yaml."""
+    if not value:
+        return "hybrid"
+    normalized = value.strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "all": "hybrid",
+        "default": "hybrid",
+        "mixed": "hybrid",
+        "direct": "direct_sources",
+        "direct_source": "direct_sources",
+        "employer": "direct_sources",
+        "employer_sources": "direct_sources",
+        "company": "direct_sources",
+        "company_sources": "direct_sources",
+        "boards": "job_boards",
+        "job_board": "job_boards",
+        "job_boards_only": "job_boards",
+    }
+    return aliases.get(normalized, normalized)
+
+
+def uses_direct_source_mode(search_cfg: dict | None) -> bool:
+    """Return true when discovery should avoid aggregator/job-board sources."""
+    mode = normalize_discovery_mode((search_cfg or {}).get("discovery_mode"))
+    return mode == "direct_sources"
+
+
+def discovery_source_enabled(search_cfg: dict | None, source: str, default: bool = True) -> bool:
+    """Read per-discovery-source toggles from normalized search config."""
+    cfg = search_cfg or {}
+    direct_sources = cfg.get("direct_sources") or {}
+    legacy_key = f"{source}_enabled"
+    if legacy_key in cfg:
+        return bool(cfg[legacy_key])
+    if source in direct_sources:
+        return bool(direct_sources[source])
+    return default
+
+
 def normalize_search_config(raw: dict | None) -> dict:
     """Normalize historical and example search config shapes.
 
@@ -162,6 +202,7 @@ def normalize_search_config(raw: dict | None) -> dict:
 
     cfg = deepcopy(raw)
     defaults = cfg.setdefault("defaults", {})
+    cfg["discovery_mode"] = normalize_discovery_mode(cfg.get("discovery_mode"))
 
     if "sites" not in cfg and cfg.get("boards"):
         cfg["sites"] = list(cfg["boards"])

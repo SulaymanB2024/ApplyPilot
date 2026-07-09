@@ -257,6 +257,7 @@ def apply(
         and harness_settings.agent_backend == "codex"
         and harness_settings.deterministic_controller
     ):
+        from applypilot.apply.google_passwords import choose_chrome_profile_for_google_passwords
         from applypilot.apply.onepassword import (
             OnePasswordClient,
             OnePasswordError,
@@ -265,7 +266,7 @@ def apply(
 
         if (
             headless
-            and harness_settings.onepassword_enabled
+            and harness_settings.uses_onepassword
             and harness_settings.allow_account_creation
         ):
             console.print(
@@ -274,7 +275,7 @@ def apply(
             )
             raise typer.Exit(code=1)
 
-        if harness_settings.onepassword_enabled and harness_settings.allow_account_creation:
+        if harness_settings.uses_onepassword and harness_settings.allow_account_creation:
             try:
                 OnePasswordClient(vault=harness_settings.onepassword_vault).require_ready()
             except OnePasswordError as exc:
@@ -292,6 +293,16 @@ def apply(
                 )
                 raise typer.Exit(code=1)
             console.print(f"[dim]1Password Chrome profile: {profile_name}[/dim]")
+        elif harness_settings.uses_google_password_manager:
+            profile_name = choose_chrome_profile_for_google_passwords()
+            if not profile_name:
+                console.print(
+                    "[red]Google Password Manager profile not found.[/red]\n"
+                    "Sign in to Chrome or set APPLYPILOT_CHROME_PROFILE_DIRECTORY "
+                    "to the profile that owns your saved passwords."
+                )
+                raise typer.Exit(code=1)
+            console.print(f"[dim]Google Password Manager Chrome profile: {profile_name}[/dim]")
 
     if gen:
         from applypilot.apply.launcher import gen_prompt
@@ -610,6 +621,7 @@ def doctor() -> None:
     from applypilot.config import (
         load_env, PROFILE_PATH, RESUME_PATH, RESUME_PDF_PATH,
         SEARCH_CONFIG_PATH, ENV_PATH, get_chrome_path, get_secret,
+        load_search_config,
     )
 
     load_env()
@@ -641,13 +653,28 @@ def doctor() -> None:
     else:
         results.append(("searches.yaml", warn_mark, "Will use example config — run 'applypilot init'"))
 
+    search_cfg = load_search_config()
+    from applypilot.pipeline import discovery_plan
+    plan = discovery_plan(search_cfg)
+    enabled_sources = [
+        name for name in ("jobspy", "workday", "direct_ats", "smartextract") if plan.get(name)
+    ]
+    results.append((
+        "Discovery mode",
+        ok_mark,
+        f"{plan['mode']} ({', '.join(enabled_sources) or 'no sources enabled'})",
+    ))
+
     # jobspy (optional discovery extra)
-    try:
-        import jobspy  # noqa: F401
-        results.append(("python-jobspy", ok_mark, "Job board scraping available"))
-    except ImportError:
-        results.append(("python-jobspy", warn_mark,
-                        "Install discovery extra: pip install 'applypilot[discovery]'"))
+    if plan["jobspy"]:
+        try:
+            import jobspy  # noqa: F401
+            results.append(("python-jobspy", ok_mark, "Job board scraping available"))
+        except ImportError:
+            results.append(("python-jobspy", warn_mark,
+                            "Install discovery extra: pip install 'applypilot[discovery]'"))
+    else:
+        results.append(("python-jobspy", ok_mark, "Not required for current discovery mode"))
 
     # --- Tier 2 checks ---
     import os
@@ -722,6 +749,10 @@ def doctor() -> None:
                 f"configured for {codex_settings.executor_model}; gpt-5.5 is recommended",
             ))
 
+    from applypilot.apply.google_passwords import (
+        chrome_profiles_with_password_store,
+        choose_chrome_profile_for_google_passwords,
+    )
     from applypilot.apply.onepassword import (
         OnePasswordClient,
         OnePasswordError,
@@ -729,44 +760,69 @@ def doctor() -> None:
         choose_chrome_profile_for_extension,
     )
 
-    op_bin = shutil.which("op")
-    if op_bin:
-        try:
-            OnePasswordClient(vault=harness_settings.onepassword_vault).require_ready()
-            results.append(("1Password CLI", ok_mark, f"{op_bin} (signed in)"))
-        except OnePasswordError as exc:
-            results.append(("1Password CLI", fail_mark, str(exc)))
-    elif harness_settings.onepassword_enabled:
-        results.append(("1Password CLI", fail_mark, "Install 1Password CLI `op` and run `op signin`"))
-    else:
-        results.append(("1Password CLI", warn_mark, "disabled by APPLYPILOT_ONEPASSWORD_ENABLED=0"))
+    results.append(("Credential provider", ok_mark, harness_settings.credential_provider))
 
-    profiles = chrome_profiles_with_extension(
-        extension_id=harness_settings.onepassword_extension_id
-    )
-    selected_profile = choose_chrome_profile_for_extension(
-        extension_id=harness_settings.onepassword_extension_id
-    )
-    if selected_profile:
-        results.append((
-            "1Password extension",
-            ok_mark,
-            f"profile {selected_profile}; found in {', '.join(profiles)}",
-        ))
-    elif harness_settings.onepassword_enabled:
-        results.append((
-            "1Password extension",
-            fail_mark,
-            f"Chrome extension {harness_settings.onepassword_extension_id} not found",
-        ))
-    else:
-        results.append(("1Password extension", warn_mark, "disabled"))
+    if harness_settings.uses_google_password_manager:
+        profiles = chrome_profiles_with_password_store()
+        selected_profile = choose_chrome_profile_for_google_passwords()
+        if selected_profile:
+            detail = f"profile {selected_profile}"
+            if profiles:
+                detail += f"; password store metadata in {', '.join(profiles)}"
+            results.append(("Google Password Manager", ok_mark, detail))
+        else:
+            results.append((
+                "Google Password Manager",
+                warn_mark,
+                "Chrome profile not found; set APPLYPILOT_CHROME_PROFILE_DIRECTORY",
+            ))
+    elif harness_settings.uses_onepassword:
+        op_bin = shutil.which("op")
+        if op_bin:
+            try:
+                OnePasswordClient(vault=harness_settings.onepassword_vault).require_ready()
+                results.append(("1Password CLI", ok_mark, f"{op_bin} (signed in)"))
+            except OnePasswordError as exc:
+                results.append(("1Password CLI", fail_mark, str(exc)))
+        else:
+            results.append(("1Password CLI", fail_mark, "Install 1Password CLI `op` and run `op signin`"))
 
-    if harness_settings.onepassword_enabled and harness_settings.allow_account_creation:
+        profiles = chrome_profiles_with_extension(
+            extension_id=harness_settings.onepassword_extension_id
+        )
+        selected_profile = choose_chrome_profile_for_extension(
+            extension_id=harness_settings.onepassword_extension_id
+        )
+        if selected_profile:
+            results.append((
+                "1Password extension",
+                ok_mark,
+                f"profile {selected_profile}; found in {', '.join(profiles)}",
+            ))
+        else:
+            results.append((
+                "1Password extension",
+                fail_mark,
+                f"Chrome extension {harness_settings.onepassword_extension_id} not found",
+            ))
+    else:
+        results.append((
+            "Credential manager",
+            warn_mark,
+            "disabled; login/account forms will fail closed",
+        ))
+
+    if harness_settings.uses_onepassword and harness_settings.allow_account_creation:
         results.append((
             "Headless apply",
             warn_mark,
             "disabled for 1Password-backed account creation",
+        ))
+    elif harness_settings.uses_google_password_manager:
+        results.append((
+            "Headless apply",
+            warn_mark,
+            "use visible Chrome for browser-managed password prompts/autofill",
         ))
     else:
         results.append(("Headless apply", ok_mark, "available"))

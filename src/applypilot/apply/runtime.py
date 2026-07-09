@@ -34,6 +34,7 @@ CANONICAL_QUERY_KEYS = {
     "reqid",
     "lever-origin",
 }
+NULL_URL_VALUES = {"", "none", "null", "nan", "n/a", "na"}
 
 BREAKER_REASONS = {
     "captcha",
@@ -57,18 +58,29 @@ def isoformat_utc(value: datetime | None = None) -> str:
     return (value or utc_now()).astimezone(timezone.utc).isoformat()
 
 
-def domain_from_job_url(url: str | None) -> str:
-    """Return the canonical domain for a job/application URL."""
-    if not url:
+def normalized_url_value(value: object | None) -> str:
+    """Return a URL-ish string or empty for common provider null sentinels."""
+    if value is None:
         return ""
-    parsed = urlparse(url if "://" in url else f"https://{url}")
+    text = str(value).strip()
+    if text.lower() in NULL_URL_VALUES:
+        return ""
+    return text
+
+
+def domain_from_job_url(url: object | None) -> str:
+    """Return the canonical domain for a job/application URL."""
+    normalized = normalized_url_value(url)
+    if not normalized:
+        return ""
+    parsed = urlparse(normalized if "://" in normalized else f"https://{normalized}")
     host = parsed.netloc.lower()
     return host[4:] if host.startswith("www.") else host
 
 
-def canonical_job_id(url: str | None, application_url: str | None = None) -> str:
+def canonical_job_id(url: object | None, application_url: object | None = None) -> str:
     """Return a stable job identity key from a posting/application URL."""
-    raw = application_url or url or ""
+    raw = normalized_url_value(application_url) or normalized_url_value(url)
     if not raw:
         return ""
     parsed = urlparse(raw if "://" in raw else f"https://{raw}")
@@ -145,7 +157,7 @@ def _ats_specific_key(host: str, path: str, query: dict[str, str]) -> str:
         if len(parts) >= 2:
             return f"lever:{parts[0].lower()}:{parts[-1].lower()}"
     if "myworkdayjobs.com" in host:
-        match = re.search(r"\b((?:r|jr|req)[-_]?\d{3,})\b", normalized_path)
+        match = re.search(r"(?:^|[^a-z0-9])((?:r|jr|req)[-_]?\d{3,})(?:\b|$)", normalized_path)
         if match:
             return f"workday:{host}:{match.group(1).replace('_', '-')}"
     if "ashbyhq.com" in host:

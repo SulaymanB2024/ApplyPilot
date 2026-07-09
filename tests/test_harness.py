@@ -35,7 +35,9 @@ def test_codex_backend_defaults_to_gpt55_and_supervisor():
     assert settings.supervisor_model == "gpt-5.5"
     assert settings.deterministic_controller is True
     assert settings.allow_account_creation is True
-    assert settings.onepassword_enabled is True
+    assert settings.credential_provider == "google_password_manager"
+    assert settings.uses_google_password_manager is True
+    assert settings.uses_onepassword is False
 
 
 def test_executor_model_override_wins_for_codex():

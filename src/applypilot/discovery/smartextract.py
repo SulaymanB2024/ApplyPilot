@@ -83,6 +83,17 @@ def load_sites() -> list[dict]:
     return data.get("sites", [])
 
 
+def _is_direct_source_site(site: dict) -> bool:
+    """Return true for employer-owned or ATS-native source pages."""
+    if site.get("direct_source") is True:
+        return True
+    return str(site.get("source_kind", "")).lower() in {
+        "direct_ats",
+        "employer_careers",
+        "company_careers",
+    }
+
+
 def _store_jobs_filtered(
     conn: sqlite3.Connection,
     jobs: list[dict],
@@ -973,6 +984,9 @@ def build_scrape_targets(
     if search_cfg is None:
         search_cfg = config.load_search_config()
 
+    if config.uses_direct_source_mode(search_cfg):
+        sites = [site for site in sites if _is_direct_source_site(site)]
+
     queries_cfg = search_cfg.get("queries", [])
     queries = [q["query"] for q in queries_cfg]
     locs = search_cfg.get("locations", [])
@@ -1108,8 +1122,11 @@ def run_smart_extract(
         log.warning("No scrape targets configured. Create config/sites.yaml and searches.yaml.")
         return {"total_new": 0, "total_existing": 0, "passed": 0, "total": 0}
 
-    search_sites = sum(1 for s in (sites or load_sites()) if s.get("type") == "search")
-    static_sites = sum(1 for s in (sites or load_sites()) if s.get("type") != "search")
+    active_sites = sites or load_sites()
+    if config.uses_direct_source_mode(search_cfg):
+        active_sites = [site for site in active_sites if _is_direct_source_site(site)]
+    search_sites = sum(1 for s in active_sites if s.get("type") == "search")
+    static_sites = sum(1 for s in active_sites if s.get("type") != "search")
     log.info("Sites: %d searchable, %d static | Total targets: %d (workers=%d)",
              search_sites, static_sites, len(targets), workers)
 

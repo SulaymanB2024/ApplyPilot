@@ -21,7 +21,13 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from applypilot.config import load_env, ensure_dirs
+from applypilot.config import (
+    discovery_source_enabled,
+    load_env,
+    ensure_dirs,
+    load_search_config,
+    uses_direct_source_mode,
+)
 from applypilot.database import init_db, get_connection, get_stats
 
 log = logging.getLogger(__name__)
@@ -35,7 +41,7 @@ console = Console()
 STAGE_ORDER = ("discover", "enrich", "score", "tailor", "cover", "pdf")
 
 STAGE_META: dict[str, dict] = {
-    "discover": {"desc": "Job discovery (JobSpy + Workday + smart extract)"},
+    "discover": {"desc": "Job discovery (direct sources + optional JobSpy)"},
     "enrich":   {"desc": "Detail enrichment (full descriptions + apply URLs)"},
     "score":    {"desc": "LLM scoring (fit 1-10)"},
     "tailor":   {"desc": "Resume tailoring (LLM + validation)"},
@@ -59,42 +65,87 @@ _UPSTREAM: dict[str, str | None] = {
 # Individual stage runners
 # ---------------------------------------------------------------------------
 
+def discovery_plan(search_cfg: dict | None = None) -> dict[str, bool | str]:
+    """Decide which discovery backends are enabled for this run."""
+    cfg = search_cfg if search_cfg is not None else load_search_config()
+    mode = str((cfg or {}).get("discovery_mode", "hybrid"))
+    board_codes = (cfg or {}).get("sites") or (cfg or {}).get("boards") or []
+    jobspy_requested = bool((cfg or {}).get("jobspy_enabled", True))
+    jobspy = bool(board_codes) and jobspy_requested and not uses_direct_source_mode(cfg)
+    direct_default = mode != "job_boards"
+    return {
+        "mode": mode,
+        "jobspy": jobspy,
+        "workday": discovery_source_enabled(cfg, "workday", default=direct_default),
+        "direct_ats": discovery_source_enabled(cfg, "direct_ats", default=direct_default),
+        "smartextract": discovery_source_enabled(cfg, "smartextract", default=direct_default),
+    }
+
+
 def _run_discover(workers: int = 1) -> dict:
     """Stage: Job discovery — JobSpy, Workday, and smart-extract scrapers."""
-    stats: dict = {"jobspy": None, "workday": None, "smartextract": None}
+    plan = discovery_plan()
+    stats: dict = {"jobspy": None, "workday": None, "direct_ats": None, "smartextract": None}
 
     # JobSpy
-    console.print("  [cyan]JobSpy full crawl...[/cyan]")
-    try:
-        from applypilot.discovery.jobspy import run_discovery
-        run_discovery()
-        stats["jobspy"] = "ok"
-    except Exception as e:
-        log.error("JobSpy crawl failed: %s", e)
-        console.print(f"  [red]JobSpy error:[/red] {e}")
-        stats["jobspy"] = f"error: {e}"
+    if plan["jobspy"]:
+        console.print("  [cyan]JobSpy full crawl...[/cyan]")
+        try:
+            from applypilot.discovery.jobspy import run_discovery
+            run_discovery()
+            stats["jobspy"] = "ok"
+        except Exception as e:
+            log.error("JobSpy crawl failed: %s", e)
+            console.print(f"  [red]JobSpy error:[/red] {e}")
+            stats["jobspy"] = f"error: {e}"
+    else:
+        console.print(f"  [dim]JobSpy skipped ({plan['mode']} discovery mode).[/dim]")
+        stats["jobspy"] = "skipped"
 
     # Workday corporate scraper
-    console.print("  [cyan]Workday corporate scraper...[/cyan]")
-    try:
-        from applypilot.discovery.workday import run_workday_discovery
-        run_workday_discovery(workers=workers)
-        stats["workday"] = "ok"
-    except Exception as e:
-        log.error("Workday scraper failed: %s", e)
-        console.print(f"  [red]Workday error:[/red] {e}")
-        stats["workday"] = f"error: {e}"
+    if plan["workday"]:
+        console.print("  [cyan]Workday corporate scraper...[/cyan]")
+        try:
+            from applypilot.discovery.workday import run_workday_discovery
+            run_workday_discovery(workers=workers)
+            stats["workday"] = "ok"
+        except Exception as e:
+            log.error("Workday scraper failed: %s", e)
+            console.print(f"  [red]Workday error:[/red] {e}")
+            stats["workday"] = f"error: {e}"
+    else:
+        console.print("  [dim]Workday scraper skipped by discovery config.[/dim]")
+        stats["workday"] = "skipped"
+
+    # Employer-owned Greenhouse, Lever, and Ashby boards
+    if plan["direct_ats"]:
+        console.print("  [cyan]Direct ATS employer boards...[/cyan]")
+        try:
+            from applypilot.discovery.direct_ats import run_direct_ats_discovery
+            run_direct_ats_discovery()
+            stats["direct_ats"] = "ok"
+        except Exception as e:
+            log.error("Direct ATS discovery failed: %s", e)
+            console.print(f"  [red]Direct ATS error:[/red] {e}")
+            stats["direct_ats"] = f"error: {e}"
+    else:
+        console.print("  [dim]Direct ATS discovery skipped by discovery config.[/dim]")
+        stats["direct_ats"] = "skipped"
 
     # Smart extract
-    console.print("  [cyan]Smart extract (AI-powered scraping)...[/cyan]")
-    try:
-        from applypilot.discovery.smartextract import run_smart_extract
-        run_smart_extract(workers=workers)
-        stats["smartextract"] = "ok"
-    except Exception as e:
-        log.error("Smart extract failed: %s", e)
-        console.print(f"  [red]Smart extract error:[/red] {e}")
-        stats["smartextract"] = f"error: {e}"
+    if plan["smartextract"]:
+        console.print("  [cyan]Smart extract (AI-powered scraping)...[/cyan]")
+        try:
+            from applypilot.discovery.smartextract import run_smart_extract
+            run_smart_extract(workers=workers)
+            stats["smartextract"] = "ok"
+        except Exception as e:
+            log.error("Smart extract failed: %s", e)
+            console.print(f"  [red]Smart extract error:[/red] {e}")
+            stats["smartextract"] = f"error: {e}"
+    else:
+        console.print("  [dim]Smart extract skipped by discovery config.[/dim]")
+        stats["smartextract"] = "skipped"
 
     return stats
 
