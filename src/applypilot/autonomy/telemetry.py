@@ -171,7 +171,7 @@ class UsageLedger:
 
     def _check_elapsed(self) -> None:
         elapsed = time.monotonic() - self.started_monotonic
-        if elapsed > self.budget.elapsed_seconds:
+        if self.budget.elapsed_seconds and elapsed > self.budget.elapsed_seconds:
             raise BudgetExceeded(
                 f"elapsed time budget exhausted ({int(elapsed)}/{self.budget.elapsed_seconds}s)"
             )

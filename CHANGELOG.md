@@ -10,7 +10,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - **Tool-first ChatGPT Web autonomy** - Added a strict JSON-in/JSON-out adapter,
   first-party role verification, compact fact packs, review-only form inspection, and
-  `applypilot autonomy plan|probe-chatgpt|run` commands.
+  `applypilot autonomy plan|advance|import-response|probe-chatgpt|run` commands.
+- **Portable browser handoff queue** - Added manifest-bound, request-ID-bound ChatGPT Web
+  artifacts so an authenticated browser tool can service at most three small model calls
+  without exposing browser credentials or spawning a nested model process.
 - **Bounded funnel telemetry** - Added hard per-run budgets, privacy-preserving usage
   ledgers, deterministic eligibility/freshness gates, and no-progress circuit breakers.
 - **Applicant fact ledger** - Added versioned profile/resume snapshots and explicit
@@ -35,6 +38,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   requires the per-run `--allow-account-creation` flag.
 - **Discovery source policy** - The autonomy funnel uses ChatGPT Web first and permits
   direct ATS fallback only after a recorded primary failure; broad aggregators are disabled.
+- **Resumable autonomy contract** - Reviewed facts, context, policy, query, run ID, prompts,
+  and imported responses are digest-bound; missing responses remain pending and stale,
+  swapped, or one-sided edits inconsistent with the receipt fail closed. Receipts are not
+  claimed to resist a hostile local writer who can modify both files.
+- **Rich model context** - ChatGPT Web receives up to 30 confirmed, contact-free facts plus
+  structured work samples, results, skills, preferences, and longer verified job evidence.
+  Calls may research and deliberate without a fixed time deadline while final artifacts remain
+  strict, bounded JSON.
+- **Handoff and evidence hardening** - Dynamic query/job inputs now bind request receipts,
+  semantically rejected material can be corrected after quarantine, fact approvals bind source
+  hashes, shared ATS tenants bind to employers, and form-review success rejects unrelated URLs,
+  challenges, logins, account creation, unknown fields, and field-value aliases.
+- **Structured applicant claims** - Material prompt schema v2 separates applicant assertions
+  from job evidence. Every first-person or possessive assertion must exactly match a structured
+  claim supported by applicant facts; `JOB` evidence cannot establish an applicant skill.
+- **Autonomy-aware doctor** - `doctor --autonomy` validates artifact transport and the required
+  contact, work-authorization, sponsorship, and availability facts without requiring a legacy
+  model API key; optional corrections use `--autonomy-corrections`.
 - **Provider error honesty** - Sequential and streaming discovery retain structured
   provider errors instead of converting failed coverage into a successful empty result.
 - **Training audit semantics** - Zero JobSpy boards are N/A only in `direct_sources`

@@ -364,6 +364,47 @@ def test_doctor_strict_requires_chatgpt_web_probe(monkeypatch, tmp_path):
     assert "configured but unprobed" in result.output
 
 
+def test_doctor_autonomy_checks_facts_without_requiring_model_api_key(monkeypatch, tmp_path):
+    from applypilot import config
+
+    profile_path = tmp_path / "profile.json"
+    resume_path = tmp_path / "resume.txt"
+    profile_path.write_text(
+        json.dumps(
+            {
+                "personal": {"phone": "555-0100"},
+                "work_authorization": {
+                    "legally_authorized_to_work": True,
+                    "require_sponsorship": False,
+                },
+                "availability": {"earliest_start_date": "2027-05-15"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    resume_path.write_text("Built a synthetic SQL dashboard.", encoding="utf-8")
+    monkeypatch.delenv("APPLYPILOT_LLM_PROVIDER", raising=False)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("LLM_URL", raising=False)
+    monkeypatch.setattr(config, "PROFILE_PATH", profile_path)
+    monkeypatch.setattr(config, "RESUME_PATH", resume_path)
+    monkeypatch.setattr(config, "RESUME_PDF_PATH", tmp_path / "resume.pdf")
+    monkeypatch.setattr(config, "SEARCH_CONFIG_PATH", tmp_path / "searches.yaml")
+    monkeypatch.setattr(config, "ENV_PATH", tmp_path / ".env")
+    monkeypatch.setattr(config, "load_search_config", lambda: {"discovery_mode": "direct_sources"})
+    monkeypatch.setattr(config, "get_chrome_path", lambda: "/Applications/Google Chrome.app")
+    monkeypatch.setattr(config, "get_secret", lambda _name, default="": default)
+
+    result = runner.invoke(app, ["doctor", "--autonomy", "--strict", "--json"])
+
+    assert result.exit_code == 0, result.output
+    assert '"ready": true' in result.output
+    assert '"ChatGPT Web artifact transport"' in result.output
+    assert '"Autonomy facts"' in result.output
+    assert '"LLM API key"' not in result.output
+
+
 def test_harness_contract_references_training_manifest(tmp_path):
     prompt_path = tmp_path / "input_prompt.md"
     prompt_path.write_text("prompt", encoding="utf-8")

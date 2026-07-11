@@ -25,7 +25,8 @@ pipeline evidence.
 
 The `applypilot autonomy` path is a finite, artifact-first coordinator:
 
-1. Build a versioned fact ledger and a compact, contact-free context pack.
+1. Build a source-bound fact ledger and a compact context pack from an explicit allowlist of
+   confirmed facts.
 2. Ask ChatGPT Web for a bounded list of official employer or ATS URLs using strict JSON.
 3. Reject senior, experience-ineligible, and known availability-conflicting roles locally.
 4. Verify each remaining role against a first-party ATS or employer surface without a model.
@@ -50,26 +51,31 @@ Default limits per run are:
 | Read-only form reviews | 1 |
 | Browser navigations | 8 |
 | External calls | 15 |
-| Prompt characters per model call | 12,000 |
-| Response characters per model call | 40,000 |
-| Elapsed time | 15 minutes |
+| Prompt characters per model call | 40,000 |
+| Response characters per model call | 80,000 |
+| Model-call time | No fixed deadline |
 
 Telemetry stores hashes, counts, durations, and observed or estimated token fields. It does not
-store raw prompts in the usage ledger. The acceptance target for a representative end-to-end
-run is at least a 90% token reduction from the 19.35-million-token failure baseline. That target
-must be measured on a fresh run after the applicant fact ledger is corrected; it is not claimed
-from unit tests.
+store raw prompts in the usage ledger. Model calls may research and reason for as long as they
+need; limits apply to the number and size of calls, not their thinking time. Context is curated
+and evidence-rich rather than intentionally sparse: the default pack allows up to 24,000
+characters and 30 confirmed facts while excluding contact details, demographics, secrets,
+unknowns, and rejected claims. The acceptance target for a representative end-to-end run is at
+least a 90% token reduction from the 19.35-million-token failure baseline. That target must be
+measured on a fresh run after the applicant fact ledger is corrected; it is not claimed from
+unit tests.
 
 ## Fact corrections
 
-Create a corrections file from `fact_corrections.example.json`. Corrections are applied to an
-immutable snapshot; they never silently rewrite `profile.json` or `resume.txt`.
+Create a corrections file from `fact_corrections.example.json`. It can live anywhere; pass its
+exact path rather than assuming the legacy `~/.applypilot` directory. Corrections are applied
+to an immutable snapshot; they never silently rewrite `profile.json` or `resume.txt`.
 
 ```bash
-cp fact_corrections.example.json ~/.applypilot/fact_corrections.json
+cp fact_corrections.example.json ~/applypilot-fact-corrections.json
 applypilot autonomy plan \
   --query "entry-level product and data roles" \
-  --corrections ~/.applypilot/fact_corrections.json
+  --corrections ~/applypilot-fact-corrections.json
 ```
 
 Review the generated `fact_ledger.json` before allowing browser or model work. Blank,
@@ -79,22 +85,70 @@ to start if the fresh profile, resume, corrections file, or approved digest diff
 
 ## ChatGPT Web operation
 
-The adapter expects a caller-provided, authenticated Chrome CDP session. It reads only the
-ChatGPT composer and the final assistant turn; it does not extract cookies, local storage,
-sidebar history, or whole-page text.
+The recommended path is a portable request/response queue. `plan` binds the reviewed fact,
+context, policy, query, and run digests, then writes one compact discovery request. `advance`
+either performs deterministic local work or returns one pending request for the browser agent.
+The browser agent sends only that prompt in ChatGPT Web and returns one strict JSON object.
+ChatGPT is explicitly encouraged to research deeply, consider the candidate's broader
+trajectory and adjacent strengths, and compare multiple approaches internally before emitting
+the final object. The strict schema governs the returned artifact, not the depth of reasoning.
+ApplyPilot never receives cookies, local storage, passwords, sidebar history, or whole-page text.
 
 ```bash
-applypilot autonomy probe-chatgpt --cdp-port 9222
-applypilot autonomy run \
-  --query "entry-level product and data roles" \
-  --cdp-port 9222 \
-  --corrections ~/.applypilot/fact_corrections.json \
+applypilot autonomy advance \
+  --run-dir COPY_THE_PLAN_RUN_DIRECTORY_HERE \
+  --approved-fact-digest COPY_THE_REVIEWED_PLAN_DIGEST_HERE
+
+# The result names one pending request and its expected response path.
+# After the authenticated browser tool returns a bare JSON object:
+applypilot autonomy import-response \
+  --request COPY_THE_PENDING_REQUEST_PATH_HERE \
+  --input COPY_THE_BROWSER_RESPONSE_FILE_HERE
+
+# Repeat until status is review_ready; the hard cap is three ChatGPT calls.
+applypilot autonomy advance \
+  --run-dir COPY_THE_PLAN_RUN_DIRECTORY_HERE \
   --approved-fact-digest COPY_THE_REVIEWED_PLAN_DIGEST_HERE
 ```
 
-`autonomy run` is review-only. It may discover roles, verify first-party evidence, write local
-cover-letter packets, and inspect one form surface. It never fills, uploads, submits, sends
-email, or changes an external account.
+Each response must echo a request ID that binds the run, stage, query or verified-job input,
+candidate, facts, context, policy, and prompt-schema version. Each semantically accepted
+response gets a coordinator-enforced hash receipt. Missing response files mean "pending," not
+"provider failed," so they cannot silently authorize fallback discovery. A stale, swapped,
+one-sided edited, or oversized response fails closed. Semantically rejected material is moved
+to a hash-named quarantine so a corrected bounded response can be imported without accepting
+the rejected output.
+Accepted receipts and hash-named rejection records are restored into the usage ledger on every
+`advance`, so resuming the CLI cannot reset the three-model-call budget or make a failed tool
+attempt disappear.
+
+The receipt is an integrity/replay control, not a cryptographic defense against a hostile local
+writer who can modify both the response and its receipt. Protect the run directory with normal
+OS account and filesystem permissions; no documentation or UI should describe these receipts
+as signed or tamper-proof.
+The browser transport must extract the assistant message's DOM `textContent`; using ChatGPT's
+rendered "Copy response" action can Markdown-linkify URLs and corrupt otherwise valid JSON.
+
+The artifact runner is review-only. It may discover roles, verify first-party evidence, and
+write local cover-letter packets. It never fills, uploads, submits, sends email, or changes an
+external account. `probe-chatgpt` and `run` remain available as optional caller-provided CDP
+compatibility commands, but they are no longer the recommended authenticated-browser path.
+
+First-party verification does not trust a hostname merely because it contains the company
+name. Shared Greenhouse, Lever, Ashby, Workday, and Avature surfaces must bind their tenant to
+the candidate company; configured employer sources bind company, exact host, path prefix, and
+source kind. Account-backed recruiters and aggregators cannot become first-party evidence.
+The browser form artifact is also bound to the verified role site and cannot report success
+when CAPTCHA, login, or account creation is required. Unknown JSON fields and all field-value
+aliases are rejected.
+
+Material prompt schema v2 separates applicant assertions from job evidence. Every prose
+sentence that asserts something about the applicant through `I`, `me`, or `my` must be copied
+verbatim into a structured `applicant_claims` entry. Those entries may cite confirmed `F` facts
+only—never `JOB`—and their terms, named entities, and numbers are validated against exactly
+those facts. This prevents a job requirement from becoming an applicant skill merely through
+different grammar while leaving ChatGPT free to reason deeply about narrative and fit before
+it emits the audited artifact.
 
 The existing deterministic form controller also defaults to dry-run:
 
@@ -118,9 +172,11 @@ Before a real submission campaign, complete all of these checks:
 
 - Applicant profile, resume, and corrections agree; required contact, work-authorization, and
   availability facts are confirmed.
-- `applypilot doctor --strict --json` reports no required missing checks.
-- A fresh authenticated ChatGPT Web probe succeeds without sending.
-- A review-only autonomy run produces official, first-party-verified candidates and clean
+- `applypilot doctor --autonomy --strict --json` reports no required missing checks. This mode
+  checks the artifact transport and required applicant facts without demanding a legacy model
+  API key; pass `--autonomy-corrections PATH` when the reviewed run uses corrections.
+- The authenticated browser tool can service one synthetic handoff without personal data.
+- A review-only artifact run produces official, first-party-verified candidates and clean
   material packets.
 - The exact role and final materials are reviewed before invoking the separate `--submit`
   boundary.

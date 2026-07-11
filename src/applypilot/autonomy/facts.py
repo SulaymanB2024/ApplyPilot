@@ -11,6 +11,15 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
+FACT_LEDGER_VERSION = "applypilot-facts-v1"
+REQUIRED_AUTONOMY_FACT_IDS = (
+    "profile.personal.phone",
+    "profile.work_authorization.legally_authorized_to_work",
+    "profile.work_authorization.require_sponsorship",
+    "profile.availability.earliest_start_date",
+)
+
+
 class FactState(StrEnum):
     CONFIRMED = "confirmed"
     UNKNOWN = "unknown"
@@ -143,18 +152,18 @@ def build_fact_ledger(
             )
         )
 
-    payload = json.dumps(
-        [asdict(record) for record in records],
-        sort_keys=True,
-        default=str,
-        ensure_ascii=False,
+    digest = _ledger_digest(
+        version=FACT_LEDGER_VERSION,
+        profile_sha256=profile_hash,
+        resume_sha256=resume_hash,
+        records=records,
     )
     return FactLedger(
-        version="applypilot-facts-v1",
+        version=FACT_LEDGER_VERSION,
         profile_sha256=profile_hash,
         resume_sha256=resume_hash,
         records=tuple(records),
-        digest=_hash(payload),
+        digest=digest,
     )
 
 
@@ -176,6 +185,57 @@ def load_corrections(path: Path) -> tuple[FactCorrection, ...]:
             )
         )
     return tuple(result)
+
+
+def fact_ledger_from_dict(payload: dict[str, Any]) -> FactLedger:
+    """Load an immutable fact-ledger snapshot and verify its content digest."""
+    if payload.get("version") != FACT_LEDGER_VERSION:
+        raise ValueError("unsupported fact ledger version")
+    records_payload = payload.get("records")
+    if not isinstance(records_payload, list):
+        raise ValueError("fact ledger records must be a list")
+    records: list[FactRecord] = []
+    for raw in records_payload:
+        if not isinstance(raw, dict):
+            raise ValueError("fact ledger record must be an object")
+        records.append(
+            FactRecord(
+                fact_id=str(raw.get("fact_id") or ""),
+                value=str(raw.get("value") or ""),
+                state=FactState(str(raw.get("state") or "unknown")),
+                source=str(raw.get("source") or ""),
+                source_sha256=str(raw.get("source_sha256") or ""),
+                reason=str(raw.get("reason") or ""),
+            )
+        )
+    profile_sha256 = str(payload.get("profile_sha256") or "")
+    resume_sha256 = str(payload.get("resume_sha256") or "")
+    if not profile_sha256 or not resume_sha256:
+        raise ValueError("fact ledger source digests are missing")
+    for record in records:
+        if not record.fact_id or not record.source or not record.source_sha256:
+            raise ValueError("fact ledger record bindings are incomplete")
+        expected_source_hash = {
+            "profile.json": profile_sha256,
+            "resume.txt": resume_sha256,
+        }.get(record.source)
+        if expected_source_hash is not None and record.source_sha256 != expected_source_hash:
+            raise ValueError("fact ledger record source digest mismatch")
+    expected_digest = _ledger_digest(
+        version=FACT_LEDGER_VERSION,
+        profile_sha256=profile_sha256,
+        resume_sha256=resume_sha256,
+        records=records,
+    )
+    if payload.get("digest") != expected_digest:
+        raise ValueError("fact ledger content digest mismatch")
+    return FactLedger(
+        version=FACT_LEDGER_VERSION,
+        profile_sha256=profile_sha256,
+        resume_sha256=resume_sha256,
+        records=tuple(records),
+        digest=expected_digest,
+    )
 
 
 def validate_artifact_against_ledger(text: str, ledger: FactLedger) -> list[str]:
@@ -268,3 +328,27 @@ def _normalize(value: str) -> str:
 
 def _hash(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _ledger_digest(
+    *,
+    version: str,
+    profile_sha256: str,
+    resume_sha256: str,
+    records: Iterable[FactRecord],
+) -> str:
+    payload = {
+        "version": version,
+        "profile_sha256": profile_sha256,
+        "resume_sha256": resume_sha256,
+        "records": [asdict(record) for record in records],
+    }
+    return _hash(
+        json.dumps(
+            payload,
+            sort_keys=True,
+            default=str,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+    )

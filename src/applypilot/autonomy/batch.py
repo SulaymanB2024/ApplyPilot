@@ -9,6 +9,7 @@ from typing import Any, Protocol
 
 from applypilot.autonomy.context import CompactContextPack
 from applypilot.autonomy.facts import FactLedger, validate_artifact_against_ledger
+from applypilot.autonomy.handoff import ArtifactPending
 from applypilot.autonomy.models import (
     AuthorizationGrant,
     BatchResult,
@@ -112,6 +113,7 @@ class AutonomousBatch:
     def run(self, *, query: str) -> BatchResult:
         result = BatchResult(run_id=self.run_id, status="running")
         attempts: list[SourceAttempt] = []
+        review_required: dict[str, set[str]] = {}
         try:
             candidates = self._discover(query=query, attempts=attempts, result=result)
             accepted: list[RoleCandidate] = []
@@ -126,9 +128,13 @@ class AutonomousBatch:
                         "evidence": list(decision.evidence),
                     }
                 )
-                if decision.decision is Decision.ACCEPT:
+                if decision.decision is not Decision.REJECT:
                     accepted.append(candidate)
-                else:
+                    if decision.decision is Decision.REVIEW:
+                        review_required.setdefault(candidate.candidate_id, set()).update(
+                            decision.reason_codes
+                        )
+                if decision.decision is not Decision.ACCEPT:
                     result.blockers.append(
                         {
                             "candidate_id": candidate.candidate_id,
@@ -158,7 +164,18 @@ class AutonomousBatch:
                         "provider_error": evidence.provider_error,
                     }
                 )
-                if decision.decision is Decision.ACCEPT:
+                reviewable_freshness = (
+                    decision.decision is Decision.REVIEW
+                    and set(decision.reason_codes) == {"freshness_dates_missing"}
+                    and evidence.first_party
+                    and evidence.resolved
+                    and evidence.open_state is True
+                )
+                if decision.decision is Decision.ACCEPT or reviewable_freshness:
+                    if reviewable_freshness:
+                        review_required.setdefault(candidate.candidate_id, set()).update(
+                            decision.reason_codes
+                        )
                     verified_candidate = replace(
                         candidate,
                         official_url=evidence.official_url,
@@ -167,17 +184,28 @@ class AutonomousBatch:
                         posted_date=evidence.posted_date or candidate.posted_date,
                         start_window=evidence.start_window or candidate.start_window,
                     )
+                    if verified_candidate.candidate_id != candidate.candidate_id:
+                        review_required.setdefault(
+                            verified_candidate.candidate_id,
+                            set(),
+                        ).update(review_required.get(candidate.candidate_id, set()))
                     verified_eligibility = eligibility_gate(verified_candidate, self.profile)
                     result.eligibility.append(
                         {
-                            "candidate_id": candidate.candidate_id,
+                            "candidate_id": verified_candidate.candidate_id,
+                            "discovery_candidate_id": candidate.candidate_id,
                             "basis": "first_party",
                             "decision": verified_eligibility.decision.value,
                             "reason_codes": list(verified_eligibility.reason_codes),
                             "evidence": list(verified_eligibility.evidence),
                         }
                     )
-                    if verified_eligibility.decision is Decision.ACCEPT:
+                    if verified_eligibility.decision is not Decision.REJECT:
+                        if verified_eligibility.decision is Decision.REVIEW:
+                            review_required.setdefault(
+                                verified_candidate.candidate_id,
+                                set(),
+                            ).update(verified_eligibility.reason_codes)
                         verified.append(
                             (
                                 verified_candidate,
@@ -189,6 +217,7 @@ class AutonomousBatch:
                         result.blockers.append(
                             {
                                 "candidate_id": candidate.candidate_id,
+                                "verified_candidate_id": verified_candidate.candidate_id,
                                 "stage": "verified_eligibility",
                                 "decision": verified_eligibility.decision.value,
                                 "reason_codes": list(verified_eligibility.reason_codes),
@@ -232,6 +261,9 @@ class AutonomousBatch:
                         "candidate_id": candidate.candidate_id,
                         "fit_score": score,
                         "verification_gaps": list(packet.verification_gaps),
+                        "human_review_required": sorted(
+                            review_required.get(candidate.candidate_id, set())
+                        ),
                         "artifact_paths": dict(packet.artifact_paths),
                     }
                 )
@@ -259,6 +291,10 @@ class AutonomousBatch:
                 if len(authorized_packets) != 1:
                     raise PermissionError("authorization must identify exactly one prepared candidate")
                 for candidate, packet in authorized_packets:
+                    if review_required.get(candidate.candidate_id):
+                        raise PermissionError(
+                            "eligibility review must be resolved before submission"
+                        )
                     review = next(
                         (
                             item
@@ -299,12 +335,33 @@ class AutonomousBatch:
                             f"final action status={str(action.get('status') or 'missing')[:80]}"
                         )
 
+            form_review_blocked = bool(result.form_reviews) and any(
+                review.get("status") not in {"form_surface_reviewed", "dry_run_verified"}
+                for review in result.form_reviews
+            )
             result.status = (
                 "submitted"
                 if result.final_actions
+                else "form_review_blocked"
+                if packets and form_review_blocked
                 else "review_ready"
                 if packets
                 else "no_eligible_verified_roles"
+            )
+        except ArtifactPending as exc:
+            result.status = (
+                "awaiting_chatgpt_web"
+                if exc.surface == "chatgpt_web"
+                else "awaiting_browser_tool"
+            )
+            result.pending_requests.append(exc.to_dict())
+            result.blockers.append(
+                {
+                    "stage": f"{exc.surface}_handoff",
+                    "decision": "review",
+                    "reason_codes": [f"{exc.surface}_response_required"],
+                    "request_id": exc.request_id,
+                }
             )
         except BudgetExceeded as exc:
             result.status = "budget_exhausted"
@@ -339,6 +396,7 @@ class AutonomousBatch:
                 result.blockers.append(
                     {"stage": "budget", "decision": "reject", "reason_codes": [str(exc)]}
                 )
+        result.source_attempts = [asdict(attempt) for attempt in attempts]
         result.usage = self.ledger.snapshot()
         self._write_result(result)
         return result
@@ -360,6 +418,8 @@ class AutonomousBatch:
                 limit=self.ledger.remaining("discoveries"),
             )
             attempts.append(SourceAttempt(self.policy.source.primary, "ok"))
+        except ArtifactPending:
+            raise
         except Exception as exc:
             attempts.append(SourceAttempt(self.policy.source.primary, "failed", str(exc)[:200]))
             if self.dependencies.fallback_discovery is None:
@@ -379,7 +439,10 @@ class AutonomousBatch:
             )
             attempts.append(SourceAttempt(fallback_name, "ok", "recorded primary failure"))
 
-        candidates = candidates[: self.ledger.remaining("discoveries")]
+        unique_candidates: dict[str, RoleCandidate] = {}
+        for candidate in candidates:
+            unique_candidates.setdefault(candidate.candidate_id, candidate)
+        candidates = list(unique_candidates.values())[: self.ledger.remaining("discoveries")]
         self.ledger.reserve("discoveries", len(candidates))
         result.discoveries.extend(
             {

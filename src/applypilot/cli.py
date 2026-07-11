@@ -512,6 +512,63 @@ def autonomy_plan(
     console.print(f"[bold]Fact digest to approve after review:[/bold] {paths['fact_digest']}")
 
 
+@autonomy_app.command("import-response")
+def autonomy_import_response(
+    request: Path = typer.Option(..., "--request", help="Bound ChatGPT handoff request."),
+    input_path: Path = typer.Option(
+        ...,
+        "--input",
+        help="File containing the one bare JSON object returned by ChatGPT Web.",
+    ),
+) -> None:
+    """Validate and atomically import one ChatGPT Web response artifact."""
+    _bootstrap_config_only()
+    from applypilot.autonomy.handoff import import_response_artifact
+
+    try:
+        result = import_response_artifact(
+            request_path=request,
+            input_path=input_path,
+        )
+    except Exception as exc:
+        console.print(
+            f"[red]ChatGPT response import failed:[/red] {type(exc).__name__}: {str(exc)[:160]}"
+        )
+        raise typer.Exit(code=1) from exc
+    console.print_json(data=result)
+
+
+@autonomy_app.command("advance")
+def autonomy_advance(
+    run_dir: Path = typer.Option(..., "--run-dir", help="Reviewed autonomy run directory."),
+    approved_fact_digest: str = typer.Option(
+        ...,
+        "--approved-fact-digest",
+        help="Exact digest from this run's reviewed fact_ledger.json.",
+    ),
+) -> None:
+    """Advance a reviewed artifact run until the next bounded browser handoff."""
+    _bootstrap_config_only()
+    from applypilot.autonomy.runner import advance_artifact_run
+
+    try:
+        result = advance_artifact_run(
+            run_dir=run_dir,
+            approved_fact_digest=approved_fact_digest,
+        )
+    except Exception as exc:
+        console.print(f"[red]Autonomy advance failed:[/red] {type(exc).__name__}: {str(exc)[:160]}")
+        raise typer.Exit(code=1) from exc
+    console.print_json(data=result)
+    if result.get("status") not in {
+        "awaiting_browser_tool",
+        "awaiting_chatgpt_web",
+        "review_ready",
+        "no_eligible_verified_roles",
+    }:
+        raise typer.Exit(code=1)
+
+
 @autonomy_app.command("probe-chatgpt")
 def autonomy_probe_chatgpt(
     cdp_port: int = typer.Option(9222, "--cdp-port", help="Authenticated Chrome debugging port."),
@@ -759,6 +816,16 @@ def training_audit(
 def doctor(
     strict: bool = typer.Option(False, "--strict", help="Exit nonzero when required checks are missing."),
     json_output: bool = typer.Option(False, "--json", help="Print machine-readable check results."),
+    autonomy: bool = typer.Option(
+        False,
+        "--autonomy",
+        help="Check the portable ChatGPT Web autonomy path instead of legacy API-key scoring.",
+    ),
+    autonomy_corrections: Optional[Path] = typer.Option(
+        None,
+        "--autonomy-corrections",
+        help="Optional fact_corrections.json used by the autonomy readiness check.",
+    ),
     chatgpt_cdp_port: Optional[int] = typer.Option(
         None,
         "--chatgpt-cdp-port",
@@ -831,7 +898,68 @@ def doctor(
     has_openai = bool(get_secret("OPENAI_API_KEY"))
     has_local = bool(os.environ.get("LLM_URL"))
     configured_provider = os.environ.get("APPLYPILOT_LLM_PROVIDER", "").strip().lower()
-    if configured_provider == "chatgpt_web":
+    if autonomy:
+        results.append((
+            "ChatGPT Web artifact transport",
+            ok_mark,
+            "portable request/response queue; no model API key or CDP ownership required",
+        ))
+        if PROFILE_PATH.exists() and RESUME_PATH.exists():
+            try:
+                import json as json_module
+
+                from applypilot.autonomy.facts import (
+                    REQUIRED_AUTONOMY_FACT_IDS,
+                    build_fact_ledger,
+                    load_corrections,
+                    require_confirmed_facts,
+                )
+
+                profile_data = json_module.loads(PROFILE_PATH.read_text(encoding="utf-8"))
+                corrections = (
+                    load_corrections(autonomy_corrections)
+                    if autonomy_corrections is not None
+                    else ()
+                )
+                fact_ledger = build_fact_ledger(
+                    profile_data,
+                    resume_text=RESUME_PATH.read_text(encoding="utf-8"),
+                    corrections=corrections,
+                )
+                fact_blockers = require_confirmed_facts(
+                    fact_ledger,
+                    REQUIRED_AUTONOMY_FACT_IDS,
+                )
+            except Exception as exc:
+                results.append((
+                    "Autonomy facts",
+                    fail_mark,
+                    f"fact readiness check failed: {type(exc).__name__}",
+                ))
+            else:
+                results.append((
+                    "Autonomy facts",
+                    fail_mark if fact_blockers else ok_mark,
+                    ", ".join(fact_blockers)
+                    if fact_blockers
+                    else "required contact, work authorization, sponsorship, and availability confirmed",
+                ))
+        if chatgpt_cdp_port is not None:
+            try:
+                from applypilot.autonomy.runner import probe_chatgpt_cdp
+
+                probe = probe_chatgpt_cdp(cdp_port=chatgpt_cdp_port)
+            except Exception as exc:
+                results.append(("Optional ChatGPT CDP probe", warn_mark, f"probe failed: {type(exc).__name__}"))
+            else:
+                results.append((
+                    "Optional ChatGPT CDP probe",
+                    ok_mark if probe.get("available") else warn_mark,
+                    "authenticated composer available; no prompt sent"
+                    if probe.get("available")
+                    else "authenticated composer unavailable; artifact browser tool remains supported",
+                ))
+    elif configured_provider == "chatgpt_web":
         if chatgpt_cdp_port is None:
             results.append((
                 "ChatGPT Web",

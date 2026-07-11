@@ -57,9 +57,9 @@ class FunnelBudget:
     external_calls: int = 15
     retries: int = 2
     artifacts: int = 12
-    prompt_chars: int = 12_000
-    response_chars: int = 40_000
-    elapsed_seconds: int = 900
+    prompt_chars: int = 40_000
+    response_chars: int = 80_000
+    elapsed_seconds: int = 0
     no_progress_cycles: int = 2
 
     def validate(self) -> None:
@@ -169,9 +169,10 @@ def eligibility_gate(candidate: RoleCandidate, profile: CandidateProfile) -> Gat
             (candidate.title,),
         )
 
-    location = _normalize(candidate.location)
+    location = _normalize_location(candidate.location)
     if location and profile.preferred_locations and not any(
-        _phrase(location, preferred) for preferred in profile.preferred_locations
+        _phrase(location, _normalize_location(preferred))
+        for preferred in profile.preferred_locations
     ):
         return GateDecision(Decision.REVIEW, ("location_outside_preferences",), (candidate.location,))
 
@@ -295,6 +296,17 @@ def _inferred_required_experience_min(text: str) -> int | None:
 
 def _normalize(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
+
+
+def _normalize_location(value: str) -> str:
+    normalized = _normalize(value)
+    normalized = re.sub(r"\bu s a?\b", "united states", normalized)
+    aliases = {
+        "tx": "texas",
+        "us": "united states",
+        "usa": "united states",
+    }
+    return " ".join(aliases.get(token, token) for token in normalized.split())
 
 
 def _phrase(haystack: str, needle: str) -> bool:

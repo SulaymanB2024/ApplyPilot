@@ -58,42 +58,49 @@ sites:
   # ── Direct employer / ATS-native sources ─────────────────────────────
   # These are preferred when searches.yaml sets discovery_mode: direct_sources.
   - name: "Anthropic Greenhouse"
+    company: "Anthropic"
     url: "https://job-boards.greenhouse.io/anthropic"
     type: static
     source_kind: direct_ats
     direct_source: true
 
   - name: "OpenAI Ashby"
+    company: "OpenAI"
     url: "https://jobs.ashbyhq.com/openai"
     type: static
     source_kind: direct_ats
     direct_source: true
 
   - name: "Runway Careers"
+    company: "Runway"
     url: "https://runway.com/careers"
     type: static
     source_kind: employer_careers
     direct_source: true
 
   - name: "Scale AI Greenhouse"
+    company: "Scale AI"
     url: "https://job-boards.greenhouse.io/scaleai"
     type: static
     source_kind: direct_ats
     direct_source: true
 
   - name: "AccuWeather Greenhouse"
+    company: "AccuWeather"
     url: "https://job-boards.greenhouse.io/accuweather"
     type: static
     source_kind: direct_ats
     direct_source: true
 
   - name: "Renesas SmartRecruiters"
+    company: "Renesas Electronics"
     url: "https://jobs.smartrecruiters.com/RenesasElectronics"
     type: static
     source_kind: direct_ats
     direct_source: true
 
   - name: "Stripe University Careers"
+    company: "Stripe"
     url: "https://stripe.com/jobs/university"
     type: static
     source_kind: employer_careers

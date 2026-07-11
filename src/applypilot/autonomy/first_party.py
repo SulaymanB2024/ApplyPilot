@@ -32,6 +32,10 @@ DISALLOWED_HOST_MARKERS = (
     "ziprecruiter.com",
     "google.com",
 )
+HOSTED_ATS_SUFFIXES = (
+    "avature.net",
+    "myworkdayjobs.com",
+)
 CLOSED_MARKERS = (
     "job is no longer available",
     "no longer accepting applications",
@@ -54,6 +58,16 @@ class FetchResponse:
     url: str
     text: str
     payload: Any = None
+
+
+@dataclass(frozen=True)
+class TrustedFirstPartySource:
+    """Exact configured employer/ATS identity, not a generic trusted host."""
+
+    company: str
+    host: str
+    path_prefix: str
+    source_kind: str
 
 
 class Transport(Protocol):
@@ -99,11 +113,11 @@ class FirstPartyVerifier:
         *,
         ledger: UsageLedger,
         transport: Transport | None = None,
-        trusted_hosts: set[str] | None = None,
+        trusted_sources: tuple[TrustedFirstPartySource, ...] = (),
     ):
         self.ledger = ledger
         self.transport = transport or URLTransport()
-        self.trusted_hosts = {host.lower().removeprefix("www.") for host in (trusted_hosts or set())}
+        self.trusted_sources = trusted_sources
 
     def verify(self, candidate: RoleCandidate) -> FreshnessEvidence:
         parsed = urlparse(candidate.official_url)
@@ -120,6 +134,17 @@ class FirstPartyVerifier:
                 evidence=(f"host={host or 'missing'}",),
             )
 
+        first_party = self._url_matches_candidate(candidate.company, candidate.official_url)
+        if not first_party:
+            return FreshnessEvidence.now(
+                official_url=candidate.official_url,
+                first_party=False,
+                resolved=False,
+                open_state=None,
+                provider_error="untrusted_company_host",
+                evidence=(f"company_or_tenant_mismatch={host}",),
+            )
+
         started = time.monotonic()
         self.ledger.reserve("external_calls")
         try:
@@ -130,23 +155,11 @@ class FirstPartyVerifier:
             elif host == "jobs.ashbyhq.com":
                 result = self._verify_html(candidate, first_party=True)
             else:
-                normalized_host = host.removeprefix("www.")
-                first_party = normalized_host in self.trusted_hosts
-                if not first_party:
-                    result = FreshnessEvidence.now(
-                        official_url=candidate.official_url,
-                        first_party=False,
-                        resolved=False,
-                        open_state=None,
-                        provider_error="untrusted_company_host",
-                        evidence=(f"company_domain_mismatch={normalized_host}",),
-                    )
-                else:
-                    result = self._verify_html(candidate, first_party=True)
+                result = self._verify_html(candidate, first_party=True)
         except Exception as exc:
             result = FreshnessEvidence.now(
                 official_url=candidate.official_url,
-                first_party=host in ATS_HOSTS,
+                first_party=first_party,
                 resolved=False,
                 open_state=None,
                 provider_error=f"{type(exc).__name__}: {str(exc)[:160]}",
@@ -180,9 +193,20 @@ class FirstPartyVerifier:
                 status_code=response.status_code,
                 evidence=(f"greenhouse_api_status={response.status_code}",),
             )
+        official_url = str(payload.get("absolute_url") or candidate.official_url)
+        if not self._url_matches_candidate(candidate.company, official_url):
+            return FreshnessEvidence.now(
+                official_url=official_url,
+                first_party=False,
+                resolved=False,
+                open_state=None,
+                status_code=response.status_code,
+                provider_error="untrusted_api_url",
+                evidence=("greenhouse_company_or_tenant_mismatch",),
+            )
         description = _clean_text(str(payload.get("content") or ""))
         return FreshnessEvidence.now(
-            official_url=str(payload.get("absolute_url") or candidate.official_url),
+            official_url=official_url,
             first_party=True,
             resolved=True,
             open_state=True,
@@ -214,11 +238,22 @@ class FirstPartyVerifier:
                 status_code=response.status_code,
                 evidence=(f"lever_api_status={response.status_code}",),
             )
+        official_url = str(payload.get("hostedUrl") or candidate.official_url)
+        if not self._url_matches_candidate(candidate.company, official_url):
+            return FreshnessEvidence.now(
+                official_url=official_url,
+                first_party=False,
+                resolved=False,
+                open_state=None,
+                status_code=response.status_code,
+                provider_error="untrusted_api_url",
+                evidence=("lever_company_or_tenant_mismatch",),
+            )
         description = _clean_text(
             str(payload.get("descriptionPlain") or payload.get("description") or "")
         )
         return FreshnessEvidence.now(
-            official_url=str(payload.get("hostedUrl") or candidate.official_url),
+            official_url=official_url,
             first_party=True,
             resolved=True,
             open_state=True,
@@ -242,6 +277,16 @@ class FirstPartyVerifier:
                 evidence=("url_path=root",),
             )
         response = self.transport.get(candidate.official_url)
+        if not self._url_matches_candidate(candidate.company, response.url):
+            return FreshnessEvidence.now(
+                official_url=response.url,
+                first_party=False,
+                resolved=False,
+                open_state=None,
+                status_code=response.status_code,
+                provider_error="untrusted_redirect_target",
+                evidence=("redirect_company_or_tenant_mismatch",),
+            )
         lower = response.text.lower()
         challenge = any(marker in lower for marker in CHALLENGE_MARKERS)
         closed = any(marker in lower for marker in CLOSED_MARKERS)
@@ -269,6 +314,22 @@ class FirstPartyVerifier:
             ),
         )
 
+    def _url_matches_candidate(self, company: str, url: str) -> bool:
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower().removeprefix("www.")
+        path = "/" + parsed.path.strip("/")
+        if host in ATS_HOSTS:
+            return _shared_ats_tenant_matches(company, host, path)
+        if any(host == suffix or host.endswith(f".{suffix}") for suffix in HOSTED_ATS_SUFFIXES):
+            return _hosted_ats_tenant_matches(company, host)
+        return any(
+            source.source_kind in {"direct_ats", "employer_careers"}
+            and host == source.host
+            and _company_identity_matches(company, source.company)
+            and _path_is_within(path, source.path_prefix)
+            for source in self.trusted_sources
+        )
+
 
 class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
@@ -288,6 +349,55 @@ def _url_is_structurally_public(url: str) -> bool:
     except ValueError:
         return True
     return address.is_global
+
+
+def _company_tokens(company: str) -> list[str]:
+    return [
+        token
+        for token in re.findall(r"[a-z0-9]+", company.lower())
+        if token not in {"and", "co", "company", "corp", "corporation", "inc", "llc", "the"}
+    ]
+
+
+def _company_identity_matches(candidate_company: str, configured_company: str) -> bool:
+    candidate = "".join(_company_tokens(candidate_company))
+    configured = "".join(_company_tokens(configured_company))
+    return bool(candidate and configured and candidate == configured)
+
+
+def _tenant_matches_company(company: str, tenant: str) -> bool:
+    company_tokens = _company_tokens(company)
+    if not company_tokens:
+        return False
+    compact_company = "".join(company_tokens)
+    comparison_label = re.sub(r"[^a-z0-9]+", "", tenant.lower())
+    if not comparison_label:
+        return False
+    return len(compact_company) >= 4 and compact_company == comparison_label
+
+
+def _shared_ats_tenant_matches(company: str, host: str, path: str) -> bool:
+    if host not in ATS_HOSTS:
+        return False
+    parts = [part for part in path.split("/") if part]
+    return bool(parts) and _tenant_matches_company(company, parts[0])
+
+
+def _hosted_ats_tenant_matches(company: str, host: str) -> bool:
+    if not any(host.endswith(f".{suffix}") for suffix in HOSTED_ATS_SUFFIXES):
+        return False
+    return _tenant_matches_company(company, host.split(".", 1)[0])
+
+
+def _path_is_within(path: str, prefix: str) -> bool:
+    normalized_path = "/" + path.strip("/")
+    prefix_body = prefix.strip("/")
+    if not prefix_body:
+        return True
+    normalized_prefix = "/" + prefix_body
+    return normalized_path == normalized_prefix or normalized_path.startswith(
+        f"{normalized_prefix}/"
+    )
 
 
 def assert_public_http_url(url: str) -> None:
@@ -362,13 +472,24 @@ def _page_matches_title(page_text: str, title: str) -> bool:
     return len(overlap) >= required
 
 
-def configured_trusted_hosts() -> set[str]:
-    """Return only user/package-configured direct-source hosts."""
-    hosts: set[str] = set()
+def configured_trusted_sources() -> tuple[TrustedFirstPartySource, ...]:
+    """Return exact employer/ATS identities, excluding recruiter/aggregator surfaces."""
+    sources: list[TrustedFirstPartySource] = []
     for site in config.load_sites_config().get("sites", []):
         if not isinstance(site, dict) or not site.get("direct_source"):
             continue
-        host = (urlparse(str(site.get("url") or "")).hostname or "").lower().removeprefix("www.")
-        if host:
-            hosts.add(host)
-    return hosts
+        source_kind = str(site.get("source_kind") or "")
+        company = str(site.get("company") or "").strip()
+        parsed = urlparse(str(site.get("url") or ""))
+        host = (parsed.hostname or "").lower().removeprefix("www.")
+        if source_kind not in {"direct_ats", "employer_careers"} or not company or not host:
+            continue
+        sources.append(
+            TrustedFirstPartySource(
+                company=company,
+                host=host,
+                path_prefix="/" + parsed.path.strip("/"),
+                source_kind=source_kind,
+            )
+        )
+    return tuple(sources)

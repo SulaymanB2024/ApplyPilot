@@ -135,11 +135,20 @@ class FreshnessEvidence:
 
 
 @dataclass(frozen=True)
+class ApplicantClaim:
+    """One exact prose assertion supported only by applicant evidence ids."""
+
+    text: str
+    evidence_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class MaterialParagraph:
     """One model-written paragraph tied to factual evidence ids."""
 
     text: str
     evidence_ids: tuple[str, ...]
+    applicant_claims: tuple[ApplicantClaim, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -217,6 +226,8 @@ class BatchResult:
 
     run_id: str
     status: str
+    pending_requests: list[dict[str, Any]] = field(default_factory=list)
+    source_attempts: list[dict[str, Any]] = field(default_factory=list)
     discoveries: list[dict[str, Any]] = field(default_factory=list)
     eligibility: list[dict[str, Any]] = field(default_factory=list)
     freshness: list[dict[str, Any]] = field(default_factory=list)

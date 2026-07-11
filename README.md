@@ -35,8 +35,11 @@ applypilot run -w 4      # same but parallel (4 threads for discovery/enrichment
 applypilot training-audit  # verify Workday, email draft, Runway, and board coverage
 applypilot improve plan --scope apply --out .applypilot-dev/exp-001  # bounded self-improvement packet
 applypilot autonomy plan --query "entry-level product and data roles"  # compact local run packet
-applypilot autonomy probe-chatgpt --cdp-port 9222  # no-send authenticated browser probe
-applypilot autonomy run --query "entry-level product and data roles" --cdp-port 9222 --approved-fact-digest DIGEST  # after reviewing plan facts
+applypilot autonomy advance --run-dir RUN_DIR --approved-fact-digest DIGEST  # emit next ChatGPT Web handoff
+applypilot autonomy import-response --request REQUEST --input RESPONSE  # bind strict JSON response
+# Repeat advance -> browser handoff -> import until review_ready (at most 3 model calls)
+applypilot doctor --autonomy --strict --json  # artifact transport + required fact readiness
+applypilot autonomy probe-chatgpt --cdp-port 9222  # optional legacy CDP no-send probe
 applypilot apply --url URL --approved-fact-digest DIGEST  # dry-run; writes one-time submit manifest
 applypilot apply --url URL --submit --approved-fact-digest DIGEST --authorization-manifest PATH
 applypilot apply --allow-account-creation  # separate per-run account-change permission
@@ -49,7 +52,11 @@ applypilot apply --dry-run  # explicit spelling of the safe default
 > **Recommended autonomy path:** `applypilot autonomy` uses ChatGPT Web only for bounded
 > role discovery and evidence-cited cover-letter drafting. Eligibility, first-party freshness,
 > budgets, and action gates are deterministic. It disables broad job-board aggregators and
-> never fills or submits during `autonomy run`. See
+> never fills or submits during the artifact run. A browser agent can service the portable
+> JSON handoff queue through an already-authenticated ChatGPT tab without giving ApplyPilot
+> cookies, credentials, or chat history. Model calls receive a rich, sanitized evidence pack
+> and may research and deliberate without a time limit; only call count, input/output size, and
+> the final JSON contract are bounded. See
 > [the diagnosis and operating contract](docs/tool-first-autonomy.md).
 
 ---
@@ -190,8 +197,10 @@ applypilot run --validation lenient     # Relax validation (recommended for Gemi
 applypilot run --validation strict      # Strictest validation (retries on any banned word)
 applypilot training-audit               # Audit apply-agent training coverage
 applypilot autonomy plan --query QUERY  # Write compact facts, policy, and ChatGPT request artifacts
-applypilot autonomy probe-chatgpt       # No-send auth/composer probe on caller-provided CDP Chrome
-applypilot autonomy run --query QUERY --approved-fact-digest DIGEST  # Review-only funnel after fact review
+applypilot autonomy advance --run-dir RUN_DIR --approved-fact-digest DIGEST
+applypilot autonomy import-response --request REQUEST --input RESPONSE
+applypilot autonomy probe-chatgpt       # Optional CDP compatibility probe
+applypilot autonomy run --query QUERY --approved-fact-digest DIGEST  # Optional CDP compatibility path
 applypilot apply                        # Launch deterministic dry-run (safe default)
 applypilot apply --url URL --approved-fact-digest DIGEST  # Dry-run and mint one-time manifest
 applypilot apply --url URL --submit --approved-fact-digest DIGEST --authorization-manifest PATH
