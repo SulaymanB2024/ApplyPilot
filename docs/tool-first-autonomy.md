@@ -99,11 +99,16 @@ email, or changes an external account.
 The existing deterministic form controller also defaults to dry-run:
 
 ```bash
-applypilot apply          # dry-run; no final submit
-applypilot apply --submit --approved-fact-digest DIGEST # reviewed live-submit boundary
+applypilot apply --url URL --approved-fact-digest DIGEST
+# Review the dry-run and copy its submission_authorization_manifest artifact:
+applypilot apply --url URL --submit --approved-fact-digest DIGEST \
+  --authorization-manifest PATH
 ```
 
-Its field model-call budget defaults to zero, so it does not require or spawn Codex/Claude.
+Live submit is limited to one exact URL, one worker, and one expiring manifest. The manifest is
+bound to the candidate, fact ledger, exact material bytes, filled-form review digest, and apply
+policy, then consumed before the click. Its field model-call budget defaults to zero, so it does
+not require or spawn Codex/Claude.
 Set `APPLYPILOT_FIELD_MODEL_CALL_BUDGET=1` only when a bounded schema-constrained fallback is
 needed. All unresolved required fields still fail closed.
 

@@ -29,7 +29,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   controller with zero model subprocess calls; a Codex executable is required only when
   `APPLYPILOT_FIELD_MODEL_CALL_BUDGET` is greater than zero.
 - **Explicit submit boundary** - `applypilot apply` is now dry-run by default; live
-  submission requires `applypilot apply --submit` plus the digest from a reviewed fact ledger.
+  submission is one exact URL and requires a reviewed fact digest plus an expiring, one-time
+  manifest bound to the candidate, material bytes, filled form, and apply policy.
 - **Explicit account boundary** - Job-site account creation is disabled by default and
   requires the per-run `--allow-account-creation` flag.
 - **Discovery source policy** - The autonomy funnel uses ChatGPT Web first and permits

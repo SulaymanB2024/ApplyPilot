@@ -37,8 +37,8 @@ applypilot improve plan --scope apply --out .applypilot-dev/exp-001  # bounded s
 applypilot autonomy plan --query "entry-level product and data roles"  # compact local run packet
 applypilot autonomy probe-chatgpt --cdp-port 9222  # no-send authenticated browser probe
 applypilot autonomy run --query "entry-level product and data roles" --cdp-port 9222 --approved-fact-digest DIGEST  # after reviewing plan facts
-applypilot apply         # deterministic browser dry-run; does not submit
-applypilot apply --submit --approved-fact-digest DIGEST  # explicit live-submit boundary
+applypilot apply --url URL --approved-fact-digest DIGEST  # dry-run; writes one-time submit manifest
+applypilot apply --url URL --submit --approved-fact-digest DIGEST --authorization-manifest PATH
 applypilot apply --allow-account-creation  # separate per-run account-change permission
 applypilot apply -w 3    # parallel apply (3 Chrome instances)
 applypilot apply --dry-run  # explicit spelling of the safe default
@@ -193,7 +193,8 @@ applypilot autonomy plan --query QUERY  # Write compact facts, policy, and ChatG
 applypilot autonomy probe-chatgpt       # No-send auth/composer probe on caller-provided CDP Chrome
 applypilot autonomy run --query QUERY --approved-fact-digest DIGEST  # Review-only funnel after fact review
 applypilot apply                        # Launch deterministic dry-run (safe default)
-applypilot apply --submit --approved-fact-digest DIGEST  # Explicit reviewed live-submit boundary
+applypilot apply --url URL --approved-fact-digest DIGEST  # Dry-run and mint one-time manifest
+applypilot apply --url URL --submit --approved-fact-digest DIGEST --authorization-manifest PATH
 applypilot apply --allow-account-creation # Separate job-site account-creation permission
 applypilot apply --workers 3            # Parallel browser workers
 applypilot apply --dry-run              # Fill forms without submitting

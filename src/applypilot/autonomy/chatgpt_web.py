@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from dataclasses import dataclass
 from datetime import date
@@ -288,15 +289,19 @@ def validate_material_provenance(
     for paragraph in packet.paragraphs:
         if not paragraph.evidence_ids:
             raise ChatGPTContractError("material paragraph has no evidence ids")
-        support: list[str] = []
+        applicant_support: list[str] = []
+        job_cited = False
         for evidence_id in paragraph.evidence_ids:
             if evidence_id == "JOB":
-                support.extend([candidate.company, candidate.title, job_text])
+                job_cited = True
             elif evidence_id in evidence_by_id:
-                support.append(evidence_by_id[evidence_id])
+                applicant_support.append(evidence_by_id[evidence_id])
             else:
                 raise ChatGPTContractError(f"unknown material evidence id: {evidence_id}")
-        allowed_text = " ".join(support)
+        allowed_parts = list(applicant_support)
+        if job_cited:
+            allowed_parts.extend([candidate.company, candidate.title])
+        allowed_text = " ".join(allowed_parts)
         unsupported_numbers = set(_numeric_claims(paragraph.text)) - set(
             _numeric_claims(allowed_text)
         )
@@ -312,8 +317,6 @@ def validate_material_provenance(
 
 
 def _numeric_claims(value: str) -> list[str]:
-    import re
-
     return re.findall(r"(?<![A-Za-z])(?:\$?\d[\d,.]*%?)(?![A-Za-z])", value)
 
 
@@ -363,8 +366,6 @@ SAFE_WRITING_TERMS = {
 
 
 def _claim_tokens(value: str) -> set[str]:
-    import re
-
     return {
         token
         for token in re.findall(r"[a-z][a-z0-9+#.-]{2,}", value.lower())

@@ -430,6 +430,7 @@ def _run_deterministic_job(
     settings: harness.HarnessSettings,
     dry_run: bool,
     fact_ledger=None,
+    authorization_manifest: Path | None = None,
 ) -> tuple[str, int]:
     """Run the code-first Codex apply controller for one job."""
     from applypilot.apply.controller import run_deterministic_controller
@@ -483,6 +484,7 @@ def _run_deterministic_job(
         settings=settings,
         dry_run=dry_run,
         fact_ledger=fact_ledger,
+        authorization_manifest=authorization_manifest,
     )
     elapsed = max(result.duration_ms // 1000, 0)
     status = result.launcher_status()
@@ -514,7 +516,8 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             supervisor_model: str | None = None,
             allow_account_creation: bool | None = None,
             approved_fact_digest: str | None = None,
-            corrections_path: Path | None = None) -> tuple[str, int]:
+            corrections_path: Path | None = None,
+            authorization_manifest: Path | None = None) -> tuple[str, int]:
     """Spawn an agent session for one job application.
 
     Returns:
@@ -530,9 +533,9 @@ def run_job(job: dict, port: int, worker_id: int = 0,
     )
     if settings.agent_backend == "codex" and settings.deterministic_controller:
         fact_ledger = None
-        if not dry_run:
-            if not approved_fact_digest:
-                raise RuntimeError("approved_fact_digest_required_for_submit")
+        if not dry_run and not approved_fact_digest:
+            raise RuntimeError("approved_fact_digest_required_for_submit")
+        if approved_fact_digest:
             from applypilot.autonomy.facts import build_fact_ledger, load_corrections
             from applypilot.autonomy.runner import require_approved_fact_digest
 
@@ -551,6 +554,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             settings=settings,
             dry_run=dry_run,
             fact_ledger=fact_ledger,
+            authorization_manifest=authorization_manifest,
         )
 
     raise RuntimeError(
@@ -847,7 +851,8 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                 supervisor_model: str | None = None,
                 allow_account_creation: bool | None = None,
                 approved_fact_digest: str | None = None,
-                corrections_path: Path | None = None) -> tuple[int, int]:
+                corrections_path: Path | None = None,
+                authorization_manifest: Path | None = None) -> tuple[int, int]:
     """Run jobs sequentially until limit is reached or queue is empty.
 
     Args:
@@ -932,7 +937,8 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                                             supervisor_model=supervisor_model,
                                             allow_account_creation=allow_account_creation,
                                             approved_fact_digest=approved_fact_digest,
-                                            corrections_path=corrections_path)
+                                            corrections_path=corrections_path,
+                                            authorization_manifest=authorization_manifest)
 
             if result == "skipped":
                 release_lock(job["url"])
@@ -1014,7 +1020,8 @@ def main(limit: int = 1, target_url: str | None = None,
          supervisor_model: str | None = None,
          allow_account_creation: bool | None = None,
          approved_fact_digest: str | None = None,
-         corrections_path: Path | None = None) -> None:
+         corrections_path: Path | None = None,
+         authorization_manifest: Path | None = None) -> None:
     """Launch the apply pipeline.
 
     Args:
@@ -1106,6 +1113,7 @@ def main(limit: int = 1, target_url: str | None = None,
                     allow_account_creation=allow_account_creation,
                     approved_fact_digest=approved_fact_digest,
                     corrections_path=corrections_path,
+                    authorization_manifest=authorization_manifest,
                 )
             else:
                 # Multi-worker — distribute limit across workers
@@ -1134,6 +1142,7 @@ def main(limit: int = 1, target_url: str | None = None,
                             allow_account_creation=allow_account_creation,
                             approved_fact_digest=approved_fact_digest,
                             corrections_path=corrections_path,
+                            authorization_manifest=authorization_manifest,
                         ): i
                         for i in range(workers)
                     }

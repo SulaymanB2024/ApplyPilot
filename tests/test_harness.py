@@ -65,7 +65,6 @@ def test_account_creation_requires_explicit_settings_override(monkeypatch):
     ("extra_args", "expected_dry_run", "expected_account_creation"),
     [
         ([], True, False),
-        (["--submit", "--approved-fact-digest", "reviewed"], False, False),
         (["--allow-account-creation"], True, True),
     ],
 )
@@ -115,6 +114,27 @@ def test_apply_uses_deterministic_controller_without_model_cli(
     assert result.exit_code == 0, result.output
     assert captured["dry_run"] is expected_dry_run
     assert captured["allow_account_creation"] is expected_account_creation
+
+
+def test_submit_rejects_batch_wide_or_manifest_free_authorization(monkeypatch):
+    from applypilot import cli
+
+    monkeypatch.setattr(cli, "_bootstrap", lambda: None)
+
+    result = runner.invoke(
+        app,
+        [
+            "apply",
+            "--submit",
+            "--approved-fact-digest",
+            "reviewed",
+            "--url",
+            "https://jobs.example.com/roles/123",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "--authorization-manifest" in result.output
 
 
 def test_executor_model_override_wins_for_codex():

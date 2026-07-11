@@ -34,6 +34,13 @@ from applypilot.apply.safety import (
     inspect_page_state,
 )
 from applypilot.apply.submission import is_probable_submit_response, verify_submission
+from applypilot.apply.submission_auth import (
+    consume_submit_manifest,
+    form_review_digest,
+    material_digest,
+    submission_policy_digest,
+    write_submit_manifest,
+)
 from applypilot.autonomy.facts import (
     FactLedger,
     require_confirmed_facts,
@@ -113,6 +120,7 @@ class DeterministicApplyController:
         dry_run: bool = False,
         onepassword_client: onepassword.OnePasswordClient | None = None,
         fact_ledger: FactLedger | None = None,
+        authorization_manifest: Path | None = None,
     ) -> None:
         self.job = job
         self.port = port
@@ -120,6 +128,7 @@ class DeterministicApplyController:
         self.settings = settings
         self.dry_run = dry_run
         self.fact_ledger = fact_ledger
+        self.authorization_manifest = authorization_manifest
         self.profile = config.load_profile()
         self.events: list[str] = []
         self.artifacts: dict[str, str] = {}
@@ -282,12 +291,41 @@ class DeterministicApplyController:
                 )
 
             if self.dry_run:
+                if self.fact_ledger is not None:
+                    current_form_digest = form_review_digest(self._collect_fields(page))
+                    current_material_digest = material_digest(self.job)
+                    current_policy_digest = submission_policy_digest(self.settings)
+                    manifest_path = write_submit_manifest(
+                        job=self.job,
+                        fact_digest=self.fact_ledger.digest,
+                        material_sha256=current_material_digest,
+                        form_sha256=current_form_digest,
+                        policy_sha256=current_policy_digest,
+                        output_dir=config.APP_DIR / "submit-authorizations",
+                    )
+                    self.artifacts["submission_authorization_manifest"] = str(manifest_path)
+                    self._record("wrote one-time candidate-scoped submission authorization manifest")
                 return self._finish(
                     "dry_run_verified",
                     start,
                     reason="dry_run_verified",
                     verification_confidence="dry_run",
                 )
+
+            if self.authorization_manifest is None:
+                raise RuntimeError("submission_authorization_manifest_required")
+            current_form_digest = form_review_digest(self._collect_fields(page))
+            current_material_digest = material_digest(self.job)
+            current_policy_digest = submission_policy_digest(self.settings)
+            consume_submit_manifest(
+                self.authorization_manifest,
+                job=self.job,
+                fact_digest=self.fact_ledger.digest,
+                material_sha256=current_material_digest,
+                form_sha256=current_form_digest,
+                policy_sha256=current_policy_digest,
+            )
+            self._record("consumed one-time candidate-scoped submission authorization")
 
             before_submit_url = page.url
             clicked, response = self._click_submit_and_capture_response(page)
@@ -788,6 +826,7 @@ def run_deterministic_controller(
     settings: HarnessSettings,
     dry_run: bool,
     fact_ledger: FactLedger | None = None,
+    authorization_manifest: Path | None = None,
 ) -> ControllerResult:
     """Convenience wrapper used by the launcher."""
     return DeterministicApplyController(
@@ -797,4 +836,5 @@ def run_deterministic_controller(
         settings=settings,
         dry_run=dry_run,
         fact_ledger=fact_ledger,
+        authorization_manifest=authorization_manifest,
     ).run()

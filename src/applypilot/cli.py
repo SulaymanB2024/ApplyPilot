@@ -200,6 +200,11 @@ def apply(
         "--corrections",
         help="Fact corrections file used to produce the approved digest.",
     ),
+    authorization_manifest: Optional[Path] = typer.Option(
+        None,
+        "--authorization-manifest",
+        help="Required for --submit; one-time manifest produced by the matching dry-run.",
+    ),
     headless: bool = typer.Option(False, "--headless", help="Run browsers in headless mode."),
     url: Optional[str] = typer.Option(None, "--url", help="Apply to a specific job URL."),
     gen: bool = typer.Option(False, "--gen", help="Generate prompt file for manual debugging instead of running."),
@@ -257,6 +262,17 @@ def apply(
             "[red]--submit requires --approved-fact-digest from a reviewed autonomy plan.[/red]"
         )
         raise typer.Exit(code=1)
+    if not dry_run:
+        if continuous or workers != 1 or (limit is not None and limit != 1) or not url:
+            console.print(
+                "[red]--submit is limited to one exact --url, one worker, and --limit 1.[/red]"
+            )
+            raise typer.Exit(code=1)
+        if authorization_manifest is None or not authorization_manifest.exists():
+            console.print(
+                "[red]--submit requires an existing --authorization-manifest from the matching dry-run.[/red]"
+            )
+            raise typer.Exit(code=1)
 
     if not gen:
         try:
@@ -383,6 +399,7 @@ def apply(
         allow_account_creation=allow_account_creation,
         approved_fact_digest=approved_fact_digest,
         corrections_path=corrections,
+        authorization_manifest=authorization_manifest,
         dry_run=dry_run,
         continuous=continuous,
         workers=workers,

@@ -559,6 +559,40 @@ def test_material_provenance_rejects_fabricated_numeric_claims():
             job_text=candidate.description,
         )
 
+    requirement_as_claim = MaterialPacket(
+        candidate_id=candidate.candidate_id,
+        paragraphs=(
+            MaterialParagraph(
+                "I have 5 years of Python experience.",
+                ("JOB",),
+            ),
+        ),
+    )
+    with pytest.raises(ChatGPTContractError, match="unsupported numeric"):
+        validate_material_provenance(
+            requirement_as_claim,
+            pack=pack,
+            candidate=candidate,
+            job_text="Applicants must have 5 years of Python experience.",
+        )
+
+    implied_requirement = MaterialPacket(
+        candidate_id=candidate.candidate_id,
+        paragraphs=(
+            MaterialParagraph(
+                "Can bring 5 years of Python experience.",
+                ("JOB",),
+            ),
+        ),
+    )
+    with pytest.raises(ChatGPTContractError, match="unsupported numeric"):
+        validate_material_provenance(
+            implied_requirement,
+            pack=pack,
+            candidate=candidate,
+            job_text="Applicants must have 5 years of Python experience.",
+        )
+
 
 def test_budget_and_no_progress_circuit_breakers():
     budget = FunnelBudget(
@@ -760,8 +794,8 @@ class FakeMaterials:
             candidate_id=candidate.candidate_id,
             paragraphs=(
                 MaterialParagraph(
-                    "I use Python for product analysis.",
-                    (self.pack.evidence[0]["id"], "JOB"),
+                    "Example Labs.",
+                    (self.pack.evidence[0]["id"],),
                 ),
             ),
         )
