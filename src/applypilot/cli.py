@@ -274,6 +274,20 @@ def apply(
             "is greater than zero.[/red]"
         )
         raise typer.Exit(code=1)
+    try:
+        get_chrome_path()
+    except FileNotFoundError:
+        console.print(
+            "[red]Chrome/Chromium is required for auto-apply.[/red]\n"
+            "Install Chrome or set [bold]CHROME_PATH[/bold]."
+        )
+        raise typer.Exit(code=1)
+    if not harness_settings.deterministic_controller and not dry_run:
+        console.print(
+            "[red]Live legacy prompt-based apply is disabled.[/red]\n"
+            "Use the deterministic controller or run [bold]--dry-run[/bold]."
+        )
+        raise typer.Exit(code=1)
 
     # Check 2: Profile exists
     if not _profile_path.exists():
@@ -463,6 +477,33 @@ def dashboard() -> None:
     from applypilot.view import open_dashboard
 
     open_dashboard()
+
+
+@autonomy_app.command("import-candidates")
+def autonomy_import_candidates(
+    file: Path = typer.Option(
+        ...,
+        "--file",
+        help="Strict versioned JSON file of browser-verified job candidates.",
+        exists=True,
+        file_okay=True,
+        dir_okay=False,
+        readable=True,
+        resolve_path=True,
+    ),
+) -> None:
+    """Import verified job facts into the jobs DB; never apply or submit."""
+    _bootstrap()
+    from applypilot.autonomy.candidate_import import CandidateImportError, import_candidate_file
+    from applypilot.database import get_connection
+
+    try:
+        result = import_candidate_file(get_connection(), file)
+    except CandidateImportError as exc:
+        console.print(f"[red]Candidate import failed:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    console.print_json(data=result.as_dict())
 
 
 @autonomy_app.command("plan")

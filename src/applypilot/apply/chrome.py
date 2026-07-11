@@ -11,7 +11,9 @@ import shutil
 import subprocess
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
+from uuid import uuid4
 
 from applypilot import config
 from applypilot.apply.google_passwords import (
@@ -104,11 +106,11 @@ def _kill_on_port(port: int) -> None:
 # ---------------------------------------------------------------------------
 
 def setup_worker_profile(worker_id: int) -> Path:
-    """Create an isolated Chrome profile for a worker.
+    """Create a least-privilege Chrome profile for a worker.
 
-    On first run, clones from an existing worker profile (preferred, since
-    it already has session cookies) or from the user's real Chrome profile.
-    Subsequent runs reuse the existing worker profile.
+    Only the selected Chrome profile's password-store databases and preference
+    files are copied. History, cookies, autofill data, extensions, other Chrome
+    profiles, and browsing telemetry are intentionally excluded.
 
     Args:
         worker_id: Numeric worker identifier.
@@ -116,51 +118,59 @@ def setup_worker_profile(worker_id: int) -> Path:
     Returns:
         Path to the worker's Chrome user-data directory.
     """
-    profile_dir = config.CHROME_WORKER_DIR / f"worker-{worker_id}"
-    if (profile_dir / "Default").exists():
+    source_profile_name = config.get_chrome_profile_directory()
+    profile_dir = config.CHROME_WORKER_DIR / f"worker-{worker_id}-minimal-v1"
+    marker = profile_dir / ".applypilot-minimal-profile"
+    if marker.exists() and (profile_dir / source_profile_name).exists():
         return profile_dir  # Already initialized
 
-    # Find a source: prefer existing worker (has session cookies), else user profile
+    # Reuse another minimal worker as the source when available. Never reuse the
+    # legacy broad worker-N clones, which may contain full browser histories.
     source: Path | None = None
     for wid in range(10):
         if wid == worker_id:
             continue
-        candidate = config.CHROME_WORKER_DIR / f"worker-{wid}"
-        if (candidate / "Default").exists():
+        candidate = config.CHROME_WORKER_DIR / f"worker-{wid}-minimal-v1"
+        if (
+            (candidate / ".applypilot-minimal-profile").exists()
+            and (candidate / source_profile_name).exists()
+        ):
             source = candidate
             break
     if source is None:
         source = config.get_chrome_user_data()
 
-    logger.info("[worker-%d] Copying Chrome profile from %s (first time setup)...",
-                worker_id, source.name)
+    logger.info(
+        "[worker-%d] Creating minimal Chrome profile from %s/%s...",
+        worker_id,
+        source.name,
+        source_profile_name,
+    )
     profile_dir.mkdir(parents=True, exist_ok=True)
 
-    # Copy essential profile dirs -- skip caches and heavy transient data
-    skip = {
-        "ShaderCache", "GrShaderCache", "Service Worker", "Cache",
-        "Code Cache", "GPUCache", "CacheStorage", "Crashpad",
-        "BrowserMetrics", "SafeBrowsing", "Crowd Deny",
-        "MEIPreload", "SSLErrorAssistant", "recovery", "Temp",
-        "SingletonLock", "SingletonSocket", "SingletonCookie",
-    }
+    root_files = ("Local State",)
+    profile_files = (
+        "Preferences",
+        "Secure Preferences",
+        "Login Data",
+        "Login Data-journal",
+        "Login Data For Account",
+        "Login Data For Account-journal",
+    )
+    source_profile = source / source_profile_name
+    destination_profile = profile_dir / source_profile_name
+    destination_profile.mkdir(parents=True, exist_ok=True)
 
-    for item in source.iterdir():
-        if item.name in skip:
-            continue
-        dst = profile_dir / item.name
-        try:
-            if item.is_dir():
-                shutil.copytree(
-                    str(item), str(dst), dirs_exist_ok=True,
-                    ignore=shutil.ignore_patterns(
-                        "Cache", "Code Cache", "GPUCache", "Service Worker",
-                    ),
-                )
-            else:
-                shutil.copy2(str(item), str(dst))
-        except (PermissionError, OSError):
-            pass  # skip locked files
+    for name in root_files:
+        item = source / name
+        if item.is_file():
+            shutil.copy2(item, profile_dir / name)
+    for name in profile_files:
+        item = source_profile / name
+        if item.is_file():
+            shutil.copy2(item, destination_profile / name)
+
+    marker.write_text("minimal-v1\n", encoding="utf-8")
 
     return profile_dir
 
@@ -337,10 +347,11 @@ def kill_all_chrome() -> None:
 
 
 def reset_worker_dir(worker_id: int) -> Path:
-    """Wipe and recreate a worker's isolated working directory.
+    """Create a unique per-job working directory without deleting evidence.
 
-    Each job gets a fresh working directory so that file conflicts
-    (resume PDFs, MCP configs) don't bleed between jobs.
+    Each job gets a fresh directory so file conflicts do not bleed between
+    jobs, while prior resumes, screenshots, and confirmation artifacts remain
+    available for the campaign audit trail.
 
     Args:
         worker_id: Numeric worker identifier.
@@ -348,9 +359,13 @@ def reset_worker_dir(worker_id: int) -> Path:
     Returns:
         Path to the clean worker directory.
     """
-    worker_dir = config.APPLY_WORKER_DIR / f"worker-{worker_id}"
-    if worker_dir.exists():
-        shutil.rmtree(str(worker_dir), ignore_errors=True)
+    worker_root = config.APPLY_WORKER_DIR / f"worker-{worker_id}"
+    worker_root.mkdir(parents=True, exist_ok=True)
+    run_id = (
+        datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+        + f"-{uuid4().hex[:8]}"
+    )
+    worker_dir = worker_root / run_id
     worker_dir.mkdir(parents=True, exist_ok=True)
     return worker_dir
 

@@ -122,11 +122,21 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                 WHERE (jobs.url = ? OR jobs.application_url = ? OR jobs.application_url LIKE ? OR jobs.url LIKE ?
                        OR jobs.canonical_job_id = ?)
                   AND jobs.tailored_resume_path IS NOT NULL
-                  AND jobs.apply_status != 'in_progress'
+                  AND (jobs.apply_status IS NULL OR jobs.apply_status = 'failed')
+                  AND (jobs.apply_attempts IS NULL OR jobs.apply_attempts < ?)
                   AND (jobs.next_apply_attempt_at IS NULL OR jobs.next_apply_attempt_at <= ?)
                   AND (breaker.opened_until IS NULL OR breaker.opened_until <= ?)
                 LIMIT 1
-            """, (target_url, target_url, like, like, canonical_target, now, now)).fetchone()
+            """, (
+                target_url,
+                target_url,
+                like,
+                like,
+                canonical_target,
+                config.DEFAULTS["max_apply_attempts"],
+                now,
+                now,
+            )).fetchone()
         else:
             blocked_sites, blocked_patterns = _load_blocked()
             # Build parameterized filters to avoid SQL injection
@@ -820,6 +830,7 @@ PERMANENT_FAILURES: set[str] = {
     "mfa_required", "payment_or_tax_info",
     "site_blocked", "cloudflare_blocked", "blocked_by_cloudflare",
     "required_field_unresolved", "submitted_unconfirmed",
+    "no_fillable_form", "submit_button_not_found",
 }
 
 PERMANENT_PREFIXES: tuple[str, ...] = ("site_blocked", "cloudflare", "blocked_by")

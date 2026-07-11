@@ -5,6 +5,7 @@ import pytest
 from applypilot.apply.harness import load_settings, prompt_header
 from applypilot.apply.harness import write_contract
 from applypilot.apply import launcher
+from applypilot.apply import chrome as chrome_mod
 from applypilot.apply.launcher import _is_permanent_failure
 from applypilot.apply import prompt as prompt_mod
 from applypilot.apply.prompt import (
@@ -32,6 +33,8 @@ def test_claude_backend_keeps_lightweight_default_model():
 def test_codex_backend_defaults_to_gpt55_and_supervisor(monkeypatch):
     monkeypatch.delenv("APPLYPILOT_ALLOW_ACCOUNT_CREATION", raising=False)
     monkeypatch.delenv("APPLYPILOT_FIELD_MODEL_CALL_BUDGET", raising=False)
+    monkeypatch.delenv("APPLYPILOT_EXECUTOR_MODEL", raising=False)
+    monkeypatch.delenv("APPLYPILOT_SUPERVISOR_MODEL", raising=False)
 
     settings = load_settings(agent_backend="codex")
 
@@ -39,6 +42,7 @@ def test_codex_backend_defaults_to_gpt55_and_supervisor(monkeypatch):
     assert settings.executor_model == "gpt-5.5"
     assert settings.supervisor_model == "gpt-5.5"
     assert settings.deterministic_controller is True
+    assert settings.field_model_call_budget == 0
     assert settings.allow_account_creation is False
     assert settings.credential_provider == "google_password_manager"
     assert settings.uses_google_password_manager is True
@@ -368,6 +372,47 @@ def test_harness_contract_references_training_manifest(tmp_path):
     assert "training manifest records Workday, email draft, Runway, and board handoff coverage" in contract["done_criteria"]
 
 
+def test_worker_run_directories_are_unique_and_preserve_prior_evidence(monkeypatch, tmp_path):
+    monkeypatch.setattr(chrome_mod.config, "APPLY_WORKER_DIR", tmp_path / "workers")
+
+    first = chrome_mod.reset_worker_dir(0)
+    marker = first / "confirmation.txt"
+    marker.write_text("preserve", encoding="utf-8")
+    second = chrome_mod.reset_worker_dir(0)
+
+    assert second != first
+    assert marker.read_text(encoding="utf-8") == "preserve"
+
+
+def test_worker_chrome_profile_copies_only_password_store_metadata(monkeypatch, tmp_path):
+    source = tmp_path / "chrome-source"
+    default = source / "Default"
+    other = source / "Profile 1"
+    default.mkdir(parents=True)
+    other.mkdir(parents=True)
+    (source / "Local State").write_text("{}", encoding="utf-8")
+    (default / "Preferences").write_text("{}", encoding="utf-8")
+    (default / "Secure Preferences").write_text("{}", encoding="utf-8")
+    (default / "Login Data").write_bytes(b"login-db")
+    (default / "History").write_bytes(b"history")
+    (default / "Web Data").write_bytes(b"autofill")
+    (default / "Cookies").write_bytes(b"cookies")
+    (other / "Login Data").write_bytes(b"other-profile")
+
+    monkeypatch.setattr(chrome_mod.config, "CHROME_WORKER_DIR", tmp_path / "workers")
+    monkeypatch.setattr(chrome_mod.config, "get_chrome_user_data", lambda: source)
+    monkeypatch.setattr(chrome_mod.config, "get_chrome_profile_directory", lambda: "Default")
+
+    worker = chrome_mod.setup_worker_profile(0)
+
+    assert (worker / "Local State").exists()
+    assert (worker / "Default" / "Login Data").read_bytes() == b"login-db"
+    assert not (worker / "Default" / "History").exists()
+    assert not (worker / "Default" / "Web Data").exists()
+    assert not (worker / "Default" / "Cookies").exists()
+    assert not (worker / "Profile 1").exists()
+
+
 def test_build_prompt_injects_training_scenarios(monkeypatch, tmp_path):
     resume_txt = tmp_path / "tailored_resume.txt"
     resume_pdf = tmp_path / "tailored_resume.pdf"
@@ -467,6 +512,8 @@ def test_email_draft_result_is_permanent_handoff_status():
 def test_submitted_unconfirmed_and_required_unresolved_are_permanent():
     assert _is_permanent_failure("submitted_unconfirmed")
     assert _is_permanent_failure("failed:required_field_unresolved")
+    assert _is_permanent_failure("failed:no_fillable_form")
+    assert _is_permanent_failure("failed:submit_button_not_found")
 
 
 def test_dry_run_verified_releases_lock_without_applied_at(monkeypatch, tmp_path):

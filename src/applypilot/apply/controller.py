@@ -8,6 +8,7 @@ required fields that deterministic mapping cannot answer.
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 import shutil
 import time
@@ -15,6 +16,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urljoin
 
 from applypilot import config
 from applypilot.apply import onepassword
@@ -50,12 +52,23 @@ __all__ = [
     "FieldSpec",
     "ResolvedField",
     "classify_page_state",
+    "file_upload_for_field",
     "field_value_for",
     "first_email",
     "is_email_only_posting",
     "run_deterministic_controller",
     "split_name",
 ]
+
+
+def file_upload_for_field(spec: FieldSpec, uploads: dict[str, str]) -> str | None:
+    """Resolve a file input only when its document purpose is explicit."""
+    field_text = f" {spec.haystack} "
+    if "cover" in field_text:
+        return uploads.get("cover_letter")
+    if any(token in field_text for token in ("resume", "résumé", "curriculum vitae", " cv ")):
+        return uploads.get("resume")
+    return None
 
 
 class RequiredFieldUnresolved(RuntimeError):
@@ -222,7 +235,8 @@ class DeterministicApplyController:
             context = browser.contexts[0] if browser.contexts else browser.new_context()
             page = context.pages[0] if context.pages else context.new_page()
             page.goto(target_url, wait_until="domcontentloaded", timeout=45000)
-            page.wait_for_timeout(1000)
+            self._wait_for_page_ready(page)
+            self._dismiss_cookie_banner(page)
 
             state = inspect_page_state(page)
             has_login_form = self._has_login_or_account_form(page)
@@ -250,6 +264,23 @@ class DeterministicApplyController:
                     verification_confidence="failed_closed",
                 )
 
+            if self._application_form_scope(page) is None and self._click_application_entry(page):
+                self._wait_for_page_ready(page)
+                self._dismiss_cookie_banner(page)
+                if self._click_button_by_text(page, ("apply manually",)):
+                    self._wait_for_page_ready(page)
+                state = inspect_page_state(page)
+                verdict = classify_page_state_with_evidence(state)
+                if verdict:
+                    self._record(f"stop gate {verdict.reason}: {verdict.evidence}")
+                    self._capture(page, "apply-entry-blocked")
+                    return self._finish(
+                        "failed",
+                        start,
+                        reason=verdict.reason,
+                        verification_confidence="failed_closed",
+                    )
+
             credential: onepassword.OnePasswordLogin | None = None
             if has_login_form:
                 credential = self._credential_for_page(page)
@@ -258,6 +289,7 @@ class DeterministicApplyController:
                     page.wait_for_load_state("domcontentloaded", timeout=10000)
                 except PlaywrightTimeoutError:
                     pass
+                self._wait_for_page_ready(page)
                 state = inspect_page_state(page)
                 verdict = classify_page_state_with_evidence(state)
                 if verdict:
@@ -270,14 +302,25 @@ class DeterministicApplyController:
                         verification_confidence="failed_closed",
                     )
 
-            filled = self._fill_application_form(page, uploads=uploads, credential=credential)
-            self._record(f"filled {filled} deterministic field(s)")
-            self._capture(page, "review")
+            filled, submit_ready = self._fill_application_steps(
+                page,
+                uploads=uploads,
+                credential=credential,
+            )
+            self._record(f"filled {filled} deterministic field(s) across application steps")
             if filled == 0:
                 return self._finish(
                     "failed",
                     start,
                     reason="no_fillable_form",
+                    verification_confidence="failed_closed",
+                )
+
+            if not submit_ready:
+                return self._finish(
+                    "failed",
+                    start,
+                    reason="submit_button_not_found",
                     verification_confidence="failed_closed",
                 )
 
@@ -355,6 +398,8 @@ class DeterministicApplyController:
         resume_out = self.worker_dir / f"{name_slug}_Resume.pdf"
         shutil.copy2(resume_pdf, resume_out)
         uploads = {"resume": str(resume_out)}
+        self.artifacts["uploaded_resume"] = str(resume_out)
+        self.artifacts["uploaded_resume_sha256"] = self._sha256(resume_out)
 
         cover_path = self.job.get("cover_letter_path")
         if cover_path:
@@ -363,7 +408,17 @@ class DeterministicApplyController:
                 cover_out = self.worker_dir / f"{name_slug}_Cover_Letter.pdf"
                 shutil.copy2(cover_pdf, cover_out)
                 uploads["cover_letter"] = str(cover_out)
+                self.artifacts["uploaded_cover_letter"] = str(cover_out)
+                self.artifacts["uploaded_cover_letter_sha256"] = self._sha256(cover_out)
         return uploads
+
+    @staticmethod
+    def _sha256(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
 
     def _credential_for_page(self, page: Any) -> onepassword.OnePasswordLogin | None:
         if self.settings.uses_google_password_manager:
@@ -411,6 +466,59 @@ class DeterministicApplyController:
         self._record(f"created pending 1Password login for {domain}")
         return login
 
+    def _fill_application_steps(
+        self,
+        page: Any,
+        *,
+        uploads: dict[str, str],
+        credential: onepassword.OnePasswordLogin | None,
+        max_steps: int = 8,
+    ) -> tuple[int, bool]:
+        """Fill application pages until an exact final-submit control is visible."""
+        total_filled = 0
+        for step in range(1, max_steps + 1):
+            state = inspect_page_state(page)
+            verdict = classify_page_state_with_evidence(state)
+            if verdict:
+                self._record(f"stop gate {verdict.reason}: {verdict.evidence}")
+                self._capture(page, f"step-{step}-blocked")
+                raise RequiredFieldUnresolved(verdict.reason)
+
+            try:
+                filled = self._fill_application_form(
+                    page,
+                    uploads=uploads,
+                    credential=credential,
+                )
+            except RequiredFieldUnresolved:
+                self._capture(page, f"step-{step}-required-unresolved")
+                raise
+            total_filled += filled
+            self._record(f"step {step}: filled {filled} deterministic field(s)")
+            self._capture(page, f"step-{step}-review")
+
+            if self._submit_locator(page) is not None:
+                return total_filled, True
+
+            progress = self._progress_locator(page)
+            if progress is None:
+                return total_filled, False
+
+            before_url = page.url
+            progress.click(timeout=5000)
+            self._wait_for_page_ready(page)
+            page.wait_for_timeout(750)
+            if self._has_validation_errors(page):
+                self._record(f"step {step}: validation errors after progress action")
+                self._capture(page, f"step-{step}-validation-error")
+                raise RequiredFieldUnresolved("validation errors after progress")
+            self._record(
+                f"advanced application step {step}; url_changed={page.url != before_url}"
+            )
+
+        self._record(f"application exceeded maximum step count ({max_steps})")
+        return total_filled, False
+
     def _fill_application_form(
         self,
         page: Any,
@@ -449,12 +557,24 @@ class DeterministicApplyController:
             for spec in specs:
                 if self._field_already_satisfied(spec):
                     continue
-                if spec.type == "file":
-                    path = (
-                        uploads["cover_letter"]
-                        if "cover" in spec.haystack and "cover_letter" in uploads
-                        else uploads["resume"]
+                if spec.role.lower() == "combobox" and spec.tag != "select":
+                    self._record(
+                        "custom combobox unsupported: "
+                        f"selector={spec.selector} label={spec.accessible_name!r}"
                     )
+                    if spec.required:
+                        raise RequiredFieldUnresolved("required custom combobox unsupported")
+                    continue
+                if spec.type == "file":
+                    path = file_upload_for_field(spec, uploads)
+                    if not path:
+                        self._record(
+                            "file field unresolved: "
+                            f"selector={spec.selector} label={spec.accessible_name!r}"
+                        )
+                        if spec.required:
+                            raise RequiredFieldUnresolved("required file purpose unresolved")
+                        continue
                     try:
                         page.locator(spec.selector).set_input_files(path, timeout=5000)
                         count += 1
@@ -528,9 +648,8 @@ class DeterministicApplyController:
             self._record("no login/account continuation button found")
 
     def _has_login_or_account_form(self, page: Any) -> bool:
-        text = self._page_text(page).lower()
-        if any(word in text for word in ("sign in", "log in", "create account", "sign up")):
-            return True
+        # Job-detail pages often include utility/header links named "Sign In".
+        # Treat only an actual password control as a login/account surface.
         return page.locator('input[type="password"]').count() > 0
 
     def _collect_fields(self, page: Any) -> list[FieldSpec]:
@@ -650,22 +769,13 @@ class DeterministicApplyController:
             )
         return specs
 
-    def _click_submit(self, page: Any) -> bool:
-        return self._click_button_by_text(
-            page,
-            ("submit application", "submit", "apply", "send application", "finish"),
-        )
-
     def _click_submit_and_capture_response(self, page: Any) -> tuple[bool, Any | None]:
         try:
             from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
         except ImportError:
             PlaywrightTimeoutError = TimeoutError
 
-        locator = self._button_locator_by_text(
-            page,
-            ("submit application", "submit", "apply", "send application", "finish"),
-        )
+        locator = self._submit_locator(page)
         if locator is None:
             return False, None
 
@@ -689,24 +799,138 @@ class DeterministicApplyController:
         locator.click(timeout=5000)
         return True
 
+    def _click_application_entry(self, page: Any) -> bool:
+        """Open the application surface from a job-detail page."""
+        exact_apply = re.compile(r"^(apply|apply now|start application)$", re.I)
+        buttons = page.get_by_role("button", name=exact_apply)
+        if buttons.count() == 1:
+            buttons.first.click(timeout=5000)
+            self._record("opened application surface via button")
+            return True
+
+        links = page.get_by_role("link", name=exact_apply)
+        if links.count() == 1:
+            href = links.first.get_attribute("href")
+            if href:
+                page.goto(urljoin(page.url, href), wait_until="domcontentloaded", timeout=45000)
+                self._record("opened application surface via exact apply link")
+                return True
+        return False
+
+    def _dismiss_cookie_banner(self, page: Any) -> None:
+        """Choose the least-permissive exact cookie-banner option when present."""
+        for label in (
+            "decline all",
+            "reject all",
+            "only necessary",
+            "necessary only",
+            "use necessary cookies only",
+        ):
+            locator = page.get_by_role("button", name=re.compile(rf"^{re.escape(label)}$", re.I))
+            if locator.count() != 1:
+                continue
+            try:
+                locator.first.click(timeout=5000)
+                self._record(f"cookie banner dismissed with {label!r}")
+            except Exception:
+                self._record(f"cookie banner dismissal failed for {label!r}")
+            return
+
     def _button_locator_by_text(self, page: Any, labels: tuple[str, ...]) -> Any | None:
-        for label in labels:
-            locator = page.get_by_role("button", name=re.compile(label, re.I))
-            if locator.count():
-                return locator.first
-        for label in labels:
-            locator = page.locator(
-                f'input[type="submit" i][value*="{label}" i], button:has-text("{label}")'
-            )
-            if locator.count():
-                return locator.first
-        return None
+        return self._unique_exact_button(page, labels)
+
+    def _submit_locator(self, page: Any) -> Any | None:
+        """Return one exact final-submit control scoped to the application form."""
+        scope = self._application_form_scope(page)
+        if scope is None:
+            scope = page
+        return self._unique_exact_button(
+            scope,
+            ("submit application", "submit", "send application"),
+        )
+
+    def _progress_locator(self, page: Any) -> Any | None:
+        """Return one exact non-final application progress control."""
+        scope = self._application_form_scope(page)
+        if scope is None:
+            scope = page
+        return self._unique_exact_button(
+            scope,
+            ("next", "continue", "save and continue", "review application"),
+        )
+
+    @staticmethod
+    def _application_form_scope(page: Any) -> Any | None:
+        forms = page.locator("form")
+        count = forms.count()
+        candidates: list[Any] = []
+        application_signals = (
+            'input[type="file"], input[name*="resume" i], '
+            'input[name*="first_name" i], input[autocomplete="given-name"]'
+        )
+        for idx in range(count):
+            form = forms.nth(idx)
+            if form.locator(application_signals).count():
+                candidates.append(form)
+        return candidates[0] if len(candidates) == 1 else None
+
+    @staticmethod
+    def _unique_exact_button(scope: Any, labels: tuple[str, ...]) -> Any | None:
+        pattern = re.compile(
+            rf"^(?:{'|'.join(re.escape(label) for label in labels)})$",
+            re.I,
+        )
+        buttons = scope.get_by_role("button", name=pattern)
+        button_count = buttons.count()
+        if button_count == 1:
+            return buttons.first
+        if button_count > 1:
+            return None
+
+        inputs = scope.locator('input[type="submit" i]')
+        matches: list[Any] = []
+        normalized_labels = {label.casefold() for label in labels}
+        for idx in range(inputs.count()):
+            candidate = inputs.nth(idx)
+            value = (candidate.get_attribute("value") or "").strip().casefold()
+            if value in normalized_labels:
+                matches.append(candidate)
+        return matches[0] if len(matches) == 1 else None
+
+    @staticmethod
+    def _has_validation_errors(page: Any) -> bool:
+        if page.locator('[aria-invalid="true"]').count():
+            return True
+        alerts = page.locator('[role="alert"], .field-error, .error-message')
+        for idx in range(min(alerts.count(), 10)):
+            try:
+                if alerts.nth(idx).is_visible():
+                    return True
+            except Exception:
+                continue
+        return False
 
     def _page_text(self, page: Any) -> str:
         try:
             return page.locator("body").inner_text(timeout=5000)
         except Exception:
             return ""
+
+    def _wait_for_page_ready(self, page: Any, timeout: int = 20000) -> None:
+        """Wait for client-rendered ATS pages to expose meaningful body text."""
+        try:
+            page.wait_for_function(
+                "() => {"
+                "  const textReady = document.body && document.body.innerText.trim().length >= 300;"
+                "  const formReady = document.querySelectorAll('input, textarea, select').length > 0;"
+                "  return Boolean(textReady || formReady);"
+                "}",
+                timeout=timeout,
+            )
+            page.wait_for_timeout(750)
+            self._record("page readiness check passed")
+        except Exception:
+            self._record("page readiness check timed out")
 
     def _write_email_draft(self, page_text: str, uploads: dict[str, str]) -> None:
         email = first_email(page_text)

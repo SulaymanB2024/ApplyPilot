@@ -367,9 +367,6 @@ def _ordered_candidates(spec: FieldSpec, *, job: dict) -> list[FieldCandidate]:
     if candidate:
         candidates.append(candidate)
 
-    if spec.type.lower() == "checkbox" and _looks_like_terms_checkbox(spec):
-        candidates.append(FieldCandidate("terms_consent", 0.9, "accessible_name"))
-
     return _dedupe_candidates(candidates)
 
 
@@ -429,7 +426,9 @@ def _candidate_from_text(
         return FieldCandidate("veteran_status", confidence, source)
     if "disability" in normalized:
         return FieldCandidate("disability_status", confidence, source)
-    if normalized in {"position", "role", "job title"} or _has_any(normalized, ("desired position", "current role")):
+    if _has_any(normalized, ("current role", "current title")):
+        return FieldCandidate("current_title", confidence, source)
+    if _has_any(normalized, ("desired position", "position applied for", "role applied for")):
         return FieldCandidate("job_title", confidence, source)
     return None
 
@@ -507,20 +506,32 @@ def _value_for_intent(
         "website_url": personal.get("website_url", ""),
         "current_company": experience.get("current_company", ""),
         "salary_expectation": compensation.get("salary_expectation", ""),
-        "earliest_start_date": availability.get("earliest_start_date", "Immediately"),
+        "earliest_start_date": availability.get("earliest_start_date", ""),
         "authorized_to_work": _profile_yes_no(work_auth.get("legally_authorized_to_work")),
         "requires_sponsorship": _profile_yes_no(work_auth.get("require_sponsorship")),
-        "gender": eeo.get("gender", "Decline to self-identify"),
-        "race_ethnicity": eeo.get("race_ethnicity", "Decline to self-identify"),
-        "veteran_status": eeo.get("veteran_status", "Decline to self-identify"),
-        "disability_status": eeo.get("disability_status", "Decline to self-identify"),
+        "gender": eeo.get("gender", ""),
+        "race_ethnicity": eeo.get("race_ethnicity", ""),
+        "veteran_status": eeo.get("veteran_status", ""),
+        "disability_status": eeo.get("disability_status", ""),
+        "current_title": experience.get("current_title", ""),
         "job_title": job.get("title", ""),
-        "terms_consent": True,
     }
     value = values.get(intent)
-    if value in ("", None):
+    if _is_unknown_profile_value(value):
         return None
     return ResolvedField(value)
+
+
+def _is_unknown_profile_value(value: Any) -> bool:
+    if value in ("", None):
+        return True
+    if not isinstance(value, str):
+        return False
+    normalized = _normalize(value)
+    if normalized in {"unknown", "unconfirmed", "unset", "tbd", "n a", "not provided"}:
+        return True
+    stripped = value.strip()
+    return stripped.startswith("[") and stripped.endswith("]")
 
 
 class CodexResolver:
@@ -982,10 +993,3 @@ def _is_salary_history_consent(normalized: str, spec: FieldSpec) -> bool:
         spec.meaningful_options and {"yes", "no"}.issubset({_normalize(opt) for opt in spec.meaningful_options})
     )
     return salary_history and (consent or yes_no_control)
-
-
-def _looks_like_terms_checkbox(spec: FieldSpec) -> bool:
-    text = spec.haystack
-    return spec.type.lower() == "checkbox" and any(
-        word in text for word in ("privacy", "terms", "certify", "agree", "consent")
-    )

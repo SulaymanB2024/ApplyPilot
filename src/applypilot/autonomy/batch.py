@@ -141,11 +141,23 @@ class AutonomousBatch:
             verified: list[tuple[RoleCandidate, FreshnessEvidence, float]] = []
             for candidate in accepted[: self.ledger.remaining("first_party_verifications")]:
                 self.ledger.reserve("first_party_verifications")
-                evidence = self.dependencies.verifier.verify(candidate)
-                decision = freshness_gate(
-                    evidence,
-                    max_post_age_days=self.policy.max_post_age_days,
-                )
+                try:
+                    evidence = self.dependencies.verifier.verify(candidate)
+                    decision = freshness_gate(
+                        evidence,
+                        max_post_age_days=self.policy.max_post_age_days,
+                    )
+                except BudgetExceeded:
+                    raise
+                except Exception as exc:
+                    _record_candidate_failure(
+                        result,
+                        candidate,
+                        stage="verification",
+                        reason_code="verification_failed",
+                        exc=exc,
+                    )
+                    continue
                 result.freshness.append(
                     {
                         "candidate_id": candidate.candidate_id,
@@ -209,23 +221,40 @@ class AutonomousBatch:
             packets: list[tuple[RoleCandidate, MaterialPacket]] = []
             for candidate, evidence, score in verified[: self.ledger.remaining("material_packets")]:
                 self.ledger.reserve("material_packets")
-                packet = self.dependencies.materials.draft_material(
-                    pack=self.context_pack,
-                    candidate=candidate,
-                    verified_job_text=evidence.description or candidate.description,
-                )
-                if self.fact_ledger is not None:
-                    blockers = validate_artifact_against_ledger(packet.cover_letter, self.fact_ledger)
-                    if blockers:
-                        raise RuntimeError("material_fact_validation_failed:" + ",".join(blockers))
-                artifact_paths = self._write_packet(candidate, packet, score=score)
-                if artifact_paths:
-                    packet = MaterialPacket(
-                        candidate_id=packet.candidate_id,
-                        paragraphs=packet.paragraphs,
-                        verification_gaps=packet.verification_gaps,
-                        artifact_paths=artifact_paths,
+                try:
+                    packet = self.dependencies.materials.draft_material(
+                        pack=self.context_pack,
+                        candidate=candidate,
+                        verified_job_text=evidence.description or candidate.description,
                     )
+                    if self.fact_ledger is not None:
+                        blockers = validate_artifact_against_ledger(
+                            packet.cover_letter,
+                            self.fact_ledger,
+                        )
+                        if blockers:
+                            raise RuntimeError(
+                                "material_fact_validation_failed:" + ",".join(blockers)
+                            )
+                    artifact_paths = self._write_packet(candidate, packet, score=score)
+                    if artifact_paths:
+                        packet = MaterialPacket(
+                            candidate_id=packet.candidate_id,
+                            paragraphs=packet.paragraphs,
+                            verification_gaps=packet.verification_gaps,
+                            artifact_paths=artifact_paths,
+                        )
+                except BudgetExceeded:
+                    raise
+                except Exception as exc:
+                    _record_candidate_failure(
+                        result,
+                        candidate,
+                        stage="materials",
+                        reason_code="material_generation_failed",
+                        exc=exc,
+                    )
+                    continue
                 packets.append((candidate, packet))
                 result.materials.append(
                     {
@@ -236,13 +265,46 @@ class AutonomousBatch:
                     }
                 )
 
-            if self.dependencies.form_review and packets and self.ledger.remaining("form_dry_runs"):
-                candidate, packet = packets[0]
-                self.ledger.reserve("form_dry_runs")
-                review = self.dependencies.form_review.dry_run(candidate=candidate, packet=packet)
-                result.form_reviews.append(
-                    {"candidate_id": candidate.candidate_id, **_bounded_mapping(review)}
-                )
+            if self.dependencies.form_review:
+                for candidate, packet in packets:
+                    if not self.ledger.remaining("form_dry_runs"):
+                        break
+                    self.ledger.reserve("form_dry_runs")
+                    try:
+                        review = self.dependencies.form_review.dry_run(
+                            candidate=candidate,
+                            packet=packet,
+                        )
+                    except BudgetExceeded:
+                        raise
+                    except Exception as exc:
+                        _record_candidate_failure(
+                            result,
+                            candidate,
+                            stage="form_review",
+                            reason_code="form_review_failed",
+                            exc=exc,
+                        )
+                        continue
+                    bounded_review = {
+                        "candidate_id": candidate.candidate_id,
+                        **_bounded_mapping(review),
+                    }
+                    result.form_reviews.append(bounded_review)
+                    if bounded_review.get("status") not in {
+                        "form_surface_reviewed",
+                        "dry_run_verified",
+                    }:
+                        _record_candidate_blocker(
+                            result,
+                            candidate,
+                            stage="form_review",
+                            reason_code="form_review_incomplete",
+                            detail=(
+                                f"status={bounded_review.get('status', 'missing')};"
+                                f"reason={bounded_review.get('reason', '')}"
+                            ),
+                        )
 
             if not self.policy.review_only and packets:
                 if self.dependencies.final_action is None:
@@ -353,17 +415,49 @@ class AutonomousBatch:
         source_decision = authorize_source(self.policy.source.primary, policy=self.policy.source)
         if source_decision.decision is not Decision.ACCEPT:
             raise RuntimeError("primary discovery source rejected by policy")
+        primary_error: Exception | None = None
+        primary_reason = ""
         try:
             candidates = self.dependencies.discovery.find_roles(
                 pack=self.context_pack,
                 query=query,
                 limit=self.ledger.remaining("discoveries"),
             )
-            attempts.append(SourceAttempt(self.policy.source.primary, "ok"))
+        except BudgetExceeded:
+            raise
         except Exception as exc:
-            attempts.append(SourceAttempt(self.policy.source.primary, "failed", str(exc)[:200]))
+            primary_error = exc
+            primary_reason = _bounded_failure_detail("primary_error", exc)
+        else:
+            if candidates:
+                attempts.append(
+                    SourceAttempt(
+                        self.policy.source.primary,
+                        "ok",
+                        f"candidate_count={len(candidates)}",
+                    )
+                )
+            else:
+                primary_reason = "primary_empty_result"
+
+        if primary_reason:
+            attempts.append(SourceAttempt(self.policy.source.primary, "failed", primary_reason))
+            _record_source_blocker(
+                result,
+                source=self.policy.source.primary,
+                reason_code=(
+                    "primary_discovery_empty"
+                    if primary_error is None
+                    else "primary_discovery_failed"
+                ),
+                detail=primary_reason,
+            )
             if self.dependencies.fallback_discovery is None:
-                raise
+                raise RuntimeError(
+                    "primary discovery failed and direct ATS fallback is unconfigured"
+                ) from primary_error
+            if not self.policy.source.fallbacks:
+                raise RuntimeError("primary discovery failed and no fallback source is allowlisted")
             fallback_name = self.policy.source.fallbacks[0]
             fallback_decision = authorize_source(
                 fallback_name,
@@ -371,16 +465,52 @@ class AutonomousBatch:
                 attempts=attempts,
             )
             if fallback_decision.decision is not Decision.ACCEPT:
-                raise RuntimeError("fallback discovery source rejected by policy") from exc
-            candidates = self.dependencies.fallback_discovery.find_roles(
-                pack=self.context_pack,
-                query=query,
-                limit=self.ledger.remaining("discoveries"),
-            )
-            attempts.append(SourceAttempt(fallback_name, "ok", "recorded primary failure"))
+                _record_source_blocker(
+                    result,
+                    source=fallback_name,
+                    reason_code="fallback_discovery_rejected",
+                    detail=",".join(fallback_decision.reason_codes),
+                )
+                raise RuntimeError("fallback discovery source rejected by policy") from primary_error
+            try:
+                candidates = self.dependencies.fallback_discovery.find_roles(
+                    pack=self.context_pack,
+                    query=query,
+                    limit=self.ledger.remaining("discoveries"),
+                )
+            except BudgetExceeded:
+                raise
+            except Exception as exc:
+                fallback_failure = _bounded_failure_detail("fallback_error", exc)
+                attempts.append(SourceAttempt(fallback_name, "failed", fallback_failure))
+                _record_source_blocker(
+                    result,
+                    source=fallback_name,
+                    reason_code="fallback_discovery_failed",
+                    detail=fallback_failure,
+                )
+                raise
+            fallback_reason = (
+                f"trigger={primary_reason};candidate_count={len(candidates)}"
+            )[:200]
+            attempts.append(SourceAttempt(fallback_name, "ok", fallback_reason))
+            if not candidates:
+                _record_source_blocker(
+                    result,
+                    source=fallback_name,
+                    reason_code="fallback_discovery_empty",
+                    detail=fallback_reason,
+                )
 
         candidates = candidates[: self.ledger.remaining("discoveries")]
         self.ledger.reserve("discoveries", len(candidates))
+        attempt_ledger = [asdict(attempt) for attempt in attempts]
+        active_source = attempts[-1].source
+        fallback_reason = (
+            attempts[-1].reason
+            if active_source != self.policy.source.primary
+            else ""
+        )
         result.discoveries.extend(
             {
                 "candidate_id": candidate.candidate_id,
@@ -388,6 +518,9 @@ class AutonomousBatch:
                 "title": candidate.title,
                 "official_url": candidate.official_url,
                 "source": candidate.source,
+                "discovery_source": active_source,
+                "fallback_reason": fallback_reason,
+                "source_attempts": attempt_ledger,
             }
             for candidate in candidates
         )
@@ -478,6 +611,64 @@ def _bounded_mapping(value: dict[str, Any]) -> dict[str, Any]:
         else:
             result[str(key)] = str(item)[:500]
     return result
+
+
+def _record_candidate_failure(
+    result: BatchResult,
+    candidate: RoleCandidate,
+    *,
+    stage: str,
+    reason_code: str,
+    exc: Exception,
+) -> None:
+    _record_candidate_blocker(
+        result,
+        candidate,
+        stage=stage,
+        reason_code=reason_code,
+        detail=f"{type(exc).__name__}:{exc}",
+    )
+
+
+def _record_candidate_blocker(
+    result: BatchResult,
+    candidate: RoleCandidate,
+    *,
+    stage: str,
+    reason_code: str,
+    detail: str,
+) -> None:
+    result.blockers.append(
+        {
+            "candidate_id": candidate.candidate_id,
+            "stage": stage,
+            "decision": "review",
+            "reason_codes": [reason_code],
+            "detail": detail[:240],
+        }
+    )
+
+
+def _record_source_blocker(
+    result: BatchResult,
+    *,
+    source: str,
+    reason_code: str,
+    detail: str,
+) -> None:
+    result.blockers.append(
+        {
+            "stage": "discovery",
+            "source": source[:80],
+            "decision": "review",
+            "reason_codes": [reason_code],
+            "detail": detail[:240],
+        }
+    )
+
+
+def _bounded_failure_detail(prefix: str, exc: Exception) -> str:
+    return f"{prefix}:{type(exc).__name__}:{exc}"[:200]
 
 
 def _mapping_digest(value: dict[str, Any]) -> str:

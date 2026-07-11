@@ -5,6 +5,7 @@ from applypilot.apply.controller import (
     DeterministicApplyController,
     FieldSpec,
     classify_page_state,
+    file_upload_for_field,
     field_value_for,
     first_email,
     is_email_only_posting,
@@ -128,6 +129,13 @@ def test_classify_page_state_fails_closed_for_sso_and_verification():
         == "mfa_required"
     )
     assert classify_page_state("https://example.com", "Allow camera to continue") == "unsafe_permissions"
+    assert (
+        classify_page_state(
+            "https://jobs.example.com/apply",
+            "Sorry, we couldn't find anything here. The job posting you're looking for might have closed.",
+        )
+        == "expired"
+    )
 
 
 def test_email_only_detection_and_recipient_extraction():
@@ -163,7 +171,7 @@ def test_field_value_for_password_uses_1password_credential():
     assert resolved.source == "1password"
 
 
-def test_required_terms_checkbox_can_be_checked_deterministically():
+def test_required_terms_checkbox_requires_explicit_profile_fact():
     resolved = field_value_for(
         FieldSpec(
             selector="#terms",
@@ -176,4 +184,62 @@ def test_required_terms_checkbox_can_be_checked_deterministically():
         job={"title": "Software Engineer"},
     )
 
-    assert resolved.value is True
+    assert resolved is None
+
+
+def test_optional_privacy_consent_checkbox_is_not_auto_selected():
+    resolved = field_value_for(
+        FieldSpec(
+            selector="#marketing",
+            tag="input",
+            type="checkbox",
+            label="I consent to optional marketing and privacy sharing",
+            required=False,
+        ),
+        profile=PROFILE,
+        job={"title": "Software Engineer"},
+    )
+
+    assert resolved is None
+
+
+def test_file_upload_intent_never_substitutes_resume_for_cover_letter():
+    uploads = {"resume": "/tmp/resume.pdf"}
+
+    assert file_upload_for_field(
+        FieldSpec(selector="#resume", tag="input", type="file", label="Resume/CV"),
+        uploads,
+    ) == "/tmp/resume.pdf"
+    assert file_upload_for_field(
+        FieldSpec(selector="#cover", tag="input", type="file", label="Cover Letter"),
+        uploads,
+    ) is None
+    assert file_upload_for_field(
+        FieldSpec(selector="#sample", tag="input", type="file", label="Writing sample"),
+        uploads,
+    ) is None
+
+
+def test_current_role_uses_confirmed_profile_title_not_target_job():
+    resolved = field_value_for(
+        FieldSpec(selector="#current", tag="input", type="text", label="Current role"),
+        profile=PROFILE,
+        job={"title": "Target Job"},
+    )
+
+    assert resolved is None
+
+
+def test_unconfirmed_availability_is_not_submitted_as_a_fact():
+    profile = {
+        **PROFILE,
+        "availability": {"earliest_start_date": "Unconfirmed"},
+    }
+
+    resolved = field_value_for(
+        FieldSpec(selector="#start", tag="input", type="text", label="Start date"),
+        profile=profile,
+        job={"title": "Target Job"},
+    )
+
+    assert resolved is None

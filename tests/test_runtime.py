@@ -131,6 +131,82 @@ def test_acquire_job_skips_future_retry_and_open_breaker(monkeypatch, tmp_path):
     assert job["url"] == "https://ready.example.com/job"
 
 
+def test_acquire_target_job_accepts_unattempted_null_status(monkeypatch, tmp_path):
+    db_path = tmp_path / "applypilot.db"
+    conn = init_db(db_path)
+    conn.execute(
+        "INSERT INTO jobs (url, title, site, tailored_resume_path, application_url, fit_score, "
+        "canonical_job_id, apply_domain, apply_status) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+        (
+            "https://source.example.com/job/123",
+            "Target",
+            "Example",
+            "/tmp/resume.txt",
+            "https://jobs.example.com/apply/123",
+            8,
+            "target-123",
+            "jobs.example.com",
+        ),
+    )
+    conn.commit()
+    monkeypatch.setattr(launcher, "get_connection", lambda: conn)
+
+    job = launcher.acquire_job(
+        target_url="https://jobs.example.com/apply/123",
+        worker_id=0,
+    )
+    close_connection(db_path)
+
+    assert job is not None
+    assert job["title"] == "Target"
+
+
+def test_acquire_target_job_rejects_applied_and_permanent_failures(monkeypatch, tmp_path):
+    db_path = tmp_path / "applypilot.db"
+    conn = init_db(db_path)
+    conn.executemany(
+        "INSERT INTO jobs (url, title, site, tailored_resume_path, application_url, fit_score, "
+        "canonical_job_id, apply_domain, apply_status, apply_attempts) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [
+            (
+                "https://source.example.com/applied",
+                "Applied",
+                "Example",
+                "/tmp/resume.txt",
+                "https://jobs.example.com/apply/applied",
+                8,
+                "applied",
+                "jobs.example.com",
+                "applied",
+                0,
+            ),
+            (
+                "https://source.example.com/captcha",
+                "Captcha",
+                "Example",
+                "/tmp/resume.txt",
+                "https://jobs.example.com/apply/captcha",
+                8,
+                "captcha",
+                "jobs.example.com",
+                "failed",
+                99,
+            ),
+        ],
+    )
+    conn.commit()
+    monkeypatch.setattr(launcher, "get_connection", lambda: conn)
+
+    applied = launcher.acquire_job(target_url="https://jobs.example.com/apply/applied")
+    captcha = launcher.acquire_job(target_url="https://jobs.example.com/apply/captcha")
+    close_connection(db_path)
+
+    assert applied is None
+    assert captcha is None
+
+
 def test_mark_result_sets_retry_metadata_and_opens_breaker(monkeypatch, tmp_path):
     db_path = tmp_path / "applypilot.db"
     conn = init_db(db_path)

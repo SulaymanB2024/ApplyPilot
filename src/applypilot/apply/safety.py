@@ -34,7 +34,13 @@ IDV_DOMAINS = (
 
 PAYMENT_AUTOCOMPLETE_TOKENS = {"cc-name", "cc-number", "cc-exp", "cc-exp-month", "cc-exp-year", "cc-csc"}
 MFA_AUTOCOMPLETE_TOKENS = {"one-time-code", "webauthn"}
-EXPIRED_MARKERS = ("job is no longer available", "no longer accepting applications")
+EXPIRED_MARKERS = (
+    "job is no longer available",
+    "no longer accepting applications",
+    "couldn't find anything here",
+    "job posting you're looking for might have closed",
+    "position has been filled",
+)
 UNSAFE_PERMISSION_MARKERS = (
     "allow camera",
     "allow microphone",
