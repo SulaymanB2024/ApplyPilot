@@ -82,22 +82,72 @@ def discovery_plan(search_cfg: dict | None = None) -> dict[str, bool | str]:
     }
 
 
+def _discovery_provider_outcome(provider: str, result: object) -> tuple[str, str | None]:
+    """Normalize a provider result without hiding internally counted failures."""
+    if not isinstance(result, dict):
+        return "ok", None
+
+    if provider == "smartextract":
+        total = result.get("total")
+        passed = result.get("passed")
+        if isinstance(total, int) and total == 0:
+            return "error", "no SmartExtract targets were configured"
+        if isinstance(total, int) and isinstance(passed, int) and passed < total:
+            failed = total - passed
+            status = "error" if passed == 0 else "partial"
+            return status, f"{failed} of {total} SmartExtract targets failed"
+        return "ok", None
+
+    if provider == "workday":
+        attempts = result.get("attempts")
+        if isinstance(attempts, int) and attempts == 0:
+            return "error", "no Workday employer-query attempts were configured"
+        failures = result.get("errors")
+        if isinstance(failures, int) and failures > 0:
+            if isinstance(attempts, int) and attempts > 0:
+                status = "error" if failures >= attempts else "partial"
+                return status, f"{failures} of {attempts} Workday employer queries failed"
+            return "partial", f"{failures} Workday employer queries failed"
+        return "ok", None
+
+    if provider == "direct_ats" and result.get("sources") == 0:
+        return "error", "no direct ATS sources were configured"
+    if provider == "jobspy" and result.get("queries") == 0:
+        return "error", "no JobSpy searches were configured"
+
+    failures = result.get("errors")
+    if not isinstance(failures, int) or failures <= 0:
+        return "ok", None
+
+    total_key = "sources" if provider == "direct_ats" else "queries"
+    total = result.get(total_key)
+    unit = "sources" if provider == "direct_ats" else "searches"
+    if isinstance(total, int) and total > 0:
+        status = "error" if failures >= total else "partial"
+        return status, f"{failures} of {total} {unit} failed"
+    return "partial", f"{failures} {unit} failed"
+
+
 def _run_discover(workers: int = 1) -> dict:
     """Stage: Job discovery — JobSpy, Workday, and smart-extract scrapers."""
     plan = discovery_plan()
     stats: dict = {"jobspy": None, "workday": None, "direct_ats": None, "smartextract": None}
+    provider_errors: dict[str, str] = {}
 
     # JobSpy
     if plan["jobspy"]:
         console.print("  [cyan]JobSpy full crawl...[/cyan]")
         try:
             from applypilot.discovery.jobspy import run_discovery
-            run_discovery()
-            stats["jobspy"] = "ok"
+            result = run_discovery()
+            stats["jobspy"], error = _discovery_provider_outcome("jobspy", result)
+            if error:
+                provider_errors["jobspy"] = error
         except Exception as e:
             log.error("JobSpy crawl failed: %s", e)
             console.print(f"  [red]JobSpy error:[/red] {e}")
-            stats["jobspy"] = f"error: {e}"
+            stats["jobspy"] = "error"
+            provider_errors["jobspy"] = str(e)
     else:
         console.print(f"  [dim]JobSpy skipped ({plan['mode']} discovery mode).[/dim]")
         stats["jobspy"] = "skipped"
@@ -107,12 +157,15 @@ def _run_discover(workers: int = 1) -> dict:
         console.print("  [cyan]Workday corporate scraper...[/cyan]")
         try:
             from applypilot.discovery.workday import run_workday_discovery
-            run_workday_discovery(workers=workers)
-            stats["workday"] = "ok"
+            result = run_workday_discovery(workers=workers)
+            stats["workday"], error = _discovery_provider_outcome("workday", result)
+            if error:
+                provider_errors["workday"] = error
         except Exception as e:
             log.error("Workday scraper failed: %s", e)
             console.print(f"  [red]Workday error:[/red] {e}")
-            stats["workday"] = f"error: {e}"
+            stats["workday"] = "error"
+            provider_errors["workday"] = str(e)
     else:
         console.print("  [dim]Workday scraper skipped by discovery config.[/dim]")
         stats["workday"] = "skipped"
@@ -122,12 +175,15 @@ def _run_discover(workers: int = 1) -> dict:
         console.print("  [cyan]Direct ATS employer boards...[/cyan]")
         try:
             from applypilot.discovery.direct_ats import run_direct_ats_discovery
-            run_direct_ats_discovery()
-            stats["direct_ats"] = "ok"
+            result = run_direct_ats_discovery()
+            stats["direct_ats"], error = _discovery_provider_outcome("direct_ats", result)
+            if error:
+                provider_errors["direct_ats"] = error
         except Exception as e:
             log.error("Direct ATS discovery failed: %s", e)
             console.print(f"  [red]Direct ATS error:[/red] {e}")
-            stats["direct_ats"] = f"error: {e}"
+            stats["direct_ats"] = "error"
+            provider_errors["direct_ats"] = str(e)
     else:
         console.print("  [dim]Direct ATS discovery skipped by discovery config.[/dim]")
         stats["direct_ats"] = "skipped"
@@ -137,17 +193,28 @@ def _run_discover(workers: int = 1) -> dict:
         console.print("  [cyan]Smart extract (AI-powered scraping)...[/cyan]")
         try:
             from applypilot.discovery.smartextract import run_smart_extract
-            run_smart_extract(workers=workers)
-            stats["smartextract"] = "ok"
+            result = run_smart_extract(workers=workers)
+            stats["smartextract"], error = _discovery_provider_outcome("smartextract", result)
+            if error:
+                provider_errors["smartextract"] = error
         except Exception as e:
             log.error("Smart extract failed: %s", e)
             console.print(f"  [red]Smart extract error:[/red] {e}")
-            stats["smartextract"] = f"error: {e}"
+            stats["smartextract"] = "error"
+            provider_errors["smartextract"] = str(e)
     else:
         console.print("  [dim]Smart extract skipped by discovery config.[/dim]")
         stats["smartextract"] = "skipped"
 
-    return stats
+    enabled_statuses = [status for status in stats.values() if status != "skipped"]
+    if enabled_statuses and all(status == "error" for status in enabled_statuses):
+        status = "error"
+    elif provider_errors:
+        status = "partial"
+    else:
+        status = "ok"
+
+    return {"status": status, "provider_errors": provider_errors, **stats}
 
 
 def _run_enrich(workers: int = 1) -> dict:
@@ -214,6 +281,19 @@ _STAGE_RUNNERS: dict[str, callable] = {
     "cover":    _run_cover,
     "pdf":      _run_pdf,
 }
+
+
+def _stage_outcome(stage: str, result: object) -> tuple[str, dict[str, object] | None]:
+    """Return a stage status plus any structured error detail to preserve."""
+    if not isinstance(result, dict):
+        return "ok", None
+
+    status = str(result.get("status", "ok"))
+    if stage == "discover":
+        provider_errors = result.get("provider_errors")
+        if isinstance(provider_errors, dict) and provider_errors:
+            return status, {"status": status, "provider_errors": dict(provider_errors)}
+    return status, None
 
 
 # ---------------------------------------------------------------------------
@@ -378,7 +458,7 @@ def _run_sequential(ordered: list[str], min_score: int, workers: int = 1,
                     validation_mode: str = "normal") -> dict:
     """Execute stages one at a time (original behavior)."""
     results: list[dict] = []
-    errors: dict[str, str] = {}
+    errors: dict[str, str | dict[str, object]] = {}
     pipeline_start = time.time()
 
     for name in ordered:
@@ -400,26 +480,19 @@ def _run_sequential(ordered: list[str], min_score: int, workers: int = 1,
                 kwargs["workers"] = workers
             result = runner(**kwargs)
             elapsed = time.time() - t0
-
-            status = "ok"
-            if isinstance(result, dict):
-                status = result.get("status", "ok")
-                if name == "discover":
-                    sub_errors = [
-                        f"{k}: {v}" for k, v in result.items()
-                        if isinstance(v, str) and v.startswith("error")
-                    ]
-                    if sub_errors:
-                        status = "partial"
+            status, error_detail = _stage_outcome(name, result)
 
         except Exception as e:
             elapsed = time.time() - t0
             status = f"error: {e}"
+            error_detail = None
             log.exception("Stage '%s' crashed", name)
             console.print(f"\n  [red]STAGE FAILED:[/red] {e}")
 
         results.append({"stage": name, "status": status, "elapsed": elapsed})
-        if status not in ("ok", "partial"):
+        if error_detail is not None:
+            errors[name] = error_detail
+        elif status not in ("ok", "partial"):
             errors[name] = status
 
         console.print(f"\n  Stage '{name}' completed in {elapsed:.1f}s — {status}")
@@ -478,15 +551,17 @@ def _run_streaming(ordered: list[str], min_score: int, workers: int = 1,
     # Build results from tracker
     all_results = tracker.get_results()
     results: list[dict] = []
-    errors: dict[str, str] = {}
+    errors: dict[str, str | dict[str, object]] = {}
 
     for name in ordered:
         r = all_results.get(name, {"status": "unknown"})
         elapsed = time.time() - start_times.get(name, pipeline_start)
-        status = r.get("status", "ok")
+        status, error_detail = _stage_outcome(name, r)
 
         results.append({"stage": name, "status": status, "elapsed": elapsed})
-        if status not in ("ok", "partial", "skipped"):
+        if error_detail is not None:
+            errors[name] = error_detail
+        elif status not in ("ok", "partial", "skipped"):
             errors[name] = status
 
     return {"stages": results, "errors": errors, "elapsed": total_elapsed}

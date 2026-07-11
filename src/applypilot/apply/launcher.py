@@ -83,10 +83,6 @@ def _make_mcp_config(cdp_port: int) -> dict:
                     f"--viewport-size={config.DEFAULTS['viewport']}",
                 ],
             },
-            "gmail": {
-                "command": "npx",
-                "args": ["-y", "@gongrzhe/server-gmail-autoauth-mcp"],
-            },
         }
     }
 
@@ -328,7 +324,8 @@ def _record_domain_success(conn, domain: str) -> None:
 def gen_prompt(target_url: str, min_score: int = 7,
                model: str | None = None, worker_id: int = 0,
                agent_backend: str | None = None,
-               supervisor_model: str | None = None) -> Path | None:
+               supervisor_model: str | None = None,
+               dry_run: bool = True) -> Path | None:
     """Generate a prompt file and print the agent CLI command for manual debugging.
 
     Returns:
@@ -350,7 +347,7 @@ def gen_prompt(target_url: str, min_score: int = 7,
         executor_model=model,
         supervisor_model=supervisor_model,
     )
-    prompt = prompt_mod.build_prompt(job=job, tailored_resume=resume_text)
+    prompt = prompt_mod.build_prompt(job=job, tailored_resume=resume_text, dry_run=dry_run)
     prompt = f"{harness.prompt_header(settings)}\n\n{prompt}"
 
     # Release the lock so the job stays available
@@ -432,6 +429,7 @@ def _run_deterministic_job(
     worker_id: int,
     settings: harness.HarnessSettings,
     dry_run: bool,
+    fact_ledger=None,
 ) -> tuple[str, int]:
     """Run the code-first Codex apply controller for one job."""
     from applypilot.apply.controller import run_deterministic_controller
@@ -484,6 +482,7 @@ def _run_deterministic_job(
         worker_dir=worker_dir,
         settings=settings,
         dry_run=dry_run,
+        fact_ledger=fact_ledger,
     )
     elapsed = max(result.duration_ms // 1000, 0)
     status = result.launcher_status()
@@ -510,9 +509,12 @@ def _run_deterministic_job(
 # ---------------------------------------------------------------------------
 
 def run_job(job: dict, port: int, worker_id: int = 0,
-            model: str | None = None, dry_run: bool = False,
+            model: str | None = None, dry_run: bool = True,
             agent_backend: str | None = None,
-            supervisor_model: str | None = None) -> tuple[str, int]:
+            supervisor_model: str | None = None,
+            allow_account_creation: bool | None = None,
+            approved_fact_digest: str | None = None,
+            corrections_path: Path | None = None) -> tuple[str, int]:
     """Spawn an agent session for one job application.
 
     Returns:
@@ -524,15 +526,36 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         agent_backend=agent_backend,
         executor_model=model,
         supervisor_model=supervisor_model,
+        allow_account_creation=allow_account_creation,
     )
     if settings.agent_backend == "codex" and settings.deterministic_controller:
+        fact_ledger = None
+        if not dry_run:
+            if not approved_fact_digest:
+                raise RuntimeError("approved_fact_digest_required_for_submit")
+            from applypilot.autonomy.facts import build_fact_ledger, load_corrections
+            from applypilot.autonomy.runner import require_approved_fact_digest
+
+            resume_text = config.RESUME_PATH.read_text(encoding="utf-8")
+            corrections = load_corrections(corrections_path) if corrections_path else ()
+            fact_ledger = build_fact_ledger(
+                config.load_profile(),
+                resume_text=resume_text,
+                corrections=corrections,
+            )
+            require_approved_fact_digest(fact_ledger.digest, approved_fact_digest)
         return _run_deterministic_job(
             job=job,
             port=port,
             worker_id=worker_id,
             settings=settings,
             dry_run=dry_run,
+            fact_ledger=fact_ledger,
         )
+
+    raise RuntimeError(
+        "legacy_agent_controller_disabled: use the deterministic Codex controller"
+    )
 
     # Read tailored resume text
     resume_path = job.get("tailored_resume_path")
@@ -583,7 +606,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             "--model", settings.executor_model,
             "-p",
             "--mcp-config", str(mcp_config_path),
-            "--permission-mode", "bypassPermissions",
+            "--permission-mode", "default",
             "--no-session-persistence",
             "--disallowedTools", (
                 "mcp__gmail__send_email,mcp__gmail__reply_email,"
@@ -605,7 +628,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             "codex",
             "exec",
             "--model", settings.executor_model,
-            "--sandbox", "danger-full-access",
+            "--sandbox", "read-only",
             "--ephemeral",
             "--cd", str(worker_dir),
             "--output-last-message", str(codex_output_path),
@@ -819,9 +842,12 @@ def _is_permanent_failure(result: str) -> bool:
 def worker_loop(worker_id: int = 0, limit: int = 1,
                 target_url: str | None = None,
                 min_score: int = 7, headless: bool = False,
-                model: str | None = None, dry_run: bool = False,
+                model: str | None = None, dry_run: bool = True,
                 agent_backend: str | None = None,
-                supervisor_model: str | None = None) -> tuple[int, int]:
+                supervisor_model: str | None = None,
+                allow_account_creation: bool | None = None,
+                approved_fact_digest: str | None = None,
+                corrections_path: Path | None = None) -> tuple[int, int]:
     """Run jobs sequentially until limit is reached or queue is empty.
 
     Args:
@@ -834,6 +860,7 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
         dry_run: Don't click Submit.
         agent_backend: Agent runner backend.
         supervisor_model: Optional supervisor model label for the harness contract.
+        allow_account_creation: Whether this invocation may create a job-site account.
 
     Returns:
         Tuple of (applied_count, failed_count).
@@ -878,6 +905,7 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                 agent_backend=agent_backend,
                 executor_model=model,
                 supervisor_model=supervisor_model,
+                allow_account_creation=allow_account_creation,
             )
             if (
                 headless
@@ -901,7 +929,10 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
             result, duration_ms = run_job(job, port=port, worker_id=worker_id,
                                             model=model, dry_run=dry_run,
                                             agent_backend=agent_backend,
-                                            supervisor_model=supervisor_model)
+                                            supervisor_model=supervisor_model,
+                                            allow_account_creation=allow_account_creation,
+                                            approved_fact_digest=approved_fact_digest,
+                                            corrections_path=corrections_path)
 
             if result == "skipped":
                 release_lock(job["url"])
@@ -977,10 +1008,13 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
 
 def main(limit: int = 1, target_url: str | None = None,
          min_score: int = 7, headless: bool = False, model: str | None = None,
-         dry_run: bool = False, continuous: bool = False,
+         dry_run: bool = True, continuous: bool = False,
          poll_interval: int = 60, workers: int = 1,
          agent_backend: str | None = None,
-         supervisor_model: str | None = None) -> None:
+         supervisor_model: str | None = None,
+         allow_account_creation: bool | None = None,
+         approved_fact_digest: str | None = None,
+         corrections_path: Path | None = None) -> None:
     """Launch the apply pipeline.
 
     Args:
@@ -995,6 +1029,7 @@ def main(limit: int = 1, target_url: str | None = None,
         workers: Number of parallel workers (default 1).
         agent_backend: Agent runner backend.
         supervisor_model: Optional supervisor model label for harness contracts.
+        allow_account_creation: Whether this invocation may create a job-site account.
     """
     global POLL_INTERVAL
     POLL_INTERVAL = poll_interval
@@ -1068,6 +1103,9 @@ def main(limit: int = 1, target_url: str | None = None,
                     dry_run=dry_run,
                     agent_backend=agent_backend,
                     supervisor_model=supervisor_model,
+                    allow_account_creation=allow_account_creation,
+                    approved_fact_digest=approved_fact_digest,
+                    corrections_path=corrections_path,
                 )
             else:
                 # Multi-worker — distribute limit across workers
@@ -1093,6 +1131,9 @@ def main(limit: int = 1, target_url: str | None = None,
                             dry_run=dry_run,
                             agent_backend=agent_backend,
                             supervisor_model=supervisor_model,
+                            allow_account_creation=allow_account_creation,
+                            approved_fact_digest=approved_fact_digest,
+                            corrections_path=corrections_path,
                         ): i
                         for i in range(workers)
                     }

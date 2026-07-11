@@ -34,19 +34,30 @@ applypilot run           # discover > enrich > score > tailor > cover letters
 applypilot run -w 4      # same but parallel (4 threads for discovery/enrichment)
 applypilot training-audit  # verify Workday, email draft, Runway, and board coverage
 applypilot improve plan --scope apply --out .applypilot-dev/exp-001  # bounded self-improvement packet
-applypilot apply         # autonomous browser-driven submission
+applypilot autonomy plan --query "entry-level product and data roles"  # compact local run packet
+applypilot autonomy probe-chatgpt --cdp-port 9222  # no-send authenticated browser probe
+applypilot autonomy run --query "entry-level product and data roles" --cdp-port 9222 --approved-fact-digest DIGEST  # after reviewing plan facts
+applypilot apply         # deterministic browser dry-run; does not submit
+applypilot apply --submit --approved-fact-digest DIGEST  # explicit live-submit boundary
+applypilot apply --allow-account-creation  # separate per-run account-change permission
 applypilot apply -w 3    # parallel apply (3 Chrome instances)
-applypilot apply --dry-run  # fill forms without submitting
+applypilot apply --dry-run  # explicit spelling of the safe default
 ```
 
 > **Discovery extra:** `applypilot[discovery]` installs JobSpy and its runtime scraping dependencies. If your environment hits a JobSpy resolver conflict, `applypilot doctor` will show the fallback install command.
+
+> **Recommended autonomy path:** `applypilot autonomy` uses ChatGPT Web only for bounded
+> role discovery and evidence-cited cover-letter drafting. Eligibility, first-party freshness,
+> budgets, and action gates are deterministic. It disables broad job-board aggregators and
+> never fills or submits during `autonomy run`. See
+> [the diagnosis and operating contract](docs/tool-first-autonomy.md).
 
 ---
 
 ## Two Paths
 
 ### Full Pipeline (recommended)
-**Requires:** Python 3.11+, Node.js (for npx), Gemini API key (free), an agent CLI (Claude Code or Codex), Chrome
+**Requires:** Python 3.11+ and Chrome. The legacy scoring/tailoring stages require a configured LLM API or local endpoint. The deterministic apply controller does not require Node.js or an agent CLI while its field model-call budget remains zero.
 
 Runs all 6 stages, from job discovery to autonomous application submission. This is the full power of ApplyPilot.
 
@@ -66,7 +77,7 @@ Runs stages 1-5: discovers jobs, scores them, tailors your resume, generates cov
 | **3. Score** | AI rates every job 1-10 based on your resume and preferences. Only high-fit jobs proceed |
 | **4. Tailor** | AI rewrites your resume per job: reorganizes, emphasizes relevant experience, adds keywords. Never fabricates |
 | **5. Cover Letter** | AI generates a targeted cover letter per job |
-| **6. Auto-Apply** | An agent CLI navigates application forms, fills fields, uploads documents, answers questions, and submits |
+| **6. Auto-Apply** | A deterministic controller navigates application forms, fills fields, uploads documents, and reviews them; final submission requires `--submit` |
 
 Each stage is independent. Run them all or pick what you need.
 
@@ -90,10 +101,10 @@ Each stage is independent. Run them all or pick what you need.
 | Component | Required For | Details |
 |-----------|-------------|---------|
 | Python 3.11+ | Everything | Core runtime |
-| Node.js 18+ | Auto-apply | Needed for `npx` to run Playwright MCP server |
+| Node.js 18+ | Legacy tooling only | Not required by the deterministic Python controller |
 | Gemini API key | Scoring, tailoring, cover letters | Free tier (15 RPM / 1M tokens/day) is enough |
 | Chrome/Chromium | Auto-apply | Auto-detected on most systems |
-| Agent CLI | Auto-apply | Claude Code is the default executor; Codex CLI can be selected with `--agent-backend codex` |
+| Codex CLI | Optional field fallback | Not required when `APPLYPILOT_FIELD_MODEL_CALL_BUDGET=0` (the default) |
 | Google Password Manager in Chrome | Codex auto-apply login flows | Uses the selected Chrome profile's browser-managed credentials/autofill |
 | 1Password CLI + Chrome extension | Legacy Codex account creation | Optional legacy provider when `APPLYPILOT_CREDENTIAL_PROVIDER=onepassword` |
 
@@ -120,7 +131,7 @@ Your personal data in one structured file: contact info, work authorization, com
 Job search queries, target titles, locations, discovery mode, direct ATS boards, and optional aggregators. Set `discovery_mode: direct_sources` to skip aggregator boards and focus on employer-owned or ATS-native pages.
 
 ### `.env`
-API keys and runtime config: `GEMINI_API_KEY`, `LLM_MODEL`, plus harness overrides such as `APPLYPILOT_AGENT_BACKEND`, `APPLYPILOT_EXECUTOR_MODEL`, `APPLYPILOT_SUPERVISOR_MODEL`, `APPLYPILOT_DETERMINISTIC_CONTROLLER`, `APPLYPILOT_ALLOW_ACCOUNT_CREATION`, `APPLYPILOT_CREDENTIAL_PROVIDER`, and `APPLYPILOT_CHROME_PROFILE_DIRECTORY`. `APPLYPILOT_CREDENTIAL_PROVIDER` defaults to `google_password_manager`, which uses the selected Chrome profile's browser-managed credentials without exporting passwords. Legacy 1Password settings remain available with `APPLYPILOT_CREDENTIAL_PROVIDER=onepassword`. The self-improvement development harness uses separate optional settings: `APPLYPILOT_DEV_MODE`, `APPLYPILOT_DEV_WORKER_MODEL`, `APPLYPILOT_DEV_REVIEWER_MODEL`, and `APPLYPILOT_DEV_FORBIDDEN_MODELS`. API secret values can also be stored in the OS keyring.
+API keys and runtime config: `GEMINI_API_KEY`, `LLM_MODEL`, plus harness overrides such as `APPLYPILOT_LLM_PROVIDER=chatgpt_web`, `APPLYPILOT_AGENT_BACKEND`, `APPLYPILOT_EXECUTOR_MODEL`, `APPLYPILOT_SUPERVISOR_MODEL`, `APPLYPILOT_DETERMINISTIC_CONTROLLER`, `APPLYPILOT_FIELD_MODEL_CALL_BUDGET`, `APPLYPILOT_CREDENTIAL_PROVIDER`, and `APPLYPILOT_CHROME_PROFILE_DIRECTORY`. Account creation is intentionally a per-run CLI permission rather than a persistent environment default. `APPLYPILOT_CREDENTIAL_PROVIDER` defaults to `google_password_manager`, which uses the selected Chrome profile's browser-managed credentials without exporting passwords. The field model-call budget defaults to zero, so deterministic auto-apply does not spawn a model subprocess. Legacy 1Password settings remain available with `APPLYPILOT_CREDENTIAL_PROVIDER=onepassword`. The self-improvement development harness uses separate optional settings: `APPLYPILOT_DEV_MODE`, `APPLYPILOT_DEV_WORKER_MODEL`, `APPLYPILOT_DEV_REVIEWER_MODEL`, and `APPLYPILOT_DEV_FORBIDDEN_MODELS`. API secret values can also be stored in the OS keyring.
 
 ### Package configs (shipped with ApplyPilot)
 - `config/employers.yaml` - Workday employer registry (48 preconfigured)
@@ -147,9 +158,9 @@ Generates a custom resume per job: reorders experience, emphasizes relevant skil
 Writes a targeted cover letter per job referencing the specific company, role, and how your experience maps to their requirements.
 
 ### Auto-Apply
-ApplyPilot launches Chrome and an agent executor, writes a deterministic per-job harness contract, navigates each application page, detects the form type, fills personal information and work history, uploads the tailored resume and cover letter, answers screening questions with AI, and submits. If a role only accepts email applications, the harness writes a local `email_application_draft.md` for user review instead of sending email. A live dashboard shows progress in real-time.
+ApplyPilot launches Chrome, writes a deterministic per-job harness contract, navigates each application page, detects the form type, fills personal information and work history, and uploads the tailored resume and cover letter. It stops at review by default; `--submit` is required to authorize the final click. If a role only accepts email applications, the harness writes a local `email_application_draft.md` for user review instead of sending email. A live dashboard shows progress in real-time.
 
-The Claude backend configures Playwright MCP automatically at runtime per worker. The Codex backend can be selected with `--agent-backend codex`; it defaults to `gpt-5.5` and uses a deterministic Python/Playwright controller for navigation, form detection, uploads, submit gates, screenshots, and result parsing. Codex 5.5 is only used as a schema-constrained fallback for ambiguous required fields or screening questions that the controller cannot resolve from profile facts. CAPTCHA, MFA, SSO, payment/tax, and identity-verification surfaces fail closed instead of attempting bypass.
+The supported apply path uses a deterministic Python/Playwright controller for navigation, form detection, uploads, submit gates, screenshots, and result parsing. Its model-call budget defaults to zero. If `APPLYPILOT_FIELD_MODEL_CALL_BUDGET` is explicitly raised, Codex is used once per page as a schema-constrained batch fallback for ambiguous required fields or screening questions that the controller cannot resolve from profile facts. The legacy free-form Claude/Codex controller is disabled. CAPTCHA, MFA, SSO, payment/tax, and identity-verification surfaces fail closed instead of attempting bypass.
 
 By default, Codex apply runs use Google Password Manager through the selected Chrome profile. ApplyPilot never reads, exports, prints, or persists Google-stored passwords; it allows Chrome autofill to satisfy login fields and fails closed if a required password field is not already satisfied. New account creation is not treated as a credential-write API for Google Password Manager. The legacy 1Password path remains available with `APPLYPILOT_CREDENTIAL_PROVIDER=onepassword`, `op`, and the 1Password Chrome extension. API keys stay in `.env` or the OS keyring.
 
@@ -161,7 +172,6 @@ applypilot training-audit             # audit Workday/email/Runway/board trainin
 applypilot apply --mark-applied URL    # manually mark a job as applied
 applypilot apply --mark-failed URL     # manually mark a job as failed
 applypilot apply --reset-failed        # reset all failed jobs for retry
-applypilot apply --gen --url URL       # generate prompt file for manual debugging
 ```
 
 ---
@@ -179,12 +189,17 @@ applypilot run --dry-run                # Preview without executing
 applypilot run --validation lenient     # Relax validation (recommended for Gemini free tier)
 applypilot run --validation strict      # Strictest validation (retries on any banned word)
 applypilot training-audit               # Audit apply-agent training coverage
-applypilot apply                        # Launch auto-apply
+applypilot autonomy plan --query QUERY  # Write compact facts, policy, and ChatGPT request artifacts
+applypilot autonomy probe-chatgpt       # No-send auth/composer probe on caller-provided CDP Chrome
+applypilot autonomy run --query QUERY --approved-fact-digest DIGEST  # Review-only funnel after fact review
+applypilot apply                        # Launch deterministic dry-run (safe default)
+applypilot apply --submit --approved-fact-digest DIGEST  # Explicit reviewed live-submit boundary
+applypilot apply --allow-account-creation # Separate job-site account-creation permission
 applypilot apply --workers 3            # Parallel browser workers
 applypilot apply --dry-run              # Fill forms without submitting
 applypilot apply --continuous           # Run forever, polling for new jobs
 applypilot apply --headless             # Headless browser mode
-applypilot apply --url URL              # Apply to a specific job
+applypilot apply --url URL              # Dry-run a specific job
 applypilot apply --agent-backend codex   # Use Codex executor profile
 applypilot apply --model gpt-5.5 --agent-backend codex
 applypilot apply --supervisor-model gpt-5.5

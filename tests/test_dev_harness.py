@@ -1,12 +1,16 @@
 import json
 
 import pytest
+from typer.testing import CliRunner
 
+from applypilot.cli import app
 from applypilot.dev_harness.artifacts import read_json, write_json
 from applypilot.dev_harness.contracts import DevHarnessSettings, load_settings
 from applypilot.dev_harness.knowledge import build_knowledge_index
 from applypilot.dev_harness.reviewer import review_proposal
 from applypilot.dev_harness.runner import create_plan, create_worker_proposal, run_validation
+
+runner = CliRunner()
 
 
 def test_settings_reject_forbidden_worker_model(monkeypatch):
@@ -157,3 +161,28 @@ def test_validation_updates_proposal_before_review(tmp_path):
 
     assert results["passed"] is True
     assert review["approved"] is True
+
+
+def test_cli_review_and_validation_fail_closed_with_nonzero_exit(tmp_path):
+    review_dir = tmp_path / "review"
+    plan_path = create_plan(out_dir=review_dir, settings=DevHarnessSettings())
+    proposal_path = create_worker_proposal(plan_path=plan_path)
+
+    review_result = runner.invoke(app, ["improve", "review", "--artifact", str(proposal_path)])
+
+    assert review_result.exit_code == 1
+    assert "not approved" in review_result.output
+
+    validate_dir = tmp_path / "validate"
+    failing_plan = create_plan(out_dir=validate_dir, settings=DevHarnessSettings())
+    payload = read_json(failing_plan)
+    payload["validation_commands"] = ["python -c 'raise SystemExit(7)'"]
+    write_json(failing_plan, payload)
+
+    validate_result = runner.invoke(
+        app,
+        ["improve", "validate", "--artifact", str(failing_plan)],
+    )
+
+    assert validate_result.exit_code == 1
+    assert "failed" in validate_result.output

@@ -547,7 +547,13 @@ def scrape_employers(
     log.info("[%s] Done: %d found, %d new, %d dupes in %.0fs",
              search_text, total_found, total_new, total_existing, elapsed)
 
-    return {"found": total_found, "new": total_new, "existing": total_existing}
+    return {
+        "found": total_found,
+        "new": total_new,
+        "existing": total_existing,
+        "errors": errors,
+        "attempts": len(valid_keys),
+    }
 
 
 # -- Public entry point ------------------------------------------------------
@@ -571,7 +577,14 @@ def run_workday_discovery(employers: dict | None = None, workers: int = 1) -> di
 
     if not employers:
         log.warning("No employers configured. Create config/employers.yaml.")
-        return {"found": 0, "new": 0, "existing": 0, "queries": 0}
+        return {
+            "found": 0,
+            "new": 0,
+            "existing": 0,
+            "queries": 0,
+            "errors": 0,
+            "attempts": 0,
+        }
 
     search_cfg = config.load_search_config()
     queries_cfg = search_cfg.get("queries", [])
@@ -587,7 +600,14 @@ def run_workday_discovery(employers: dict | None = None, workers: int = 1) -> di
 
     if not queries:
         log.warning("No search queries configured in searches.yaml.")
-        return {"found": 0, "new": 0, "existing": 0, "queries": 0}
+        return {
+            "found": 0,
+            "new": 0,
+            "existing": 0,
+            "queries": 0,
+            "errors": 0,
+            "attempts": 0,
+        }
 
     proxy = search_cfg.get("proxy")
     if proxy:
@@ -601,6 +621,8 @@ def run_workday_discovery(employers: dict | None = None, workers: int = 1) -> di
     grand_new = 0
     grand_existing = 0
     grand_found = 0
+    grand_errors = 0
+    grand_attempts = 0
 
     for i, query in enumerate(queries, 1):
         log.info("Query %d/%d: \"%s\"", i, len(queries), query)
@@ -617,6 +639,8 @@ def run_workday_discovery(employers: dict | None = None, workers: int = 1) -> di
         grand_new += result["new"]
         grand_existing += result["existing"]
         grand_found += result["found"]
+        grand_errors += int(result.get("errors", 0))
+        grand_attempts += int(result.get("attempts", 0))
 
     log.info("Workday crawl done: %d found, %d new, %d existing across %d queries x %d employers",
              grand_found, grand_new, grand_existing, len(queries), len(employers))
@@ -626,4 +650,6 @@ def run_workday_discovery(employers: dict | None = None, workers: int = 1) -> di
         "new": grand_new,
         "existing": grand_existing,
         "queries": len(queries),
+        "errors": grand_errors,
+        "attempts": grand_attempts,
     }

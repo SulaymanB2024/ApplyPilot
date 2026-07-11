@@ -70,6 +70,7 @@ class PageState:
     text: str = ""
     inputs: tuple[PageInput, ...] = ()
     iframe_origins: tuple[str, ...] = ()
+    inspection_error: str = ""
 
 
 @dataclass(frozen=True)
@@ -86,6 +87,7 @@ def classify_page_state(
     *,
     inputs: tuple[PageInput, ...] = (),
     iframe_origins: tuple[str, ...] = (),
+    allow_password: bool = False,
 ) -> str | None:
     """Return a fail-closed result reason for known unsafe page states.
 
@@ -96,12 +98,18 @@ def classify_page_state(
         state = state_or_url
     else:
         state = PageState(url=state_or_url, text=text, inputs=inputs, iframe_origins=iframe_origins)
-    verdict = classify_page_state_with_evidence(state)
+    verdict = classify_page_state_with_evidence(state, allow_password=allow_password)
     return verdict.reason if verdict else None
 
 
-def classify_page_state_with_evidence(state: PageState) -> SafetyVerdict | None:
+def classify_page_state_with_evidence(
+    state: PageState,
+    *,
+    allow_password: bool = False,
+) -> SafetyVerdict | None:
     """Return a fail-closed verdict and evidence for unsafe page states."""
+    if state.inspection_error:
+        return SafetyVerdict("inspection_failed", f"page_state={state.inspection_error[:120]}")
     url_origin = _origin(state.url)
     if _domain_matches(url_origin, SSO_DOMAINS) or "saml" in state.url.lower():
         return SafetyVerdict("sso_required", f"url_origin={url_origin}")
@@ -114,7 +122,7 @@ def classify_page_state_with_evidence(state: PageState) -> SafetyVerdict | None:
             return SafetyVerdict("unsafe_verification", f"iframe_origin={host}")
 
     for page_input in state.inputs:
-        verdict = _classify_input(page_input)
+        verdict = _classify_input(page_input, allow_password=allow_password)
         if verdict:
             return verdict
 
@@ -174,10 +182,12 @@ def inspect_page_state(page) -> PageState:
       };
     }
     """
+    inspection_error = ""
     try:
         raw = page.evaluate(script)
-    except Exception:
+    except Exception as exc:
         raw = {"text": "", "inputs": [], "iframeOrigins": []}
+        inspection_error = type(exc).__name__
     inputs = tuple(
         PageInput(
             selector=str(item.get("selector") or ""),
@@ -196,14 +206,19 @@ def inspect_page_state(page) -> PageState:
         text=str(raw.get("text") or ""),
         inputs=inputs,
         iframe_origins=tuple(str(origin) for origin in raw.get("iframeOrigins", [])),
+        inspection_error=inspection_error,
     )
 
 
-def _classify_input(page_input: PageInput) -> SafetyVerdict | None:
+def _classify_input(
+    page_input: PageInput,
+    *,
+    allow_password: bool = False,
+) -> SafetyVerdict | None:
     field_type = page_input.type.lower()
     autocomplete_tokens = {token.lower() for token in page_input.autocomplete.split() if token.strip()}
     evidence_id = page_input.selector or page_input.name or page_input.label[:40]
-    if field_type == "password":
+    if field_type == "password" and not allow_password:
         return SafetyVerdict("login_issue", f"input[type=password] selector={evidence_id}")
     if autocomplete_tokens & MFA_AUTOCOMPLETE_TOKENS:
         return SafetyVerdict("mfa_required", f"autocomplete={page_input.autocomplete} selector={evidence_id}")

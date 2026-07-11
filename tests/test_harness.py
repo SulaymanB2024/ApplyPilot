@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from applypilot.apply.harness import load_settings, prompt_header
 from applypilot.apply.harness import write_contract
 from applypilot.apply import launcher
@@ -27,17 +29,92 @@ def test_claude_backend_keeps_lightweight_default_model():
     assert settings.executor_model == "haiku"
 
 
-def test_codex_backend_defaults_to_gpt55_and_supervisor():
+def test_codex_backend_defaults_to_gpt55_and_supervisor(monkeypatch):
+    monkeypatch.delenv("APPLYPILOT_ALLOW_ACCOUNT_CREATION", raising=False)
+    monkeypatch.delenv("APPLYPILOT_FIELD_MODEL_CALL_BUDGET", raising=False)
+
     settings = load_settings(agent_backend="codex")
 
     assert settings.agent_backend == "codex"
     assert settings.executor_model == "gpt-5.5"
     assert settings.supervisor_model == "gpt-5.5"
     assert settings.deterministic_controller is True
-    assert settings.allow_account_creation is True
+    assert settings.allow_account_creation is False
     assert settings.credential_provider == "google_password_manager"
     assert settings.uses_google_password_manager is True
     assert settings.uses_onepassword is False
+    assert settings.requires_model_cli is False
+
+
+def test_model_cli_is_required_only_when_field_budget_is_enabled(monkeypatch):
+    monkeypatch.setenv("APPLYPILOT_FIELD_MODEL_CALL_BUDGET", "1")
+
+    settings = load_settings(agent_backend="codex")
+
+    assert settings.requires_model_cli is True
+
+
+def test_account_creation_requires_explicit_settings_override(monkeypatch):
+    monkeypatch.delenv("APPLYPILOT_ALLOW_ACCOUNT_CREATION", raising=False)
+
+    assert load_settings().allow_account_creation is False
+    assert load_settings(allow_account_creation=True).allow_account_creation is True
+
+
+@pytest.mark.parametrize(
+    ("extra_args", "expected_dry_run", "expected_account_creation"),
+    [
+        ([], True, False),
+        (["--submit", "--approved-fact-digest", "reviewed"], False, False),
+        (["--allow-account-creation"], True, True),
+    ],
+)
+def test_apply_uses_deterministic_controller_without_model_cli(
+    monkeypatch,
+    tmp_path,
+    extra_args,
+    expected_dry_run,
+    expected_account_creation,
+):
+    from applypilot import cli, config
+    from applypilot.apply import google_passwords
+    from applypilot.apply import field_resolver
+
+    class FakeCursor:
+        @staticmethod
+        def fetchone():
+            return (1,)
+
+    class FakeConnection:
+        @staticmethod
+        def execute(_query):
+            return FakeCursor()
+
+    profile_path = tmp_path / "profile.json"
+    profile_path.write_text("{}", encoding="utf-8")
+    captured = {}
+    monkeypatch.delenv("APPLYPILOT_FIELD_MODEL_CALL_BUDGET", raising=False)
+    monkeypatch.setattr(cli, "_bootstrap", lambda: None)
+    monkeypatch.setattr(config, "PROFILE_PATH", profile_path)
+    monkeypatch.setattr(config, "get_chrome_path", lambda: "/Applications/Google Chrome.app")
+    monkeypatch.setattr("applypilot.database.get_connection", lambda: FakeConnection())
+    monkeypatch.setattr(field_resolver, "find_codex_executable", lambda: None)
+    monkeypatch.setattr(
+        google_passwords,
+        "choose_chrome_profile_for_google_passwords",
+        lambda: "Default",
+    )
+    monkeypatch.setattr(
+        launcher,
+        "main",
+        lambda **kwargs: captured.update(kwargs),
+    )
+
+    result = runner.invoke(app, ["apply", "--limit", "1", *extra_args])
+
+    assert result.exit_code == 0, result.output
+    assert captured["dry_run"] is expected_dry_run
+    assert captured["allow_account_creation"] is expected_account_creation
 
 
 def test_executor_model_override_wins_for_codex():
@@ -159,6 +236,33 @@ def test_training_manifest_audit_fails_closed_on_missing_boundaries():
     assert audit["has_runway_source"] is False
 
 
+def test_training_manifest_audit_marks_zero_boards_not_applicable_for_direct_sources():
+    manifest = build_training_manifest({
+        "discovery_mode": "direct_sources",
+        "boards": [],
+    })
+
+    audit = audit_training_manifest(manifest)
+
+    assert audit["passed"] is True
+    assert audit["jobspy_board_status"] == "not_applicable"
+    assert audit["failures"]["jobspy_boards"] is False
+
+
+def test_training_manifest_audit_fails_zero_boards_when_jobspy_is_enabled():
+    for discovery_mode in ("hybrid", "job_boards"):
+        manifest = build_training_manifest({
+            "discovery_mode": discovery_mode,
+            "boards": [],
+        })
+
+        audit = audit_training_manifest(manifest)
+
+        assert audit["passed"] is False
+        assert audit["jobspy_board_status"] == "fail"
+        assert audit["failures"]["jobspy_boards"] is True
+
+
 def test_training_audit_cli_prints_user_facing_report():
     result = runner.invoke(app, ["training-audit"])
 
@@ -166,6 +270,78 @@ def test_training_audit_cli_prints_user_facing_report():
     assert "ApplyPilot Training Audit" in result.output
     assert "Runway" in result.output
     assert "email_application_draft.md" in result.output
+
+
+def test_training_audit_cli_renders_zero_direct_source_boards_as_not_applicable(monkeypatch):
+    manifest = build_training_manifest({
+        "discovery_mode": "direct_sources",
+        "boards": [],
+    })
+    monkeypatch.setattr(prompt_mod, "build_training_manifest", lambda: manifest)
+
+    result = runner.invoke(app, ["training-audit"])
+
+    assert result.exit_code == 0
+    assert "N/A" in result.output
+    assert "0 configured JobSpy board(s)" in result.output
+
+
+def test_training_audit_cli_fails_zero_hybrid_boards(monkeypatch):
+    manifest = build_training_manifest({
+        "discovery_mode": "hybrid",
+        "boards": [],
+    })
+    monkeypatch.setattr(prompt_mod, "build_training_manifest", lambda: manifest)
+
+    result = runner.invoke(app, ["training-audit"])
+
+    assert result.exit_code == 1
+    assert "FAIL" in result.output
+    assert "0 configured JobSpy board(s)" in result.output
+
+
+def test_doctor_strict_json_exits_nonzero_for_required_missing_files(
+    monkeypatch,
+    tmp_path,
+):
+    from applypilot import config
+
+    monkeypatch.setattr(config, "PROFILE_PATH", tmp_path / "profile.json")
+    monkeypatch.setattr(config, "RESUME_PATH", tmp_path / "resume.txt")
+    monkeypatch.setattr(config, "RESUME_PDF_PATH", tmp_path / "resume.pdf")
+    monkeypatch.setattr(config, "SEARCH_CONFIG_PATH", tmp_path / "searches.yaml")
+    monkeypatch.setattr(config, "ENV_PATH", tmp_path / ".env")
+    monkeypatch.setattr(config, "load_search_config", lambda: {"discovery_mode": "direct_sources"})
+
+    result = runner.invoke(app, ["doctor", "--strict", "--json"])
+
+    assert result.exit_code == 1
+    assert '"ready": false' in result.output
+    assert '"profile.json"' in result.output
+    assert '"resume.txt"' in result.output
+
+
+def test_doctor_strict_requires_chatgpt_web_probe(monkeypatch, tmp_path):
+    from applypilot import config
+
+    profile_path = tmp_path / "profile.json"
+    resume_path = tmp_path / "resume.txt"
+    profile_path.write_text("{}", encoding="utf-8")
+    resume_path.write_text("resume", encoding="utf-8")
+    monkeypatch.setenv("APPLYPILOT_LLM_PROVIDER", "chatgpt_web")
+    monkeypatch.setattr(config, "PROFILE_PATH", profile_path)
+    monkeypatch.setattr(config, "RESUME_PATH", resume_path)
+    monkeypatch.setattr(config, "RESUME_PDF_PATH", tmp_path / "resume.pdf")
+    monkeypatch.setattr(config, "SEARCH_CONFIG_PATH", tmp_path / "searches.yaml")
+    monkeypatch.setattr(config, "ENV_PATH", tmp_path / ".env")
+    monkeypatch.setattr(config, "load_search_config", lambda: {"discovery_mode": "direct_sources"})
+    monkeypatch.setattr(config, "get_chrome_path", lambda: "/Applications/Google Chrome.app")
+
+    result = runner.invoke(app, ["doctor", "--strict", "--json"])
+
+    assert result.exit_code == 1
+    assert '"ChatGPT Web"' in result.output
+    assert "configured but unprobed" in result.output
 
 
 def test_harness_contract_references_training_manifest(tmp_path):
@@ -205,6 +381,7 @@ def test_build_prompt_injects_training_scenarios(monkeypatch, tmp_path):
             "phone": "555-0100",
             "city": "Austin",
             "country": "USA",
+            "password": "never-include-this-password",
         },
         "work_authorization": {
             "legally_authorized_to_work": True,
@@ -248,6 +425,27 @@ def test_build_prompt_injects_training_scenarios(monkeypatch, tmp_path):
     assert "Email-only application" in prompt
     assert "Runway fresh-role discovery" in prompt
     assert "Aggregator to employer ATS" in prompt
+    assert "never-include-this-password" not in prompt
+
+
+def test_legacy_agent_controller_is_disabled_before_prompt_construction(monkeypatch):
+    monkeypatch.setattr(
+        launcher.harness,
+        "load_settings",
+        lambda **_kwargs: type(
+            "Settings",
+            (),
+            {"agent_backend": "claude", "deterministic_controller": False},
+        )(),
+    )
+    monkeypatch.setattr(
+        launcher.prompt_mod,
+        "build_prompt",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("prompt must not be built")),
+    )
+
+    with pytest.raises(RuntimeError, match="legacy_agent_controller_disabled"):
+        launcher.run_job({"url": "https://example.com/job"}, port=9222)
 
 
 def test_job_board_playbook_includes_configured_smart_extract_sources():

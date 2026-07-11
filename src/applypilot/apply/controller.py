@@ -34,6 +34,11 @@ from applypilot.apply.safety import (
     inspect_page_state,
 )
 from applypilot.apply.submission import is_probable_submit_response, verify_submission
+from applypilot.autonomy.facts import (
+    FactLedger,
+    require_confirmed_facts,
+    validate_artifact_against_ledger,
+)
 
 EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
 
@@ -107,12 +112,14 @@ class DeterministicApplyController:
         settings: HarnessSettings,
         dry_run: bool = False,
         onepassword_client: onepassword.OnePasswordClient | None = None,
+        fact_ledger: FactLedger | None = None,
     ) -> None:
         self.job = job
         self.port = port
         self.worker_dir = worker_dir
         self.settings = settings
         self.dry_run = dry_run
+        self.fact_ledger = fact_ledger
         self.profile = config.load_profile()
         self.events: list[str] = []
         self.artifacts: dict[str, str] = {}
@@ -125,7 +132,15 @@ class DeterministicApplyController:
                 else None
             )
         )
-        self._resolver = CodexResolver(model=settings.executor_model, worker_dir=worker_dir)
+        self._resolver = (
+            CodexResolver(
+                model=settings.executor_model,
+                worker_dir=worker_dir,
+                max_calls=settings.field_model_call_budget,
+            )
+            if settings.field_model_call_budget > 0
+            else None
+        )
 
     def run(self) -> ControllerResult:
         """Execute the deterministic apply flow."""
@@ -151,6 +166,37 @@ class DeterministicApplyController:
             )
 
     def _preflight(self) -> None:
+        if not self.dry_run:
+            if self.fact_ledger is None:
+                raise RuntimeError("approved_fact_ledger_required")
+            required_facts = (
+                "profile.personal.full_name",
+                "profile.personal.email",
+                "profile.personal.phone",
+                "profile.personal.city",
+                "profile.personal.country",
+                "profile.work_authorization.legally_authorized_to_work",
+                "profile.work_authorization.require_sponsorship",
+                "profile.availability.earliest_start_date",
+            )
+            fact_blockers = require_confirmed_facts(self.fact_ledger, required_facts)
+            if fact_blockers:
+                raise RuntimeError("required_facts_unconfirmed:" + ",".join(fact_blockers))
+            for path_key in ("tailored_resume_path", "cover_letter_path"):
+                artifact_path = self.job.get(path_key)
+                if not artifact_path:
+                    continue
+                text_path = Path(artifact_path).with_suffix(".txt")
+                if not text_path.exists():
+                    raise RuntimeError(f"reviewable_text_artifact_missing:{path_key}")
+                blockers = validate_artifact_against_ledger(
+                    text_path.read_text(encoding="utf-8"),
+                    self.fact_ledger,
+                )
+                if blockers:
+                    raise RuntimeError(
+                        f"artifact_fact_validation_failed:{path_key}:" + ",".join(blockers)
+                    )
         if self.settings.uses_onepassword and self.settings.allow_account_creation:
             if self._op is None:
                 raise RuntimeError("onepassword_required_for_account_creation")
@@ -179,7 +225,11 @@ class DeterministicApplyController:
             page.wait_for_timeout(1000)
 
             state = inspect_page_state(page)
-            verdict = classify_page_state_with_evidence(state)
+            has_login_form = self._has_login_or_account_form(page)
+            verdict = classify_page_state_with_evidence(
+                state,
+                allow_password=has_login_form,
+            )
             if verdict:
                 self._record(f"stop gate {verdict.reason}: {verdict.evidence}")
                 self._capture(page, "blocked")
@@ -201,7 +251,7 @@ class DeterministicApplyController:
                 )
 
             credential: onepassword.OnePasswordLogin | None = None
-            if self._has_login_or_account_form(page):
+            if has_login_form:
                 credential = self._credential_for_page(page)
                 self._fill_login_or_account(page, credential)
                 try:
@@ -317,6 +367,13 @@ class DeterministicApplyController:
 
     def _credential_for_page(self, page: Any) -> onepassword.OnePasswordLogin | None:
         if self.settings.uses_google_password_manager:
+            page_text = self._page_text(page).lower()
+            account_only = (
+                any(marker in page_text for marker in ("create account", "sign up"))
+                and not any(marker in page_text for marker in ("sign in", "log in"))
+            )
+            if account_only and not self.settings.allow_account_creation:
+                raise RuntimeError("account_required")
             domain = onepassword.domain_from_url(page.url)
             self._record(
                 f"using Google Password Manager browser autofill for {domain}; "
@@ -364,7 +421,32 @@ class DeterministicApplyController:
         count = 0
         for _ in range(3):
             filled_this_pass = 0
-            for spec in self._collect_fields(page):
+            specs = self._collect_fields(page)
+            deterministic: dict[str, ResolvedField] = {}
+            fallback_specs: list[FieldSpec] = []
+            for spec in specs:
+                if self._field_already_satisfied(spec) or spec.type == "file":
+                    continue
+                resolved = field_value_for(
+                    spec,
+                    profile=self.profile,
+                    job=self.job,
+                    credential=credential,
+                )
+                if resolved is not None:
+                    deterministic[spec.selector] = resolved
+                elif needs_llm_fallback(spec):
+                    fallback_specs.append(spec)
+
+            fallback: dict[str, ResolvedField] = {}
+            if fallback_specs and self._resolver is not None:
+                fallback = self._resolver.resolve_fields(
+                    fallback_specs,
+                    profile=self.profile,
+                    job=self.job,
+                )
+
+            for spec in specs:
                 if self._field_already_satisfied(spec):
                     continue
                 if spec.type == "file":
@@ -383,9 +465,7 @@ class DeterministicApplyController:
                             raise RequiredFieldUnresolved("required file upload failed")
                     continue
 
-                resolved = field_value_for(spec, profile=self.profile, job=self.job, credential=credential)
-                if resolved is None and needs_llm_fallback(spec):
-                    resolved = self._resolver.resolve_field(spec, profile=self.profile, job=self.job)
+                resolved = deterministic.get(spec.selector) or fallback.get(spec.selector)
                 if resolved is None or resolved.value in ("", None):
                     if spec.required:
                         self._record(
@@ -441,7 +521,10 @@ class DeterministicApplyController:
     def _fill_login_or_account(self, page: Any, credential: onepassword.OnePasswordLogin | None) -> None:
         filled = self._fill_application_form(page, uploads={"resume": ""}, credential=credential)
         self._record(f"filled {filled} login/account field(s)")
-        if not self._click_button_by_text(page, ("continue", "next", "sign in", "log in", "create account", "sign up")):
+        button_text = ["continue", "next", "sign in", "log in"]
+        if self.settings.allow_account_creation:
+            button_text.extend(["create account", "sign up"])
+        if not self._click_button_by_text(page, tuple(button_text)):
             self._record("no login/account continuation button found")
 
     def _has_login_or_account_form(self, page: Any) -> bool:
@@ -704,6 +787,7 @@ def run_deterministic_controller(
     worker_dir: Path,
     settings: HarnessSettings,
     dry_run: bool,
+    fact_ledger: FactLedger | None = None,
 ) -> ControllerResult:
     """Convenience wrapper used by the launcher."""
     return DeterministicApplyController(
@@ -712,4 +796,5 @@ def run_deterministic_controller(
         worker_dir=worker_dir,
         settings=settings,
         dry_run=dry_run,
+        fact_ledger=fact_ledger,
     ).run()

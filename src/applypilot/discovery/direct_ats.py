@@ -226,7 +226,6 @@ query ApiJobBoardWithTeams($organizationHostedJobsPageName: String!) {
       title
       locationName
       employmentType
-      isListed
     }
   }
 }
@@ -244,11 +243,20 @@ def _ashby_jobs(source: dict) -> list[dict]:
             "query": ASHBY_QUERY,
         },
     )
-    postings = (((payload or {}).get("data") or {}).get("jobBoard") or {}).get("jobPostings", [])
+    if not isinstance(payload, dict):
+        raise ValueError("Ashby GraphQL response was not an object")
+
+    graphql_errors = payload.get("errors")
+    if graphql_errors:
+        messages = [
+            str(error.get("message") or error) if isinstance(error, dict) else str(error)
+            for error in graphql_errors
+        ]
+        raise RuntimeError(f"Ashby GraphQL error: {'; '.join(messages)}")
+
+    postings = (((payload.get("data") or {}).get("jobBoard") or {}).get("jobPostings", []))
     jobs = []
     for job in postings:
-        if job.get("isListed") is False:
-            continue
         job_id = job.get("id")
         url = f"https://jobs.ashbyhq.com/{slug}/{job_id}" if job_id else None
         jobs.append({

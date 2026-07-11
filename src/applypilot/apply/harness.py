@@ -23,18 +23,19 @@ DEFAULT_CODEX_MODEL = "gpt-5.5"
 class HarnessSettings(BaseSettings):
     """Environment-driven harness settings.
 
-    The default backend stays on the existing Claude executor. The Codex
-    backend defaults to the user's configured Codex 5.5 account model and uses
-    the deterministic Python/Playwright controller by default.
+    The default backend is Codex, but production application work remains in
+    the deterministic Python/Playwright controller. Codex is available only as
+    a narrow, schema-constrained fallback for unresolved safe fields.
     """
 
-    agent_backend: AgentBackend = "claude"
+    agent_backend: AgentBackend = "codex"
     executor_model: str = DEFAULT_CODEX_MODEL
     supervisor_model: str = DEFAULT_CODEX_MODEL
     supervisor_poll_seconds: int = Field(default=60, ge=5)
     deterministic_mode: bool = True
     deterministic_controller: bool = True
-    allow_account_creation: bool = True
+    field_model_call_budget: int = Field(default=0, ge=0, le=2)
+    allow_account_creation: bool = False
     credential_provider: CredentialProvider = GOOGLE_PASSWORD_MANAGER
     onepassword_enabled: bool = False
     onepassword_vault: str | None = None
@@ -52,12 +53,18 @@ class HarnessSettings(BaseSettings):
         """Return whether Chrome should use Google Password Manager/autofill."""
         return self.credential_provider == GOOGLE_PASSWORD_MANAGER and not self.uses_onepassword
 
+    @property
+    def requires_model_cli(self) -> bool:
+        """Return whether the deterministic controller may invoke a model subprocess."""
+        return self.field_model_call_budget > 0
+
 
 def load_settings(
     *,
     agent_backend: str | None = None,
     executor_model: str | None = None,
     supervisor_model: str | None = None,
+    allow_account_creation: bool | None = None,
 ) -> HarnessSettings:
     """Load harness settings with optional CLI overrides."""
     overrides: dict[str, str] = {}
@@ -67,6 +74,8 @@ def load_settings(
         overrides["executor_model"] = executor_model
     if supervisor_model:
         overrides["supervisor_model"] = supervisor_model
+    if allow_account_creation is not None:
+        overrides["allow_account_creation"] = allow_account_creation
     settings = HarnessSettings(**overrides)
     if not executor_model and settings.agent_backend == "claude":
         settings = settings.model_copy(update={"executor_model": DEFAULT_CLAUDE_MODEL})
@@ -82,6 +91,7 @@ Supervisor model: {settings.supervisor_model}
 Supervisor wait policy: sleep/poll every {settings.supervisor_poll_seconds}s until executor finishes or times out.
 Deterministic mode: {str(settings.deterministic_mode).lower()}
 Deterministic controller: {str(settings.deterministic_controller).lower()}
+Field model-call budget per job: {settings.field_model_call_budget}
 Account creation allowed: {str(settings.allow_account_creation).lower()}
 Credential provider for job-site auth: {settings.credential_provider}
 Google Password Manager/autofill enabled: {str(settings.uses_google_password_manager).lower()}
@@ -126,6 +136,8 @@ def write_contract(
         "supervisor_poll_seconds": settings.supervisor_poll_seconds,
         "deterministic_mode": settings.deterministic_mode,
         "deterministic_controller": settings.deterministic_controller,
+        "field_model_call_budget": settings.field_model_call_budget,
+        "requires_model_cli": settings.requires_model_cli,
         "allow_account_creation": settings.allow_account_creation,
         "credential_provider": settings.credential_provider,
         "google_password_manager": {

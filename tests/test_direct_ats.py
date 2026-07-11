@@ -1,5 +1,8 @@
+import pytest
+
 from applypilot.config import normalize_search_config
 from applypilot.database import close_connection, init_db
+from applypilot.discovery import direct_ats
 from applypilot.discovery.direct_ats import _filter_jobs, _store_jobs, infer_source_from_url, load_direct_ats_sources
 
 
@@ -97,3 +100,57 @@ def test_direct_ats_store_sets_canonical_and_apply_domain(tmp_path):
     assert row["canonical_job_id"] == "greenhouse:123"
     assert row["apply_domain"] == "boards.greenhouse.io"
     assert row["full_description"] == "Internship role with detailed description"
+
+
+def test_ashby_query_uses_current_job_posting_schema(monkeypatch):
+    captured_payload = {}
+
+    def fake_request(url, *, method="GET", payload=None, timeout=30):
+        captured_payload.update(payload or {})
+        return {
+            "data": {
+                "jobBoard": {
+                    "jobPostings": [
+                        {
+                            "id": "posting-123",
+                            "title": "Product Analyst Intern",
+                            "locationName": "Remote",
+                            "employmentType": "Intern",
+                        }
+                    ]
+                }
+            }
+        }
+
+    monkeypatch.setattr(direct_ats, "_request_json", fake_request)
+
+    jobs = direct_ats._ashby_jobs({"ats": "ashby", "slug": "example"})
+
+    assert "isListed" not in captured_payload["query"]
+    assert jobs[0]["url"] == "https://jobs.ashbyhq.com/example/posting-123"
+
+
+def test_direct_ats_counts_top_level_ashby_graphql_errors(monkeypatch):
+    def fake_request(url, *, method="GET", payload=None, timeout=30):
+        slug = payload["variables"]["organizationHostedJobsPageName"]
+        if slug == "broken":
+            return {"errors": [{"message": "upstream resolver failed"}]}
+        return {"data": {"jobBoard": {"jobPostings": []}}}
+
+    monkeypatch.setattr(direct_ats, "_request_json", fake_request)
+    monkeypatch.setattr(direct_ats.config, "load_search_config", lambda: {})
+    monkeypatch.setattr(direct_ats, "init_db", lambda: None)
+    monkeypatch.setattr(direct_ats, "get_connection", object)
+    monkeypatch.setattr(direct_ats, "_store_jobs", lambda conn, source, jobs: (0, 0))
+
+    result = direct_ats.run_direct_ats_discovery(
+        sources=[
+            {"name": "Broken Ashby", "ats": "ashby", "slug": "broken"},
+            {"name": "Working Ashby", "ats": "ashby", "slug": "working"},
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="Ashby GraphQL error: upstream resolver failed"):
+        direct_ats._ashby_jobs({"ats": "ashby", "slug": "broken"})
+    assert result["sources"] == 2
+    assert result["errors"] == 1

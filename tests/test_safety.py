@@ -23,6 +23,25 @@ def test_password_input_stops_with_evidence():
     assert "input[type=password]" in verdict.evidence
 
 
+def test_password_can_be_deferred_to_login_handler_without_weakening_other_gates():
+    password_state = PageState(
+        url="https://jobs.example.com/login",
+        inputs=(PageInput(selector="#pw", type="password", label="Password"),),
+    )
+    mfa_state = PageState(
+        url="https://jobs.example.com/login",
+        inputs=(
+            PageInput(selector="#pw", type="password", label="Password"),
+            PageInput(selector="#otp", type="text", autocomplete="one-time-code"),
+        ),
+    )
+
+    assert classify_page_state_with_evidence(password_state, allow_password=True) is None
+    verdict = classify_page_state_with_evidence(mfa_state, allow_password=True)
+    assert verdict is not None
+    assert verdict.reason == "mfa_required"
+
+
 def test_otp_and_payment_autocomplete_stop():
     assert (
         classify_page_state(
@@ -78,3 +97,10 @@ def test_sso_captcha_idv_and_id_upload_stop():
 
 def test_expired_text_still_maps_to_expired():
     assert classify_page_state("https://example.com", "This job is no longer available.") == "expired"
+
+
+def test_page_inspection_failure_fails_closed():
+    assert (
+        classify_page_state(PageState(url="https://example.com", inspection_error="RuntimeError"))
+        == "inspection_failed"
+    )

@@ -28,7 +28,13 @@ improve_app = typer.Typer(
     help="Bounded self-improvement development harness.",
     no_args_is_help=True,
 )
+autonomy_app = typer.Typer(
+    name="autonomy",
+    help="Tool-first, budgeted ChatGPT Web application funnel.",
+    no_args_is_help=True,
+)
 app.add_typer(improve_app, name="improve")
+app.add_typer(autonomy_app, name="autonomy")
 console = Console()
 log = logging.getLogger(__name__)
 
@@ -159,14 +165,14 @@ def run(
 
 @app.command()
 def apply(
-    limit: Optional[int] = typer.Option(None, "--limit", "-l", help="Max applications to submit."),
+    limit: Optional[int] = typer.Option(None, "--limit", "-l", help="Max application forms to process."),
     workers: int = typer.Option(1, "--workers", "-w", help="Number of parallel browser workers."),
     min_score: int = typer.Option(7, "--min-score", help="Minimum fit score for job selection."),
     model: Optional[str] = typer.Option(None, "--model", "-m", help="Override agent executor model."),
     agent_backend: Optional[str] = typer.Option(
         None,
         "--agent-backend",
-        help="Agent runner backend: claude or codex. Defaults to APPLYPILOT_AGENT_BACKEND or claude.",
+        help="Deterministic controller backend. Only codex is supported; defaults to codex.",
     ),
     supervisor_model: Optional[str] = typer.Option(
         None,
@@ -174,7 +180,26 @@ def apply(
         help="Supervisor model label written into the deterministic harness contract.",
     ),
     continuous: bool = typer.Option(False, "--continuous", "-c", help="Run forever, polling for new jobs."),
-    dry_run: bool = typer.Option(False, "--dry-run", help="Preview actions without submitting."),
+    dry_run: bool = typer.Option(
+        True,
+        "--dry-run/--submit",
+        help="Dry-run by default. --submit is an explicit irreversible-action authorization.",
+    ),
+    allow_account_creation: bool = typer.Option(
+        False,
+        "--allow-account-creation",
+        help="Explicitly allow creation of a job-site account during this invocation.",
+    ),
+    approved_fact_digest: Optional[str] = typer.Option(
+        None,
+        "--approved-fact-digest",
+        help="Required for --submit; exact digest from a reviewed autonomy fact ledger.",
+    ),
+    corrections: Optional[Path] = typer.Option(
+        None,
+        "--corrections",
+        help="Fact corrections file used to produce the approved digest.",
+    ),
     headless: bool = typer.Option(False, "--headless", help="Run browsers in headless mode."),
     url: Optional[str] = typer.Option(None, "--url", help="Apply to a specific job URL."),
     gen: bool = typer.Option(False, "--gen", help="Generate prompt file for manual debugging instead of running."),
@@ -183,10 +208,10 @@ def apply(
     fail_reason: Optional[str] = typer.Option(None, "--fail-reason", help="Reason for --mark-failed."),
     reset_failed: bool = typer.Option(False, "--reset-failed", help="Reset all failed jobs for retry."),
 ) -> None:
-    """Launch auto-apply to submit job applications."""
+    """Launch deterministic auto-apply; dry-run unless --submit is explicit."""
     _bootstrap()
 
-    from applypilot.config import check_tier, PROFILE_PATH as _profile_path
+    from applypilot.config import PROFILE_PATH as _profile_path, get_chrome_path
     from applypilot.database import get_connection
 
     # --- Utility modes (no Chrome/agent needed) ---
@@ -214,20 +239,39 @@ def apply(
         console.print("[red]Invalid --agent-backend.[/red] Choose: claude, codex")
         raise typer.Exit(code=1)
 
-    # Check 1: Tier 3 required (agent CLI + Chrome)
-    check_tier(3, "auto-apply")
-
-    import shutil
     from applypilot.apply.harness import load_settings as load_harness_settings
     harness_settings = load_harness_settings(
         agent_backend=agent_backend,
         executor_model=model,
         supervisor_model=supervisor_model,
+        allow_account_creation=allow_account_creation,
     )
-    if not shutil.which(harness_settings.agent_backend):
+    if harness_settings.agent_backend != "codex" or not harness_settings.deterministic_controller:
         console.print(
-            f"[red]Missing {harness_settings.agent_backend} executable for selected "
-            f"--agent-backend {harness_settings.agent_backend}.[/red]"
+            "[red]Legacy model-driven apply controllers are disabled.[/red]\n"
+            "Use the deterministic Codex controller."
+        )
+        raise typer.Exit(code=1)
+    if not dry_run and not approved_fact_digest:
+        console.print(
+            "[red]--submit requires --approved-fact-digest from a reviewed autonomy plan.[/red]"
+        )
+        raise typer.Exit(code=1)
+
+    if not gen:
+        try:
+            get_chrome_path()
+        except FileNotFoundError as exc:
+            console.print("[red]Chrome/Chromium is required for auto-apply.[/red]")
+            raise typer.Exit(code=1) from exc
+
+    from applypilot.apply.field_resolver import find_codex_executable
+
+    codex_bin = find_codex_executable()
+    if harness_settings.requires_model_cli and not codex_bin:
+        console.print(
+            "[red]Codex is required only because APPLYPILOT_FIELD_MODEL_CALL_BUDGET "
+            "is greater than zero.[/red]"
         )
         raise typer.Exit(code=1)
 
@@ -305,36 +349,12 @@ def apply(
             console.print(f"[dim]Google Password Manager Chrome profile: {profile_name}[/dim]")
 
     if gen:
-        from applypilot.apply.launcher import gen_prompt
-        target = url or ""
-        if not target:
-            console.print("[red]--gen requires --url to specify which job.[/red]")
-            raise typer.Exit(code=1)
-        prompt_file = gen_prompt(
-            target,
-            min_score=min_score,
-            model=model,
-            agent_backend=agent_backend,
-            supervisor_model=supervisor_model,
+        console.print(
+            "[red]Legacy free-form prompt generation is disabled.[/red]\n"
+            "Use [bold]applypilot autonomy plan --query QUERY[/bold] for a compact, "
+            "reviewable request artifact."
         )
-        if not prompt_file:
-            console.print("[red]No matching job found for that URL.[/red]")
-            raise typer.Exit(code=1)
-        mcp_path = _profile_path.parent / ".mcp-apply-0.json"
-        console.print(f"[green]Wrote prompt to:[/green] {prompt_file}")
-        console.print("\n[bold]Run manually:[/bold]")
-        if harness_settings.agent_backend == "codex":
-            console.print(
-                f"  codex exec --model {harness_settings.executor_model} "
-                f"--sandbox danger-full-access --ephemeral --cd {prompt_file.parent} < {prompt_file}"
-            )
-        else:
-            console.print(
-                f"  claude --model {harness_settings.executor_model} -p "
-                f"--mcp-config {mcp_path} "
-                f"--permission-mode bypassPermissions < {prompt_file}"
-            )
-        return
+        raise typer.Exit(code=1)
 
     from applypilot.apply.launcher import main as apply_main
 
@@ -360,6 +380,9 @@ def apply(
         model=model,
         agent_backend=agent_backend,
         supervisor_model=supervisor_model,
+        allow_account_creation=allow_account_creation,
+        approved_fact_digest=approved_fact_digest,
+        corrections_path=corrections,
         dry_run=dry_run,
         continuous=continuous,
         workers=workers,
@@ -442,6 +465,92 @@ def dashboard() -> None:
     open_dashboard()
 
 
+@autonomy_app.command("plan")
+def autonomy_plan(
+    query: str = typer.Option(..., "--query", "-q", help="Bounded role-search query."),
+    out: Optional[Path] = typer.Option(None, "--out", help="Run artifact directory."),
+    corrections: Optional[Path] = typer.Option(
+        None,
+        "--corrections",
+        help="Optional fact_corrections.json path.",
+    ),
+) -> None:
+    """Create a compact run packet without network or browser actions."""
+    _bootstrap_config_only()
+    from applypilot import config
+    from applypilot.autonomy.runner import prepare_run
+
+    output_dir = out or config.APP_DIR / "autonomy-runs"
+    try:
+        paths = prepare_run(
+            query=query,
+            output_dir=output_dir,
+            corrections_path=corrections,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        console.print(f"[red]Autonomy plan failed:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    console.print(f"[green]Wrote autonomy run packet:[/green] {paths['run_dir']}")
+    console.print(f"[dim]ChatGPT Web request: {paths['request']}[/dim]")
+    console.print(f"[bold]Fact digest to approve after review:[/bold] {paths['fact_digest']}")
+
+
+@autonomy_app.command("probe-chatgpt")
+def autonomy_probe_chatgpt(
+    cdp_port: int = typer.Option(9222, "--cdp-port", help="Authenticated Chrome debugging port."),
+) -> None:
+    """Read ChatGPT Web auth/composer state without sending a prompt."""
+    _bootstrap_config_only()
+    from applypilot.autonomy.runner import probe_chatgpt_cdp
+
+    try:
+        result = probe_chatgpt_cdp(cdp_port=cdp_port)
+    except Exception as exc:
+        console.print(f"[red]ChatGPT Web probe failed:[/red] {type(exc).__name__}: {str(exc)[:160]}")
+        raise typer.Exit(code=1) from exc
+    console.print_json(data=result)
+    if not result.get("available"):
+        raise typer.Exit(code=1)
+
+
+@autonomy_app.command("run")
+def autonomy_run(
+    query: str = typer.Option(..., "--query", "-q", help="Bounded role-search query."),
+    cdp_port: int = typer.Option(9222, "--cdp-port", help="Authenticated Chrome debugging port."),
+    out: Optional[Path] = typer.Option(None, "--out", help="Run artifact directory."),
+    corrections: Optional[Path] = typer.Option(
+        None,
+        "--corrections",
+        help="Optional fact_corrections.json path.",
+    ),
+    approved_fact_digest: str = typer.Option(
+        ...,
+        "--approved-fact-digest",
+        help="Exact digest from a reviewed autonomy plan fact_ledger.json.",
+    ),
+) -> None:
+    """Run the review-only ChatGPT Web funnel; never upload or submit."""
+    _bootstrap_config_only()
+    from applypilot import config
+    from applypilot.autonomy.runner import run_with_cdp
+
+    output_dir = out or config.APP_DIR / "autonomy-runs"
+    try:
+        result = run_with_cdp(
+            query=query,
+            cdp_port=cdp_port,
+            output_dir=output_dir,
+            corrections_path=corrections,
+            approved_fact_digest=approved_fact_digest,
+        )
+    except Exception as exc:
+        console.print(f"[red]Autonomy run failed:[/red] {type(exc).__name__}: {str(exc)[:160]}")
+        raise typer.Exit(code=1) from exc
+    console.print_json(data=result)
+    if result.get("status") not in {"review_ready", "no_eligible_verified_roles"}:
+        raise typer.Exit(code=1)
+
+
 @improve_app.command("plan")
 def improve_plan(
     scope: str = typer.Option("apply", "--scope", help="Improvement scope label."),
@@ -502,6 +611,8 @@ def improve_review(
     verdict = "approved" if review.get("approved") else "not approved"
     console.print(f"[green]Wrote improve review:[/green] {review_path}")
     console.print(f"Verdict: [bold]{verdict}[/bold]")
+    if not review.get("approved"):
+        raise typer.Exit(code=1)
 
 
 @improve_app.command("validate")
@@ -520,6 +631,8 @@ def improve_validate(
     status = "passed" if results.get("passed") else "failed"
     console.print(f"[green]Wrote validation results:[/green] {results_path}")
     console.print(f"Validation: [bold]{status}[/bold]")
+    if not results.get("passed"):
+        raise typer.Exit(code=1)
 
 
 @app.command()
@@ -591,9 +704,20 @@ def training_audit(
     board_detail = f"{audit['configured_jobspy_boards']} configured JobSpy board(s)"
     if audit["jobspy_boards_without_rules"]:
         board_detail += "; missing specific rules: " + ", ".join(audit["jobspy_boards_without_rules"])
+    board_status = audit["jobspy_board_status"]
+    if board_status == "not_applicable":
+        board_label = "[dim]N/A[/dim]"
+        board_detail += "; not required in direct_sources mode"
+    elif board_status == "fail":
+        board_label = "[red]FAIL[/red]"
+        board_detail += f"; required in {audit['discovery_mode']} mode"
+    elif audit["jobspy_boards_without_rules"]:
+        board_label = "[yellow]WARN[/yellow]"
+    else:
+        board_label = "[green]PASS[/green]"
     table.add_row(
         "JobSpy boards",
-        "[yellow]WARN[/yellow]" if audit["jobspy_boards_without_rules"] else "[green]PASS[/green]",
+        board_label,
         board_detail,
     )
 
@@ -615,7 +739,15 @@ def training_audit(
 
 
 @app.command()
-def doctor() -> None:
+def doctor(
+    strict: bool = typer.Option(False, "--strict", help="Exit nonzero when required checks are missing."),
+    json_output: bool = typer.Option(False, "--json", help="Print machine-readable check results."),
+    chatgpt_cdp_port: Optional[int] = typer.Option(
+        None,
+        "--chatgpt-cdp-port",
+        help="Optionally probe an authenticated Chrome/ChatGPT Web CDP session without sending.",
+    ),
+) -> None:
     """Check your setup and diagnose missing requirements."""
     import shutil
     from applypilot.config import (
@@ -681,7 +813,30 @@ def doctor() -> None:
     has_gemini = bool(get_secret("GEMINI_API_KEY"))
     has_openai = bool(get_secret("OPENAI_API_KEY"))
     has_local = bool(os.environ.get("LLM_URL"))
-    if has_gemini:
+    configured_provider = os.environ.get("APPLYPILOT_LLM_PROVIDER", "").strip().lower()
+    if configured_provider == "chatgpt_web":
+        if chatgpt_cdp_port is None:
+            results.append((
+                "ChatGPT Web",
+                fail_mark if strict else warn_mark,
+                "configured but unprobed; run doctor --chatgpt-cdp-port PORT for a no-send auth probe",
+            ))
+        else:
+            try:
+                from applypilot.autonomy.runner import probe_chatgpt_cdp
+
+                probe = probe_chatgpt_cdp(cdp_port=chatgpt_cdp_port)
+            except Exception as exc:
+                results.append(("ChatGPT Web", fail_mark, f"probe failed: {type(exc).__name__}"))
+            else:
+                results.append((
+                    "ChatGPT Web",
+                    ok_mark if probe.get("available") else fail_mark,
+                    "authenticated composer available; no prompt sent"
+                    if probe.get("available")
+                    else "authenticated composer unavailable",
+                ))
+    elif has_gemini:
         model = os.environ.get("LLM_MODEL", "gemini-2.0-flash")
         results.append(("LLM API key", ok_mark, f"Gemini ({model})"))
     elif has_openai:
@@ -703,6 +858,10 @@ def doctor() -> None:
                         "Install from https://claude.ai/code for Claude backend"))
 
     codex_bin = shutil.which("codex")
+    if not codex_bin:
+        bundled_codex = Path("/Applications/ChatGPT.app/Contents/Resources/codex")
+        if bundled_codex.exists():
+            codex_bin = str(bundled_codex)
     if codex_bin:
         results.append(("Codex CLI", ok_mark, codex_bin))
     else:
@@ -722,8 +881,11 @@ def doctor() -> None:
     if npx_bin:
         results.append(("Node.js (npx)", ok_mark, npx_bin))
     else:
-        results.append(("Node.js (npx)", fail_mark,
-                        "Install Node.js 18+ from nodejs.org (needed for auto-apply)"))
+        results.append((
+            "Node.js (npx)",
+            warn_mark,
+            "not required by the deterministic Python controller; needed only for legacy MCP tooling",
+        ))
 
     results.append(("CAPTCHA policy", ok_mark, "fail closed; solver APIs are not used"))
 
@@ -827,29 +989,53 @@ def doctor() -> None:
     else:
         results.append(("Headless apply", ok_mark, "available"))
 
-    # --- Render results ---
-    console.print()
-    console.print("[bold]ApplyPilot Doctor[/bold]\n")
+    serialized_results = [
+        {
+            "check": check,
+            "status": "missing" if status == fail_mark else "warn" if status == warn_mark else "ok",
+            "note": note,
+        }
+        for check, status, note in results
+    ]
+    missing_checks = [item["check"] for item in serialized_results if item["status"] == "missing"]
 
-    col_w = max(len(r[0]) for r in results) + 2
-    for check, status, note in results:
-        pad = " " * (col_w - len(check))
-        console.print(f"  {check}{pad}{status}  [dim]{note}[/dim]")
+    if json_output:
+        console.print_json(
+            data={
+                "ready": not missing_checks,
+                "strict": strict,
+                "missing_checks": missing_checks,
+                "checks": serialized_results,
+            }
+        )
+    else:
+        # --- Render results ---
+        console.print()
+        console.print("[bold]ApplyPilot Doctor[/bold]\n")
 
-    console.print()
+        col_w = max(len(r[0]) for r in results) + 2
+        for check, status, note in results:
+            pad = " " * (col_w - len(check))
+            console.print(f"  {check}{pad}{status}  [dim]{note}[/dim]")
+
+        console.print()
 
     # Tier summary
     from applypilot.config import get_tier, TIER_LABELS
     tier = get_tier()
-    console.print(f"[bold]Current tier: Tier {tier} — {TIER_LABELS[tier]}[/bold]")
+    if not json_output:
+        console.print(f"[bold]Current tier: Tier {tier} — {TIER_LABELS[tier]}[/bold]")
 
-    if tier == 1:
+    if not json_output and tier == 1:
         console.print("[dim]  → Tier 2 unlocks: scoring, tailoring, cover letters (needs LLM API key)[/dim]")
         console.print("[dim]  → Tier 3 unlocks: auto-apply (needs agent CLI + Chrome + Node.js)[/dim]")
-    elif tier == 2:
+    elif not json_output and tier == 2:
         console.print("[dim]  → Tier 3 unlocks: auto-apply (needs agent CLI + Chrome + Node.js)[/dim]")
 
-    console.print()
+    if not json_output:
+        console.print()
+    if strict and missing_checks:
+        raise typer.Exit(code=1)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,15 @@
+{
+  "corrections": [
+    {
+      "match": "Incorrect or withdrawn experience line",
+      "state": "rejected",
+      "reason": "Applicant explicitly rejected this source fact"
+    },
+    {
+      "fact_id": "profile.personal.phone",
+      "match": "",
+      "state": "unknown",
+      "reason": "Confirm before any form-fill or submission run"
+    }
+  ]
+}

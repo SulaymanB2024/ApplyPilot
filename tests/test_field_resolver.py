@@ -130,7 +130,13 @@ def test_required_ambiguous_field_uses_validated_codex_fallback(tmp_path):
     resolver._store_cache(
         {},
         key,
-        {"value": "Maybe", "confidence": 0.9, "abstain": False, "reason": "test"},
+        {
+            "value": "Maybe",
+            "confidence": 0.9,
+            "abstain": False,
+            "reason": "test",
+                        "support_fact_ids": ["work_authorization.legally_authorized_to_work"],
+        },
     )
 
     assert needs_llm_fallback(spec)
@@ -139,7 +145,13 @@ def test_required_ambiguous_field_uses_validated_codex_fallback(tmp_path):
     resolver._store_cache(
         {},
         key,
-        {"value": "Yes", "confidence": 0.9, "abstain": False, "reason": "test"},
+        {
+            "value": "Yes",
+            "confidence": 0.9,
+            "abstain": False,
+            "reason": "test",
+            "support_fact_ids": ["work_authorization.legally_authorized_to_work"],
+        },
     )
     resolved = resolver.resolve_field(spec, profile=PROFILE, job={"title": "Software Engineer"})
 
@@ -163,7 +175,15 @@ def test_codex_resolver_uses_current_exec_flags(monkeypatch, tmp_path):
         if "--output-last-message" in cmd:
             output_path = tmp_path / cmd[cmd.index("--output-last-message") + 1].split("/")[-1]
         output_path.write_text(
-            json.dumps({"value": "Yes", "confidence": 0.9, "abstain": False, "reason": "test"}),
+            json.dumps(
+                {
+                    "value": "Yes",
+                    "confidence": 0.9,
+                    "abstain": False,
+                    "reason": "test",
+                    "support_fact_ids": ["work_authorization.legally_authorized_to_work"],
+                }
+            ),
             encoding="utf-8",
         )
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
@@ -178,3 +198,113 @@ def test_codex_resolver_uses_current_exec_flags(monkeypatch, tmp_path):
 
     assert resolved is not None
     assert resolved.value == "Yes"
+
+
+def test_codex_resolver_batches_required_fields_into_one_call(monkeypatch, tmp_path):
+    specs = [
+        FieldSpec(
+            selector=f"#question-{index}",
+            tag="input",
+            type="text",
+            label=f"Required custom question {index}",
+            required=True,
+        )
+        for index in range(8)
+    ]
+    calls = []
+
+    def fake_run(cmd, input, capture_output, text, timeout):
+        calls.append(cmd)
+        prompt = json.loads(input)
+        assert len(prompt["fields"]) == 8
+        output_path = tmp_path / cmd[cmd.index("--output-last-message") + 1].split("/")[-1]
+        output_path.write_text(
+            json.dumps(
+                {
+                    "answers": [
+                        {
+                            "field_id": item["field_id"],
+                            "value": "Test Candidate",
+                            "confidence": 0.9,
+                            "abstain": False,
+                            "reason": "supported",
+                            "support_fact_ids": ["personal.full_name"],
+                        }
+                        for index, item in enumerate(prompt["fields"])
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("applypilot.apply.field_resolver.subprocess.run", fake_run)
+    resolver = CodexResolver(model="gpt-5.5", worker_dir=tmp_path, max_calls=1)
+
+    resolved = resolver.resolve_fields(specs, profile=PROFILE, job={"title": "Engineer"})
+
+    assert len(calls) == 1
+    assert len(resolved) == 8
+    assert resolved["#question-7"].value == "Test Candidate"
+    assert resolver.calls == 1
+
+
+def test_codex_resolver_rejects_value_not_derived_from_cited_fact(monkeypatch, tmp_path):
+    spec = FieldSpec(
+        selector="#question",
+        tag="input",
+        type="text",
+        label="Required custom question",
+        required=True,
+    )
+
+    def fake_run(cmd, input, capture_output, text, timeout):
+        prompt = json.loads(input)
+        output_path = tmp_path / cmd[cmd.index("--output-last-message") + 1].split("/")[-1]
+        output_path.write_text(
+            json.dumps(
+                {
+                    "answers": [
+                        {
+                            "field_id": prompt["fields"][0]["field_id"],
+                            "value": "Fabricated answer",
+                            "confidence": 0.99,
+                            "abstain": False,
+                            "reason": "unsupported",
+                            "support_fact_ids": ["personal.full_name"],
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("applypilot.apply.field_resolver.subprocess.run", fake_run)
+    resolver = CodexResolver(model="gpt-5.5", worker_dir=tmp_path, max_calls=1)
+
+    assert resolver.resolve_fields([spec], profile=PROFILE, job={"title": "Engineer"}) == {}
+
+
+def test_codex_resolver_zero_call_budget_fails_closed(monkeypatch, tmp_path):
+    spec = FieldSpec(
+        selector="#question",
+        tag="input",
+        type="text",
+        label="Required custom question",
+        required=True,
+    )
+
+    def unexpected_run(*_args, **_kwargs):
+        raise AssertionError("model process must not run")
+
+    monkeypatch.setattr("applypilot.apply.field_resolver.subprocess.run", unexpected_run)
+
+    assert (
+        CodexResolver(model="gpt-5.5", worker_dir=tmp_path, max_calls=0).resolve_fields(
+            [spec],
+            profile=PROFILE,
+            job={"title": "Engineer"},
+        )
+        == {}
+    )

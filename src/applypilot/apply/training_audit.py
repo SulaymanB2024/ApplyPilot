@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
+from applypilot.config import normalize_discovery_mode
+
 EXPECTED_CAPABILITIES = (
     "workday_application_flow",
     "email_only_local_draft",
@@ -67,6 +69,7 @@ def audit_training_manifest(manifest: Mapping[str, Any]) -> dict[str, Any]:
 
     sources = _list_of_mappings(manifest.get("smart_extract_sources"))
     boards = _list_of_mappings(manifest.get("jobspy_boards"))
+    discovery_mode = normalize_discovery_mode(str(manifest.get("discovery_mode", "hybrid")))
     manual_ats = manifest.get("manual_ats_domains")
     if not isinstance(manual_ats, list):
         manual_ats = []
@@ -89,6 +92,12 @@ def audit_training_manifest(manifest: Mapping[str, Any]) -> dict[str, Any]:
     has_runway_source = _source_has_runway(sources)
     email_draft_artifact_ok = manifest.get("email_draft_artifact") == EMAIL_DRAFT_ARTIFACT
     version_ok = manifest.get("version") == EXPECTED_VERSION
+    if discovery_mode == "direct_sources":
+        jobspy_board_status = "not_applicable"
+    elif boards:
+        jobspy_board_status = "pass"
+    else:
+        jobspy_board_status = "fail"
 
     failures = {
         "version": not version_ok,
@@ -97,6 +106,7 @@ def audit_training_manifest(manifest: Mapping[str, Any]) -> dict[str, Any]:
         "missing_result_codes": bool(missing_result_codes),
         "runway_source": not has_runway_source,
         "email_draft_artifact": not email_draft_artifact_ok,
+        "jobspy_boards": jobspy_board_status == "fail",
     }
 
     return {
@@ -111,7 +121,9 @@ def audit_training_manifest(manifest: Mapping[str, Any]) -> dict[str, Any]:
         "email_draft_artifact": EMAIL_DRAFT_ARTIFACT,
         "version_ok": version_ok,
         "expected_version": EXPECTED_VERSION,
+        "discovery_mode": discovery_mode,
         "configured_jobspy_boards": len(boards),
+        "jobspy_board_status": jobspy_board_status,
         "jobspy_boards_without_rules": boards_without_rules,
         "smart_extract_source_count": len(sources),
         "search_source_count": sum(1 for source in sources if source.get("type") == "search"),

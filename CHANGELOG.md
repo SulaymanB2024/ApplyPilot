@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Tool-first ChatGPT Web autonomy** - Added a strict JSON-in/JSON-out adapter,
+  first-party role verification, compact fact packs, review-only form inspection, and
+  `applypilot autonomy plan|probe-chatgpt|run` commands.
+- **Bounded funnel telemetry** - Added hard per-run budgets, privacy-preserving usage
+  ledgers, deterministic eligibility/freshness gates, and no-progress circuit breakers.
+- **Applicant fact ledger** - Added versioned profile/resume snapshots and explicit
+  confirmed, unknown, and rejected fact states with correction enforcement.
 - **Apply harness hardening** - Added structured field resolution, structural safety gates,
   and tri-state submission verification for the deterministic apply controller.
 - **Apply runtime guards** - Added canonical job IDs, retry scheduling with full jitter,
@@ -18,6 +25,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and ChatGPT Web research queues for retrieval-gated Codex worker context.
 
 ### Changed
+- **Tool-free deterministic default** - Auto-apply now defaults to the deterministic
+  controller with zero model subprocess calls; a Codex executable is required only when
+  `APPLYPILOT_FIELD_MODEL_CALL_BUDGET` is greater than zero.
+- **Explicit submit boundary** - `applypilot apply` is now dry-run by default; live
+  submission requires `applypilot apply --submit` plus the digest from a reviewed fact ledger.
+- **Explicit account boundary** - Job-site account creation is disabled by default and
+  requires the per-run `--allow-account-creation` flag.
+- **Discovery source policy** - The autonomy funnel uses ChatGPT Web first and permits
+  direct ATS fallback only after a recorded primary failure; broad aggregators are disabled.
+- **Provider error honesty** - Sequential and streaming discovery retain structured
+  provider errors instead of converting failed coverage into a successful empty result.
+- **Training audit semantics** - Zero JobSpy boards are N/A only in `direct_sources`
+  mode and fail the audit in hybrid or job-board modes.
 - **CAPTCHA policy** - Auto-apply now fails closed on CAPTCHA and anti-bot challenges
   instead of advertising solver APIs or token injection.
 - **Dry-run apply semantics** - `applypilot apply --dry-run` records dry-run verification
