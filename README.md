@@ -37,6 +37,9 @@ applypilot improve plan --scope apply --out .applypilot-dev/exp-001  # bounded s
 applypilot autonomy plan --query "entry-level product and data roles"  # compact local run packet
 applypilot autonomy status --run-dir RUN_DIR  # redacted immutable-run-checked pre-campaign status
 applypilot autonomy heartbeat --run-dir RUN_DIR  # fixed-name five-minute pre-campaign heartbeat
+applypilot autonomy status --latest  # resolve the newest canonical app-data run without a path
+applypilot autonomy heartbeat --latest
+applypilot autonomy heartbeat --latest --compact  # bounded 5-minute decision/liveness output
 applypilot autonomy advance --run-dir RUN_DIR --approved-fact-digest DIGEST  # emit next ChatGPT Web handoff
 applypilot autonomy import-response --request REQUEST --input RESPONSE  # bind strict JSON response
 # Repeat advance -> browser handoff -> import until review_ready (at most 3 model calls)
@@ -210,6 +213,10 @@ applypilot training-audit               # Audit apply-agent training coverage
 applypilot autonomy plan --query QUERY  # Write compact facts, policy, and ChatGPT request artifacts
 applypilot autonomy status --run-dir RUN_DIR
 applypilot autonomy heartbeat --run-dir RUN_DIR
+applypilot autonomy status --latest
+applypilot autonomy heartbeat --latest
+applypilot autonomy status --latest --compact
+applypilot autonomy heartbeat --latest --compact
 applypilot autonomy advance --run-dir RUN_DIR --approved-fact-digest DIGEST
 applypilot autonomy import-response --request REQUEST --input RESPONSE
 applypilot autonomy prepare-fact-approval --run-dir RUN_DIR --approved-fact-digest DIGEST [OPTIONS]

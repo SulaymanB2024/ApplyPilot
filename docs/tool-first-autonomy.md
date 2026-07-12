@@ -144,6 +144,19 @@ from `result_ledger.json` are exact-schema checked but remain explicitly `report
 `validated_but_mutable_untrusted`; they never count as authoritative submission confirmation.
 The heartbeat's embedded SHA-256 detects accidental corruption only; it is not a signature or a
 defense against a hostile writer with access to the run directory.
+For unattended supervisors, `autonomy status --latest` and `autonomy heartbeat --latest` select
+the newest canonical immediate child of the configured `autonomy-runs` directory. Selection uses
+the sortable generated run ID rather than mutable filesystem timestamps, validates the selected
+manifest, and fails closed when the newest run-shaped directory is incomplete, symlinked, or
+disagrees with its manifest. Invalid older history cannot disable a newer valid supervisor run,
+but selection never silently falls back past an invalid newest run. Equal newest timestamp
+prefixes are treated as ambiguous and require an explicit `--run-dir`.
+Add `--compact` for a bounded supervisor view containing only the precedence-resolved action
+owner/code, whether a browser is required, 0/100 progress, one stable state fingerprint,
+progress age, and poller heartbeat timing. Applicant and system gates always override pending
+browser handoffs. Recording another unchanged heartbeat refreshes liveness without resetting
+`last_progress_at`, allowing a five-minute controller to compare hashes instead of re-reading or
+re-reasoning over nested facts and handoff counts.
 
 ## Signed applicant approval
 

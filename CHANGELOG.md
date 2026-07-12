@@ -28,6 +28,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Pre-campaign status heartbeat** - Added immutable-run-checked `autonomy status` and
   fixed-name, fsynced `autonomy heartbeat` artifacts that report redacted run, gate, and handoff
   counts while signed campaign creation is still waiting on applicant or system approval.
+- **Latest-run supervision** - Added fail-closed `--latest` selectors for pre-campaign status and
+  heartbeat commands so unattended workers can find the canonical app-data run without copying
+  private absolute paths or falling back past incomplete state.
+- **Compact supervisor decision** - Added human-gate-first action ownership, stable progress
+  fingerprints, and `--compact` status/heartbeat output so five-minute pollers separate liveness
+  from material progress without repeatedly loading nested run context.
 - **Apply harness hardening** - Added structured field resolution, structural safety gates,
   and tri-state submission verification for the deterministic apply controller.
 - **Apply runtime guards** - Added canonical job IDs, retry scheduling with full jitter,

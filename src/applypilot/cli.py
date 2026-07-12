@@ -70,6 +70,21 @@ def _bootstrap_config_only() -> None:
     ensure_dirs()
 
 
+def _resolve_autonomy_run_selector(
+    *,
+    run_dir: Optional[Path],
+    latest: bool,
+) -> Path:
+    """Require one explicit run selector and resolve it without guessing."""
+    if latest == (run_dir is not None):
+        raise ValueError("use exactly one of --run-dir or --latest")
+    if run_dir is not None:
+        return run_dir
+    from applypilot.autonomy.runner import latest_autonomy_run_dir
+
+    return latest_autonomy_run_dir()
+
+
 def _version_callback(value: bool) -> None:
     if value:
         console.print(f"[bold]applypilot[/bold] {__version__}")
@@ -593,14 +608,27 @@ def autonomy_import_response(
 
 @autonomy_app.command("status")
 def autonomy_status(
-    run_dir: Path = typer.Option(..., "--run-dir", help="Autonomy run directory."),
+    run_dir: Optional[Path] = typer.Option(None, "--run-dir", help="Autonomy run directory."),
+    latest: bool = typer.Option(
+        False,
+        "--latest",
+        help="Use the newest canonical run under the ApplyPilot data directory.",
+    ),
+    compact: bool = typer.Option(
+        False,
+        "--compact",
+        help="Print only the precedence-resolved supervisor decision and liveness fields.",
+    ),
 ) -> None:
     """Print one immutable-run-checked redacted pre-campaign status."""
     _bootstrap_config_only()
-    from applypilot.autonomy.runner import run_status_snapshot
+    from applypilot.autonomy.runner import compact_run_status, run_status_snapshot
 
     try:
-        result = run_status_snapshot(run_dir=run_dir)
+        selected_run_dir = _resolve_autonomy_run_selector(run_dir=run_dir, latest=latest)
+        result = run_status_snapshot(run_dir=selected_run_dir)
+        if compact:
+            result = compact_run_status(result)
     except Exception as exc:
         console.print(
             f"[red]Autonomy status failed:[/red] {type(exc).__name__}: {str(exc)[:160]}"
@@ -611,14 +639,27 @@ def autonomy_status(
 
 @autonomy_app.command("heartbeat")
 def autonomy_heartbeat(
-    run_dir: Path = typer.Option(..., "--run-dir", help="Autonomy run directory."),
+    run_dir: Optional[Path] = typer.Option(None, "--run-dir", help="Autonomy run directory."),
+    latest: bool = typer.Option(
+        False,
+        "--latest",
+        help="Use the newest canonical run under the ApplyPilot data directory.",
+    ),
+    compact: bool = typer.Option(
+        False,
+        "--compact",
+        help="Print only the precedence-resolved supervisor decision and liveness fields.",
+    ),
 ) -> None:
     """Fsync one fixed-name redacted five-minute pre-campaign heartbeat."""
     _bootstrap_config_only()
-    from applypilot.autonomy.runner import record_run_heartbeat
+    from applypilot.autonomy.runner import compact_run_status, record_run_heartbeat
 
     try:
-        result = record_run_heartbeat(run_dir=run_dir)
+        selected_run_dir = _resolve_autonomy_run_selector(run_dir=run_dir, latest=latest)
+        result = record_run_heartbeat(run_dir=selected_run_dir)
+        if compact:
+            result = compact_run_status(result)
     except Exception as exc:
         console.print(
             f"[red]Autonomy heartbeat failed:[/red] {type(exc).__name__}: {str(exc)[:160]}"
