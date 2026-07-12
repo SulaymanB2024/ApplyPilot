@@ -158,6 +158,23 @@ browser handoffs. Recording another unchanged heartbeat refreshes liveness witho
 `last_progress_at`, allowing a five-minute controller to compare hashes instead of re-reading or
 re-reasoning over nested facts and handoff counts.
 
+`autonomy observe-runtime` and `campaign observe-runtime` let the external Codex supervisor write
+one fixed-name `runtime_observation.json`. The exact schema contains only its run/campaign binding,
+short TTL, coarse Chronicle state/evidence code, latest-frame timestamp, coarse browser surface,
+and authentication readiness. It rejects extra fields and never stores screenshots, window text,
+URLs, profile names, or cookies. A `capturing` claim requires an explicitly observed frame no more
+than 30 seconds old; `idle_paused` requires the explicit `system_idle_reported` evidence code.
+Observations expire within ten minutes and are always labeled `externally_observed_untrusted`.
+They are diagnostic only and can never establish applicant facts, authorization, form review, or
+submission evidence.
+
+Human and system approval gates still take precedence. Once a handoff genuinely needs a browser,
+the supervisor holds it until the observation proves the `codex_chrome_connector`, an authenticated
+composer, and fresh Chronicle capture. A wrong surface yields
+`activate_codex_chrome_connector`; an unauthenticated connector requests applicant authentication;
+stale or idle-paused Chronicle state requests capture restoration. The compact status carries only
+these coarse runtime fields, so the five-minute task does not need to reload screenshots or prose.
+
 ## Signed applicant approval
 
 `campaign create --submit` rejects a readable fact digest by itself. The run manifest contains
@@ -273,10 +290,11 @@ Before a real submission campaign, complete all of these checks:
 
 - Applicant profile, resume, and corrections agree; required contact, work-authorization, and
   availability facts and at least one preferred-location fact are confirmed.
-- `applypilot doctor --autonomy --strict --json` reports no required missing checks. This mode
-  checks the artifact transport, required applicant facts, and the fixed root-protected approval
-  trust store without demanding a legacy model API key; pass `--autonomy-corrections PATH` when
-  the reviewed run uses corrections.
+- `applypilot doctor --autonomy --strict --json` reports both `static_ready: true` and
+  `runtime_ready: true`. Static readiness covers artifact transport, required applicant facts,
+  and the fixed root-protected approval trust store without demanding a legacy model API key.
+  Runtime readiness requires a fresh, correct-browser observation; pass
+  `--autonomy-corrections PATH` when the reviewed run uses corrections.
 - The authenticated browser tool can service one synthetic handoff without personal data.
 - A review-only artifact run produces official, first-party-verified candidates and clean
   material packets.

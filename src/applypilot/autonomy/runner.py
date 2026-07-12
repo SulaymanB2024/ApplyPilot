@@ -43,6 +43,12 @@ from applypilot.autonomy.handoff import (
     RUN_SCHEMA_VERSION,
 )
 from applypilot.autonomy.policy import FunnelBudget, RunPolicy, SourcePolicy
+from applypilot.autonomy.supervisor import (
+    require_browser_runtime,
+    runtime_gated_decision,
+    runtime_observation_snapshot,
+    runtime_semantic_state,
+)
 from applypilot.autonomy.telemetry import UsageLedger
 
 
@@ -303,6 +309,19 @@ def run_status_snapshot(
         live_gate=live_gate,
         review_phase=review_phase,
     )
+    runtime_status = runtime_observation_snapshot(
+        root=run_dir,
+        scope_kind="run",
+        scope_id=bindings.run_id,
+        now=current,
+    )
+    next_action_owner, next_action_code, browser_required = runtime_gated_decision(
+        next_action_owner=next_action_owner,
+        next_action_code=next_action_code,
+        browser_required=browser_required,
+        runtime_status=runtime_status,
+    )
+    runtime_semantic = runtime_semantic_state(runtime_status)
     progress_fingerprint = _sha256_text(
         _canonical_json(
             {
@@ -320,6 +339,7 @@ def run_status_snapshot(
                 "next_action_owner": next_action_owner,
                 "next_action_code": next_action_code,
                 "browser_required": browser_required,
+                "runtime": runtime_semantic,
             }
         )
     )
@@ -364,6 +384,11 @@ def run_status_snapshot(
         "next_action_owner": next_action_owner,
         "next_action_code": next_action_code,
         "browser_required": browser_required,
+        "runtime_ready": runtime_status["runtime_ready"],
+        "runtime_observation_state": runtime_status["observation_state"],
+        "chronicle_state": runtime_status["chronicle_state"],
+        "browser_surface": runtime_status["browser_surface"],
+        "browser_readiness": runtime_status["browser_readiness"],
         "progress_fingerprint": progress_fingerprint,
         "state_changed": state_changed,
         "last_progress_at": last_progress_at.isoformat(),
@@ -377,6 +402,7 @@ def run_status_snapshot(
         "fact_approval_file_count": approval_file_count,
         "fact_approval_files_present": approval_files_present,
         "fact_approval_state": approval_state,
+        "runtime_observation": runtime_status,
         "handoff": handoff,
         "result": result,
         "heartbeat_interval_seconds": RUN_HEARTBEAT_INTERVAL_SECONDS,
@@ -400,6 +426,11 @@ def compact_run_status(status: dict[str, Any]) -> dict[str, Any]:
         "next_action_owner",
         "next_action_code",
         "browser_required",
+        "runtime_ready",
+        "runtime_observation_state",
+        "chronicle_state",
+        "browser_surface",
+        "browser_readiness",
         "progress_fingerprint",
         "state_changed",
         "last_progress_at",
@@ -646,6 +677,14 @@ def advance_artifact_run(
         raise ValueError("run manifest policy digest mismatch")
     if not policy.review_only:
         raise ValueError("artifact handoff runner is review-only")
+
+    handoff_status = _run_handoff_status(run_dir=run_dir, bindings=bindings)
+    if handoff_status["responded_unconsumed_count"]:
+        require_browser_runtime(
+            root=run_dir,
+            scope_kind="run",
+            scope_id=bindings.run_id,
+        )
 
     ledger = UsageLedger(run_id=bindings.run_id, budget=policy.budget)
     _restore_artifact_usage(ledger, run_dir)

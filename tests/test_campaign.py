@@ -21,6 +21,7 @@ from applypilot.autonomy.campaign import (
     SubmissionBindings,
     SubmissionConfirmation,
 )
+from applypilot.autonomy.supervisor import record_runtime_observation
 
 
 NOW = datetime(2026, 7, 12, 18, 0, tzinfo=timezone.utc)
@@ -545,9 +546,24 @@ def test_heartbeat_defaults_to_five_minutes_and_persists_timestamp(tmp_path):
     initial = store.heartbeat_snapshot(now=NOW)
     assert initial["heartbeat_interval_seconds"] == 300
     assert initial["heartbeat_due"] is True
+    assert initial["runtime_ready"] is False
+    assert initial["runtime_observation_state"] == "missing"
+    record_runtime_observation(
+        root=store.root,
+        scope_kind="campaign",
+        scope_id=store.manifest.campaign_id,
+        chronicle_state="capturing",
+        chronicle_evidence_code="fresh_frame_observed",
+        latest_frame_at=NOW,
+        browser_surface="codex_chrome_connector",
+        browser_readiness="ready",
+        now=NOW,
+    )
     with store.acquire_lease("controller"):
         recorded = store.record_heartbeat(now=NOW)
     assert recorded["heartbeat_due"] is False
+    assert recorded["runtime_ready"] is True
+    assert recorded["browser_surface"] == "codex_chrome_connector"
     assert store.heartbeat_snapshot(now=NOW + timedelta(seconds=299))["heartbeat_due"] is False
     assert store.heartbeat_snapshot(now=NOW + timedelta(seconds=300))["heartbeat_due"] is True
     assert CampaignStore.open(store.root).heartbeat_snapshot(now=NOW)["last_heartbeat_at"] == NOW.isoformat()

@@ -1161,6 +1161,14 @@ class CampaignStore:
     def heartbeat_snapshot(self, *, now: datetime | None = None) -> dict[str, Any]:
         """Return a bounded progress view containing no raw user or model values."""
         current = _aware_datetime(now)
+        from applypilot.autonomy.supervisor import runtime_observation_snapshot
+
+        runtime_status = runtime_observation_snapshot(
+            root=self.root,
+            scope_kind="campaign",
+            scope_id=self.manifest.campaign_id,
+            now=current,
+        )
         last_heartbeat = self._read_last_heartbeat_at()
         due = True
         if isinstance(last_heartbeat, str):
@@ -1208,6 +1216,12 @@ class CampaignStore:
             "heartbeat_interval_seconds": self.manifest.heartbeat_interval_seconds,
             "last_heartbeat_at": last_heartbeat,
             "heartbeat_due": due,
+            "runtime_ready": runtime_status["runtime_ready"],
+            "runtime_observation_state": runtime_status["observation_state"],
+            "chronicle_state": runtime_status["chronicle_state"],
+            "browser_surface": runtime_status["browser_surface"],
+            "browser_readiness": runtime_status["browser_readiness"],
+            "runtime_observation": runtime_status,
         }
 
     def record_heartbeat(self, *, now: datetime | None = None) -> dict[str, Any]:

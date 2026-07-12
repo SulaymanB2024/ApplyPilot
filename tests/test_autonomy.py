@@ -80,6 +80,7 @@ from applypilot.autonomy.policy import (
     require_authorization,
 )
 from applypilot.autonomy.telemetry import BudgetExceeded, UsageLedger
+from applypilot.autonomy.supervisor import record_runtime_observation
 from applypilot.autonomy.runner import (
     advance_artifact_run,
     latest_autonomy_run_dir,
@@ -125,6 +126,21 @@ PROFILE = {
     },
 }
 CLI_RUNNER = CliRunner()
+
+
+def _record_ready_runtime(root: Path, scope_id: str) -> None:
+    observed_at = datetime.now(timezone.utc)
+    record_runtime_observation(
+        root=root,
+        scope_kind="run",
+        scope_id=scope_id,
+        chronicle_state="capturing",
+        chronicle_evidence_code="fresh_frame_observed",
+        latest_frame_at=observed_at,
+        browser_surface="codex_chrome_connector",
+        browser_readiness="ready",
+        now=observed_at,
+    )
 
 
 def test_legacy_cdp_probe_requires_explicit_opt_in():
@@ -1848,6 +1864,29 @@ def test_autonomy_plan_cli_writes_compact_secret_free_request(monkeypatch, tmp_p
     assert campaign_manifest["submit_authorized"] is False
     assert campaign_manifest["target_confirmed"] == 100
 
+    observed_at = datetime.now(timezone.utc)
+    observed = CLI_RUNNER.invoke(
+        app,
+        [
+            "campaign",
+            "observe-runtime",
+            "--campaign-dir",
+            str(campaign_dir),
+            "--chronicle-state",
+            "capturing",
+            "--chronicle-evidence-code",
+            "fresh_frame_observed",
+            "--latest-frame-at",
+            observed_at.isoformat(),
+            "--browser-surface",
+            "codex_chrome_connector",
+            "--browser-readiness",
+            "ready",
+        ],
+    )
+    assert observed.exit_code == 0, observed.output
+    assert '"runtime_ready": true' in observed.output
+
     status = CLI_RUNNER.invoke(
         app,
         ["campaign", "status", "--campaign-dir", str(campaign_dir)],
@@ -1855,6 +1894,7 @@ def test_autonomy_plan_cli_writes_compact_secret_free_request(monkeypatch, tmp_p
     assert status.exit_code == 0, status.output
     assert "private" not in status.output.lower()
     assert '"submitted_confirmed": 0' in status.output
+    assert '"runtime_ready": true' in status.output
 
 
 def test_pre_campaign_status_and_heartbeat_are_fixed_name_and_redacted(
@@ -1905,6 +1945,9 @@ def test_pre_campaign_status_and_heartbeat_are_fixed_name_and_redacted(
     assert status["next_action_owner"] == "applicant"
     assert status["next_action_code"] == "confirm_preferred_location"
     assert status["browser_required"] is False
+    assert status["runtime_ready"] is False
+    assert status["runtime_observation_state"] == "missing"
+    assert status["browser_surface"] == "unknown"
     assert status["state_changed"] is True
     assert status["last_progress_at"] == now.isoformat()
     assert status["progress_age_seconds"] == 0
@@ -1969,12 +2012,41 @@ def test_pre_campaign_status_and_heartbeat_are_fixed_name_and_redacted(
     assert list(run_dir.glob("heartbeat*.json")) == [heartbeat_path]
     assert "candidate@example.com" not in second_text
 
+    (run_dir / "runtime_observation.json").write_text(
+        '{"corrupt":true}\n',
+        encoding="utf-8",
+    )
+    observed_at = datetime.now(timezone.utc)
+    runtime_observation = CLI_RUNNER.invoke(
+        app,
+        [
+            "autonomy",
+            "observe-runtime",
+            "--run-dir",
+            str(run_dir),
+            "--chronicle-state",
+            "capturing",
+            "--chronicle-evidence-code",
+            "fresh_frame_observed",
+            "--latest-frame-at",
+            observed_at.isoformat(),
+            "--browser-surface",
+            "codex_chrome_connector",
+            "--browser-readiness",
+            "ready",
+        ],
+    )
+    assert runtime_observation.exit_code == 0, runtime_observation.output
+    assert '"runtime_ready": true' in runtime_observation.output
+    assert "candidate@example.com" not in runtime_observation.output
+
     cli_status = CLI_RUNNER.invoke(
         app,
         ["autonomy", "status", "--run-dir", str(run_dir)],
     )
     assert cli_status.exit_code == 0, cli_status.output
     assert '"submitted_confirmed": 0' in cli_status.output
+    assert '"browser_surface": "codex_chrome_connector"' in cli_status.output
     assert "candidate@example.com" not in cli_status.output
     cli_compact = CLI_RUNNER.invoke(
         app,
@@ -1983,7 +2055,13 @@ def test_pre_campaign_status_and_heartbeat_are_fixed_name_and_redacted(
     assert cli_compact.exit_code == 0, cli_compact.output
     assert len(cli_compact.output) < 1_200
     assert '"next_action_code": "confirm_preferred_location"' in cli_compact.output
-    for omitted in ("fact_states", "handoff", "result", "candidate@example.com"):
+    for omitted in (
+        "fact_states",
+        "handoff",
+        "result",
+        "latest_frame_at",
+        "candidate@example.com",
+    ):
         assert omitted not in cli_compact.output
     cli_heartbeat = CLI_RUNNER.invoke(
         app,
@@ -2361,6 +2439,16 @@ def test_artifact_handoff_advances_to_review_ready_without_browser(monkeypatch, 
         ),
         encoding="utf-8",
     )
+    direct_response = run_dir / str(discovery_request["response_path"])
+    direct_response.write_text(discovery_input.read_text(encoding="utf-8"), encoding="utf-8")
+    with pytest.raises(PermissionError, match="refresh_runtime_observation"):
+        advance_artifact_run(
+            run_dir=run_dir,
+            approved_fact_digest=facts["digest"],
+            verifier=verifier,
+        )
+    direct_response.unlink()
+    _record_ready_runtime(run_dir, str(discovery_request["run_id"]))
     import_response_artifact(
         request_path=run_dir / "handoff" / "discovery.request.json",
         input_path=discovery_input,
@@ -2525,6 +2613,10 @@ def test_artifact_import_rejects_swapped_request_id(monkeypatch, tmp_path):
         encoding="utf-8",
     )
 
+    with pytest.raises(PermissionError, match="refresh_runtime_observation"):
+        import_response_artifact(request_path=request_path, input_path=bad_input)
+    request = json.loads(request_path.read_text(encoding="utf-8"))
+    _record_ready_runtime(request_path.parent.parent, str(request["run_id"]))
     with pytest.raises(ChatGPTContractError, match="request_id mismatch"):
         import_response_artifact(request_path=request_path, input_path=bad_input)
     rejected_imports = list(request_path.parent.glob("discovery.rejected.*.json"))
@@ -2599,6 +2691,7 @@ def test_artifact_handoff_binds_dynamic_inputs_and_allows_corrected_material(tmp
         ),
         encoding="utf-8",
     )
+    _record_ready_runtime(run_dir, str(discovery_request["run_id"]))
     import_response_artifact(
         request_path=discovery_request_path,
         input_path=discovery_input,
