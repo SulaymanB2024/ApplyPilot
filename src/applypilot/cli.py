@@ -1213,6 +1213,17 @@ def doctor(
                     if fact_blockers
                     else "required contact, work authorization, sponsorship, and availability confirmed",
                 ))
+        try:
+            from applypilot.autonomy.approval import (
+                FactApprovalError,
+                require_system_approval_trust_store,
+            )
+
+            trust_store = require_system_approval_trust_store()
+        except FactApprovalError as exc:
+            results.append(("System approval trust store", fail_mark, str(exc)))
+        else:
+            results.append(("System approval trust store", ok_mark, str(trust_store)))
         if chatgpt_cdp_port is not None:
             try:
                 from applypilot.autonomy.runner import probe_chatgpt_cdp
