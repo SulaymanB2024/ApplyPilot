@@ -23,7 +23,7 @@ from applypilot import config
 from applypilot.autonomy.facts import (
     REQUIRED_AUTONOMY_FACT_IDS,
     FactLedger,
-    FactState,
+    confirmed_preferred_location_fact_ids,
     require_confirmed_facts,
 )
 
@@ -42,12 +42,6 @@ _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _CHALLENGE = re.compile(r"[0-9a-f]{64}\Z")
 _ISSUER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._@:+-]{0,199}\Z")
 _SOURCE_SURFACE = re.compile(r"[a-z][a-z0-9._-]{0,63}\Z")
-_LOCATION_FACT_PREFIXES = (
-    "profile.availability.preferred_locations.",
-    "profile.preferences.locations.",
-)
-
-
 class FactApprovalError(PermissionError):
     """Raised when applicant approval is missing, stale, or unverifiable."""
 
@@ -83,12 +77,7 @@ class FactApprovalExpectation:
         if len(fact_ids) != len(set(fact_ids)):
             raise FactApprovalError("live approval rejects duplicate fact ledger ids")
         by_id = {record.fact_id: record for record in fact_ledger.records}
-        location_ids = sorted(
-            record.fact_id
-            for record in fact_ledger.records
-            if record.state is FactState.CONFIRMED
-            and any(record.fact_id.startswith(prefix) for prefix in _LOCATION_FACT_PREFIXES)
-        )
+        location_ids = confirmed_preferred_location_fact_ids(fact_ledger)
         if not location_ids:
             raise FactApprovalError(
                 "live approval requires at least one confirmed preferred-location fact"

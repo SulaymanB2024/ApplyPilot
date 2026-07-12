@@ -378,7 +378,10 @@ def test_doctor_autonomy_checks_facts_without_requiring_model_api_key(monkeypatc
                     "legally_authorized_to_work": True,
                     "require_sponsorship": False,
                 },
-                "availability": {"earliest_start_date": "2027-05-15"},
+                "availability": {
+                    "earliest_start_date": "2027-05-15",
+                    "preferred_locations": ["Remote"],
+                },
             }
         ),
         encoding="utf-8",
@@ -396,7 +399,11 @@ def test_doctor_autonomy_checks_facts_without_requiring_model_api_key(monkeypatc
     monkeypatch.setattr(config, "load_search_config", lambda: {"discovery_mode": "direct_sources"})
     monkeypatch.setattr(config, "get_chrome_path", lambda: "/Applications/Google Chrome.app")
     monkeypatch.setattr(config, "get_secret", lambda _name, default="": default)
-    monkeypatch.setattr(approval, "require_system_approval_trust_store", lambda: tmp_path / "allowed_signers")
+    monkeypatch.setattr(
+        approval,
+        "require_system_approval_trust_store",
+        lambda: tmp_path / "allowed_signers",
+    )
 
     result = runner.invoke(app, ["doctor", "--autonomy", "--strict", "--json"])
 
@@ -404,11 +411,56 @@ def test_doctor_autonomy_checks_facts_without_requiring_model_api_key(monkeypatc
     assert '"ready": true' in result.output
     assert '"ChatGPT Web artifact transport"' in result.output
     assert '"Autonomy facts"' in result.output
+    assert '"Autonomy preferred locations"' in result.output
     assert '"System approval trust store"' in result.output
     assert '"LLM API key"' not in result.output
 
 
 def test_doctor_autonomy_strict_requires_system_approval_trust_store(monkeypatch, tmp_path):
+    from applypilot import config
+    from applypilot.autonomy import approval
+
+    profile_path = tmp_path / "profile.json"
+    resume_path = tmp_path / "resume.txt"
+    profile_path.write_text(
+        json.dumps(
+            {
+                "personal": {"phone": "555-0100"},
+                "work_authorization": {
+                    "legally_authorized_to_work": True,
+                    "require_sponsorship": False,
+                },
+                "availability": {
+                    "earliest_start_date": "2027-05-15",
+                    "preferred_locations": ["Remote"],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    resume_path.write_text("Built a synthetic SQL dashboard.", encoding="utf-8")
+    monkeypatch.setattr(config, "PROFILE_PATH", profile_path)
+    monkeypatch.setattr(config, "RESUME_PATH", resume_path)
+    monkeypatch.setattr(config, "RESUME_PDF_PATH", tmp_path / "resume.pdf")
+    monkeypatch.setattr(config, "SEARCH_CONFIG_PATH", tmp_path / "searches.yaml")
+    monkeypatch.setattr(config, "ENV_PATH", tmp_path / ".env")
+    monkeypatch.setattr(config, "load_search_config", lambda: {"discovery_mode": "direct_sources"})
+    monkeypatch.setattr(config, "get_chrome_path", lambda: "/Applications/Google Chrome.app")
+    monkeypatch.setattr(config, "get_secret", lambda _name, default="": default)
+
+    def missing_trust_store():
+        raise approval.FactApprovalError("system approval trust store is not installed")
+
+    monkeypatch.setattr(approval, "require_system_approval_trust_store", missing_trust_store)
+
+    result = runner.invoke(app, ["doctor", "--autonomy", "--strict", "--json"])
+
+    assert result.exit_code == 1, result.output
+    assert '"ready": false' in result.output
+    assert '"System approval trust store"' in result.output
+
+
+def test_doctor_autonomy_strict_requires_preferred_location(monkeypatch, tmp_path):
     from applypilot import config
     from applypilot.autonomy import approval
 
@@ -436,17 +488,17 @@ def test_doctor_autonomy_strict_requires_system_approval_trust_store(monkeypatch
     monkeypatch.setattr(config, "load_search_config", lambda: {"discovery_mode": "direct_sources"})
     monkeypatch.setattr(config, "get_chrome_path", lambda: "/Applications/Google Chrome.app")
     monkeypatch.setattr(config, "get_secret", lambda _name, default="": default)
-
-    def missing_trust_store():
-        raise approval.FactApprovalError("system approval trust store is not installed")
-
-    monkeypatch.setattr(approval, "require_system_approval_trust_store", missing_trust_store)
+    monkeypatch.setattr(
+        approval,
+        "require_system_approval_trust_store",
+        lambda: tmp_path / "allowed_signers",
+    )
 
     result = runner.invoke(app, ["doctor", "--autonomy", "--strict", "--json"])
 
     assert result.exit_code == 1, result.output
     assert '"ready": false' in result.output
-    assert '"System approval trust store"' in result.output
+    assert '"Autonomy preferred locations"' in result.output
 
 
 def test_harness_contract_references_training_manifest(tmp_path):

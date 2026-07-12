@@ -18,6 +18,10 @@ REQUIRED_AUTONOMY_FACT_IDS = (
     "profile.work_authorization.require_sponsorship",
     "profile.availability.earliest_start_date",
 )
+PREFERRED_LOCATION_FACT_PREFIXES = (
+    "profile.availability.preferred_locations.",
+    "profile.preferences.locations.",
+)
 
 
 class FactState(StrEnum):
@@ -263,6 +267,21 @@ def require_confirmed_facts(ledger: FactLedger, fact_ids: Iterable[str]) -> list
         elif record.state is not FactState.CONFIRMED:
             blockers.append(f"{record.state.value}:{fact_id}")
     return blockers
+
+
+def confirmed_preferred_location_fact_ids(ledger: FactLedger) -> tuple[str, ...]:
+    """Return exact confirmed location fact IDs accepted by live approval."""
+    return tuple(
+        sorted(
+            record.fact_id
+            for record in ledger.records
+            if record.state is FactState.CONFIRMED
+            and any(
+                record.fact_id.startswith(prefix)
+                for prefix in PREFERRED_LOCATION_FACT_PREFIXES
+            )
+        )
+    )
 
 
 def _apply_corrections(

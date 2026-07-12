@@ -247,10 +247,11 @@ advance a run packet created with context v1 or prompt schema v2 after upgrading
 Before a real submission campaign, complete all of these checks:
 
 - Applicant profile, resume, and corrections agree; required contact, work-authorization, and
-  availability facts are confirmed.
+  availability facts and at least one preferred-location fact are confirmed.
 - `applypilot doctor --autonomy --strict --json` reports no required missing checks. This mode
-  checks the artifact transport and required applicant facts without demanding a legacy model
-  API key; pass `--autonomy-corrections PATH` when the reviewed run uses corrections.
+  checks the artifact transport, required applicant facts, and the fixed root-protected approval
+  trust store without demanding a legacy model API key; pass `--autonomy-corrections PATH` when
+  the reviewed run uses corrections.
 - The authenticated browser tool can service one synthetic handoff without personal data.
 - A review-only artifact run produces official, first-party-verified candidates and clean
   material packets.

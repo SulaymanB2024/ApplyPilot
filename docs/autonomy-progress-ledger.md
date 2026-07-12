@@ -15,7 +15,7 @@ were the main causes.
 
 | Gate | Evidence required | Current state |
 | --- | --- | --- |
-| Facts | Reviewed fact ledger; required contact, authorization, sponsorship, and availability facts confirmed; rejected claims tombstoned | Blocked on applicant review |
+| Facts | Reviewed fact ledger; required contact, authorization, sponsorship, availability, and preferred-location facts confirmed; rejected claims tombstoned | Blocked on applicant review and preferred-location choice |
 | Browser transport | Synthetic, no-personal-data ChatGPT Web requests and responses through the authenticated real Chrome session | Complete: 3 bounded model calls, no nested model |
 | Resumable run | The same manifest-bound run advances from discovery request to review-ready materials without CDP or a nested model | Complete in synthetic artifact run; regression-covered |
 | Source quality | Candidate URLs deduplicated, broad aggregators rejected, and accepted roles verified against exact employer or ATS tenant evidence | Complete in synthetic run; rendered-browser review caught one stale posting that returned HTTP 200 |
@@ -23,7 +23,7 @@ were the main causes.
 | Form review | At most one application form inspected without filling, uploading, or submitting | Complete: stale Capital One Workday page returned `form_review_blocked`; no side effects |
 | Submission | Signed applicant facts, one exact candidate, reviewed material/form bytes, expiring one-time authorization, and durable typed confirmation evidence | Implemented fail-closed gates; no signed fact approval or live authorization issued |
 | Token reduction | Fresh run usage ledger below 1.935 million token events (90% below baseline), using at most three rich model calls and no repeated thread context | Synthetic estimate: 6,257 model tokens, 99.96767% below baseline; reviewed personal run still blocked on facts |
-| Doctor | `applypilot doctor --autonomy --strict --json` succeeds in a fresh shell on the active machine | Correctly blocked only on 4 unreviewed applicant facts; artifact transport passes without a legacy API key |
+| Doctor | `applypilot doctor --autonomy --strict --json` succeeds in a fresh shell on the active machine | Correctly fails closed while the fixed root-owned approval trust store is absent; artifact transport passes without a legacy API key |
 | Durable campaign | Immutable target-100 manifest, serialized/recoverable state, one writer lease, dedupe, typed evidence, unknown-outcome pause, bounded heartbeat | Implemented locally; focused regression coverage complete |
 | Publish | Targeted tests, lint, diff review, commit, and push to `SulaymanB2024/ApplyPilot` fork branch | `2638a13` pushed; current campaign/signature work pending final gate and push |
 
