@@ -45,6 +45,14 @@ ENV_PATH = APP_DIR / ".env"
 TAILORED_DIR = APP_DIR / "tailored_resumes"
 COVER_LETTER_DIR = APP_DIR / "cover_letters"
 LOG_DIR = APP_DIR / "logs"
+CAMPAIGN_DIR = APP_DIR / "campaigns"
+SYSTEM_APPROVAL_TRUST_STORE_PATH = (
+    Path("/Library/Application Support/ApplyPilot/approval_allowed_signers")
+    if platform.system() == "Darwin"
+    else Path("/etc/applypilot/approval_allowed_signers")
+)
+SYSTEM_SSH_KEYGEN_PATH = Path("/usr/bin/ssh-keygen")
+SYSTEM_GIT_PATH = Path("/usr/bin/git")
 
 # Chrome worker isolation
 CHROME_WORKER_DIR = APP_DIR / "chrome-workers"
@@ -117,7 +125,15 @@ def get_chrome_profile_directory() -> str:
 
 def ensure_dirs():
     """Create all required directories."""
-    for d in [APP_DIR, TAILORED_DIR, COVER_LETTER_DIR, LOG_DIR, CHROME_WORKER_DIR, APPLY_WORKER_DIR]:
+    for d in [
+        APP_DIR,
+        TAILORED_DIR,
+        COVER_LETTER_DIR,
+        LOG_DIR,
+        CAMPAIGN_DIR,
+        CHROME_WORKER_DIR,
+        APPLY_WORKER_DIR,
+    ]:
         d.mkdir(parents=True, exist_ok=True)
 
 

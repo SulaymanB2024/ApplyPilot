@@ -18,6 +18,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ledgers, deterministic eligibility/freshness gates, and no-progress circuit breakers.
 - **Applicant fact ledger** - Added versioned profile/resume snapshots and explicit
   confirmed, unknown, and rejected fact states with correction enforcement.
+- **Signed live fact approval** - Added detached OpenSSH verification over exact run, source,
+  profile/resume, challenge, and fact-value bindings. The campaign controller can verify and
+  import approval but cannot mint it from a readable digest or message ID. Live verification
+  uses a fixed root-protected trust store and pinned system executables rather than caller paths.
+- **Durable campaign ledger** - Added an immutable target-100 manifest, serialized writer lease,
+  crash-recoverable event/state projection, canonical candidate dedupe, typed submission
+  evidence, fail-closed unknown-outcome reconciliation, and bounded five-minute heartbeats.
 - **Apply harness hardening** - Added structured field resolution, structural safety gates,
   and tri-state submission verification for the deterministic apply controller.
 - **Apply runtime guards** - Added canonical job IDs, retry scheduling with full jitter,
@@ -67,6 +74,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of advertising solver APIs or token injection.
 - **Dry-run apply semantics** - `applypilot apply --dry-run` records dry-run verification
   confidence without marking the job applied.
+- **Exact-URL retry safety** - Explicit URL acquisition now refuses already-applied,
+  permanently failed, and max-attempt jobs instead of bypassing queue retry guards.
 - **Codex resolver compatibility** - Field fallback execution now uses the current
   `codex exec` flag surface without the removed approval flag, has no default model deadline,
   and receives only the exact confirmed fact-ledger subset rather than an unchecked raw profile.

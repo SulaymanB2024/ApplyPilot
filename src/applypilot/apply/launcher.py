@@ -122,11 +122,23 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                 WHERE (jobs.url = ? OR jobs.application_url = ? OR jobs.application_url LIKE ? OR jobs.url LIKE ?
                        OR jobs.canonical_job_id = ?)
                   AND jobs.tailored_resume_path IS NOT NULL
-                  AND jobs.apply_status != 'in_progress'
+                  AND (jobs.apply_status IS NULL OR jobs.apply_status = 'failed')
+                  AND jobs.applied_at IS NULL
+                  AND (jobs.apply_attempts IS NULL OR jobs.apply_attempts < ?)
+                  AND COALESCE(jobs.apply_error_class, '') != 'permanent'
                   AND (jobs.next_apply_attempt_at IS NULL OR jobs.next_apply_attempt_at <= ?)
                   AND (breaker.opened_until IS NULL OR breaker.opened_until <= ?)
                 LIMIT 1
-            """, (target_url, target_url, like, like, canonical_target, now, now)).fetchone()
+            """, (
+                target_url,
+                target_url,
+                like,
+                like,
+                canonical_target,
+                config.DEFAULTS["max_apply_attempts"],
+                now,
+                now,
+            )).fetchone()
         else:
             blocked_sites, blocked_patterns = _load_blocked()
             # Build parameterized filters to avoid SQL injection

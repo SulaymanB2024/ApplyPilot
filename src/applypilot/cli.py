@@ -33,8 +33,14 @@ autonomy_app = typer.Typer(
     help="Tool-first, budgeted ChatGPT Web application funnel.",
     no_args_is_help=True,
 )
+campaign_app = typer.Typer(
+    name="campaign",
+    help="Durable, evidence-bound multi-application campaign state.",
+    no_args_is_help=True,
+)
 app.add_typer(improve_app, name="improve")
 app.add_typer(autonomy_app, name="autonomy")
+app.add_typer(campaign_app, name="campaign")
 console = Console()
 log = logging.getLogger(__name__)
 
@@ -68,6 +74,53 @@ def _version_callback(value: bool) -> None:
     if value:
         console.print(f"[bold]applypilot[/bold] {__version__}")
         raise typer.Exit()
+
+
+def _current_git_revision(*, require_clean: bool = False) -> str:
+    """Return the exact checkout revision used to create campaign state."""
+    import subprocess
+
+    from applypilot import config
+    from applypilot.autonomy.approval import require_root_protected_file
+
+    repository_root = Path(__file__).resolve().parents[2]
+    executable = require_root_protected_file(
+        config.SYSTEM_GIT_PATH,
+        label="system git",
+        executable=True,
+    )
+    clean_environment = {
+        "PATH": "/usr/bin:/bin",
+        "LANG": "C",
+        "LC_ALL": "C",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+    }
+    result = subprocess.run(
+        [str(executable), "rev-parse", "HEAD"],
+        cwd=repository_root,
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+        env=clean_environment,
+    )
+    revision = result.stdout.strip().lower()
+    if result.returncode != 0 or not revision:
+        raise ValueError("cannot resolve code revision; pass --code-revision explicitly")
+    if require_clean:
+        status = subprocess.run(
+            [str(executable), "status", "--porcelain"],
+            cwd=repository_root,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+            env=clean_environment,
+        )
+        if status.returncode != 0 or status.stdout.strip():
+            raise ValueError("live campaign creation requires a clean reviewed checkout")
+    return revision
 
 
 # ---------------------------------------------------------------------------
@@ -569,6 +622,103 @@ def autonomy_advance(
         raise typer.Exit(code=1)
 
 
+@autonomy_app.command("import-fact-approval")
+def autonomy_import_fact_approval(
+    run_dir: Path = typer.Option(..., "--run-dir", help="Reviewed autonomy run directory."),
+    approved_fact_digest: str = typer.Option(
+        ...,
+        "--approved-fact-digest",
+        help="Exact digest from this run's reviewed fact_ledger.json.",
+    ),
+    attestation: Path = typer.Option(
+        ...,
+        "--attestation",
+        help="Exact applicant-reviewed JSON attestation.",
+    ),
+    signature: Path = typer.Option(
+        ...,
+        "--signature",
+        help="Detached OpenSSH signature for the attestation.",
+    ),
+) -> None:
+    """Verify and immutably import applicant-signed fact approval."""
+    _bootstrap_config_only()
+    from applypilot.autonomy.runner import import_signed_fact_approval
+
+    try:
+        result = import_signed_fact_approval(
+            run_dir=run_dir,
+            approved_fact_digest=approved_fact_digest,
+            attestation_path=attestation,
+            signature_path=signature,
+        )
+    except Exception as exc:
+        console.print(
+            f"[red]Fact approval import failed:[/red] {type(exc).__name__}: {str(exc)[:160]}"
+        )
+        raise typer.Exit(code=1) from exc
+    console.print_json(data=result)
+
+
+@autonomy_app.command("prepare-fact-approval")
+def autonomy_prepare_fact_approval(
+    run_dir: Path = typer.Option(..., "--run-dir", help="Reviewed autonomy run directory."),
+    approved_fact_digest: str = typer.Option(
+        ...,
+        "--approved-fact-digest",
+        help="Exact digest from this run's reviewed fact_ledger.json.",
+    ),
+    issuer: str = typer.Option(..., "--issuer", help="Allowed-signers identity that will sign."),
+    source_surface: str = typer.Option(
+        ...,
+        "--source-surface",
+        help="Machine code for the user-controlled approval surface.",
+    ),
+    source_message_sha256: str = typer.Option(
+        ...,
+        "--source-message-sha256",
+        help="SHA-256 of the exact applicant approval message.",
+    ),
+    source_author_sha256: str = typer.Option(
+        ...,
+        "--source-author-sha256",
+        help="SHA-256 of the exact applicant author identity.",
+    ),
+    source_observed_at: str = typer.Option(
+        ...,
+        "--source-observed-at",
+        help="Timezone-aware ISO timestamp for the source evidence.",
+    ),
+    valid_hours: int = typer.Option(24, "--valid-hours", help="Approval lifetime, 1 to 168 hours."),
+    out: Path = typer.Option(..., "--out", help="New unsigned JSON path for external signing."),
+) -> None:
+    """Prepare exact unsigned approval bytes; this command cannot authorize anything."""
+    from datetime import datetime
+
+    _bootstrap_config_only()
+    from applypilot.autonomy.runner import prepare_fact_approval_attestation
+
+    try:
+        observed_at = datetime.fromisoformat(source_observed_at)
+        result = prepare_fact_approval_attestation(
+            run_dir=run_dir,
+            approved_fact_digest=approved_fact_digest,
+            issuer=issuer,
+            source_surface=source_surface,
+            source_message_sha256=source_message_sha256,
+            source_author_sha256=source_author_sha256,
+            source_observed_at=observed_at,
+            valid_hours=valid_hours,
+            output_path=out,
+        )
+    except Exception as exc:
+        console.print(
+            f"[red]Fact approval preparation failed:[/red] {type(exc).__name__}: {str(exc)[:160]}"
+        )
+        raise typer.Exit(code=1) from exc
+    console.print_json(data=result)
+
+
 @autonomy_app.command("probe-chatgpt")
 def autonomy_probe_chatgpt(
     cdp_port: int = typer.Option(9222, "--cdp-port", help="Authenticated Chrome debugging port."),
@@ -623,6 +773,111 @@ def autonomy_run(
     console.print_json(data=result)
     if result.get("status") not in {"review_ready", "no_eligible_verified_roles"}:
         raise typer.Exit(code=1)
+
+
+@campaign_app.command("create")
+def campaign_create(
+    run_dir: Path = typer.Option(..., "--run-dir", help="Reviewed autonomy run directory."),
+    approved_fact_digest: str = typer.Option(
+        ...,
+        "--approved-fact-digest",
+        help="Exact digest from the reviewed run fact ledger.",
+    ),
+    campaign_id: str = typer.Option(..., "--campaign-id", help="Bounded campaign identifier."),
+    target: int = typer.Option(100, "--target", help="Authoritatively confirmed submission target."),
+    submit: bool = typer.Option(
+        False,
+        "--submit/--review-only",
+        help="Record explicit campaign-level submission intent; exact per-candidate grants remain required.",
+    ),
+    code_revision: Optional[str] = typer.Option(
+        None,
+        "--code-revision",
+        help="Review-only revision override; live mode requires clean checkout HEAD.",
+    ),
+    out: Optional[Path] = typer.Option(None, "--out", help="Exact campaign state directory."),
+) -> None:
+    """Create immutable campaign state from one reviewed autonomy run packet."""
+    _bootstrap_config_only()
+    from applypilot import config
+    from applypilot.autonomy.campaign import CampaignManifest, CampaignStore
+    from applypilot.autonomy.runner import load_reviewed_run_snapshot
+
+    if submit and code_revision is not None:
+        console.print("[red]Live campaigns cannot override the current reviewed Git revision.[/red]")
+        raise typer.Exit(code=1)
+    try:
+        snapshot = load_reviewed_run_snapshot(
+            run_dir=run_dir,
+            approved_fact_digest=approved_fact_digest,
+            require_signed_approval=submit,
+        )
+        revision = code_revision or _current_git_revision(require_clean=submit)
+        manifest = CampaignManifest.new(
+            campaign_id=campaign_id,
+            source_run_id=snapshot["run_id"],
+            query=snapshot["query"],
+            fact_digest=snapshot["fact_digest"],
+            context_digest=snapshot["context_digest"],
+            policy_digest=snapshot["policy_digest"],
+            code_revision=revision,
+            submit_authorized=submit,
+            allow_account_creation=False,
+            fact_approval_receipt_sha256=snapshot["fact_approval_receipt_sha256"],
+            fact_approval_signature_sha256=snapshot["fact_approval_signature_sha256"],
+            approval_issuer=snapshot["approval_issuer"],
+            approval_trust_store_sha256=snapshot["approval_trust_store_sha256"],
+            fact_approval_expires_at=snapshot["fact_approval_expires_at"],
+            target_confirmed=target,
+        )
+        campaign_dir = (out or config.CAMPAIGN_DIR / campaign_id).resolve()
+        store = CampaignStore.create(campaign_dir, manifest)
+    except Exception as exc:
+        console.print(f"[red]Campaign creation failed:[/red] {type(exc).__name__}: {str(exc)[:160]}")
+        raise typer.Exit(code=1) from exc
+    console.print_json(
+        data={
+            "campaign_dir": str(store.root),
+            "campaign_id": manifest.campaign_id,
+            "manifest_digest": manifest.digest,
+            "submit_authorized": manifest.submit_authorized,
+            "target_confirmed": manifest.target_confirmed,
+        }
+    )
+
+
+@campaign_app.command("status")
+def campaign_status(
+    campaign_dir: Path = typer.Option(..., "--campaign-dir", help="Campaign state directory."),
+) -> None:
+    """Print a bounded, redacted campaign heartbeat snapshot."""
+    _bootstrap_config_only()
+    from applypilot.autonomy.campaign import CampaignStore
+
+    try:
+        snapshot = CampaignStore.open(campaign_dir).heartbeat_snapshot()
+    except Exception as exc:
+        console.print(f"[red]Campaign status failed:[/red] {type(exc).__name__}: {str(exc)[:160]}")
+        raise typer.Exit(code=1) from exc
+    console.print_json(data=snapshot)
+
+
+@campaign_app.command("heartbeat")
+def campaign_heartbeat(
+    campaign_dir: Path = typer.Option(..., "--campaign-dir", help="Campaign state directory."),
+) -> None:
+    """Record and print one redacted five-minute campaign heartbeat."""
+    _bootstrap_config_only()
+    from applypilot.autonomy.campaign import CampaignStore
+
+    try:
+        store = CampaignStore.open(campaign_dir)
+        with store.acquire_lease("campaign-heartbeat-cli"):
+            snapshot = store.record_heartbeat()
+    except Exception as exc:
+        console.print(f"[red]Campaign heartbeat failed:[/red] {type(exc).__name__}: {str(exc)[:160]}")
+        raise typer.Exit(code=1) from exc
+    console.print_json(data=snapshot)
 
 
 @improve_app.command("plan")

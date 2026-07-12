@@ -21,26 +21,36 @@ were the main causes.
 | Source quality | Candidate URLs deduplicated, broad aggregators rejected, and accepted roles verified against exact employer or ATS tenant evidence | Complete in synthetic run; rendered-browser review caught one stale posting that returned HTTP 200 |
 | Material safety | At most two cover letters, every applicant claim tied to applicant evidence, rejected facts and placeholders blocked | Complete in synthetic run; 2 material packets |
 | Form review | At most one application form inspected without filling, uploading, or submitting | Complete: stale Capital One Workday page returned `form_review_blocked`; no side effects |
-| Submission | One exact candidate, reviewed facts and material bytes, successful dry-run form review, expiring one-time authorization, authoritative confirmation | Implemented gate; no live authorization issued |
+| Submission | Signed applicant facts, one exact candidate, reviewed material/form bytes, expiring one-time authorization, and durable typed confirmation evidence | Implemented fail-closed gates; no signed fact approval or live authorization issued |
 | Token reduction | Fresh run usage ledger below 1.935 million token events (90% below baseline), using at most three rich model calls and no repeated thread context | Synthetic estimate: 6,257 model tokens, 99.96767% below baseline; reviewed personal run still blocked on facts |
 | Doctor | `applypilot doctor --autonomy --strict --json` succeeds in a fresh shell on the active machine | Correctly blocked only on 4 unreviewed applicant facts; artifact transport passes without a legacy API key |
-| Publish | Targeted tests, lint, diff review, commit, and push to `SulaymanB2024/ApplyPilot` fork branch | Pending continuation verification |
+| Durable campaign | Immutable target-100 manifest, serialized/recoverable state, one writer lease, dedupe, typed evidence, unknown-outcome pause, bounded heartbeat | Implemented locally; focused regression coverage complete |
+| Publish | Targeted tests, lint, diff review, commit, and push to `SulaymanB2024/ApplyPilot` fork branch | `2638a13` pushed; current campaign/signature work pending final gate and push |
 
 ## 2026-07-12 second-Mac checkpoint
 
 - The active second-Mac checkout is preserved on `codex/apply-harness-stage1-hardening` at
   `b1f266e`; it is ahead by two commits and has untracked `outputs/` and `tmp/`, so it must not be
   pulled or switched in place.
-- The fork branch `codex/tool-first-autonomy` is confirmed at `d5604a1`. The safe update path is a
+- The fork branch `codex/tool-first-autonomy` is confirmed at `2638a13`. The safe update path is a
   clean worktree under `~/Projects/CodexWork/ApplyPilot-campaign`, followed by a fresh venv and a
   latest-code autonomy doctor.
 - Terra is the persistent Codex model label `gpt-5.6-terra`, not a separate executable. Nested
   `codex exec` orchestration previously failed and must not own the campaign.
-- Memories maps to Codex Chronicle. Chronicle is installed but disabled on the second Mac; no
-  current recorder process or fresh capture files were observed.
+- Memories maps to Codex Chronicle. The recorder process now starts on the second Mac, but frame
+  updates are intermittent (the latest recheck was 214 seconds old rather than a few seconds).
+  Chronicle remains excluded from reporting until recorder identity and continuous fresh frame
+  timestamps both pass.
 - The local v2 context pack now selects 71 confirmed facts from the current applicant data for a
   representative query, up from 30, while the resulting discovery prompt is 7,817 characters
   against the existing 40,000-character cap.
+- A dedicated second-Mac Codex task is active in the clean worktree with `gpt-5.6-terra` and the
+  normal authenticated Chrome surface. Its first pass produced useful approval-gate evidence,
+  but a raw Gmail-message-ID receipt was rejected because the self-delivery thread cannot prove
+  applicant intent. The replacement requires an external OpenSSH signature.
+- That collaborator also consumed roughly 4.9 million token events after broad tool inventory,
+  full-thread reads, and repeated release checks. Follow-ups must read only the campaign heartbeat
+  and named artifacts, perform one bounded action, and stop.
 
 ## Synthetic end-to-end evidence
 
@@ -68,6 +78,11 @@ substitute for a personal review-only run after applicant facts are approved.
   CLI restart cannot reset model, browser, external-call, or retry budgets.
 - Fact-ledger approval digests bind ledger version, profile hash, resume hash, and per-record
   source hashes.
+- Live campaign approval additionally requires a detached OpenSSH signature over the exact run,
+  one-time challenge, source evidence, and approved fact-value hashes. The controller has only
+  the allowed public keys and cannot mint the approval.
+- Campaign confirmations reference durable typed evidence bytes; arbitrary 64-hex strings cannot
+  increment the confirmed target.
 - Shared ATS trust is tenant-and-company bound; configured sources include company, host, path,
   and source kind, while account-backed recruiters are excluded.
 - Model context is constructed from confirmed allowlisted fact records and recursively strips
@@ -82,6 +97,8 @@ substitute for a personal review-only run after applicant facts are approved.
 ## Stop boundaries
 
 - No real applicant prompt is sent while required facts or corrections are unreviewed.
+- No live campaign manifest is created from a copied digest, self-sent Gmail thread, or unsigned
+  local receipt.
 - No application form is filled or uploaded during role discovery or material generation.
 - No submit click occurs without a separate exact-candidate authorization artifact.
 - Missing, failed, challenged, or skipped provider coverage remains a measurement gap.

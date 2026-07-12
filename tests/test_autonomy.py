@@ -1796,6 +1796,39 @@ def test_autonomy_plan_cli_writes_compact_secret_free_request(monkeypatch, tmp_p
     assert "secret-sentinel" not in fact_text
     assert "personal.password" not in fact_text
 
+    facts = json.loads(fact_text)
+    campaign_dir = tmp_path / "campaign"
+    created = CLI_RUNNER.invoke(
+        app,
+        [
+            "campaign",
+            "create",
+            "--run-dir",
+            str(request_path.parents[1]),
+            "--approved-fact-digest",
+            facts["digest"],
+            "--campaign-id",
+            "review-campaign",
+            "--code-revision",
+            "a" * 40,
+            "--out",
+            str(campaign_dir),
+        ],
+    )
+    assert created.exit_code == 0, created.output
+    campaign_manifest = json.loads((campaign_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert campaign_manifest["source_run_id"] == request_payload["run_id"]
+    assert campaign_manifest["submit_authorized"] is False
+    assert campaign_manifest["target_confirmed"] == 100
+
+    status = CLI_RUNNER.invoke(
+        app,
+        ["campaign", "status", "--campaign-dir", str(campaign_dir)],
+    )
+    assert status.exit_code == 0, status.output
+    assert "private" not in status.output.lower()
+    assert '"submitted_confirmed": 0' in status.output
+
 
 def test_artifact_advance_blocks_unreviewed_required_facts_before_tools(monkeypatch, tmp_path):
     app_dir = tmp_path / "app-data"
