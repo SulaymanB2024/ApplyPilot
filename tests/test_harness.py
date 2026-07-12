@@ -32,8 +32,6 @@ def test_claude_backend_keeps_lightweight_default_model():
 def test_codex_backend_defaults_to_gpt55_and_supervisor(monkeypatch):
     monkeypatch.delenv("APPLYPILOT_ALLOW_ACCOUNT_CREATION", raising=False)
     monkeypatch.delenv("APPLYPILOT_FIELD_MODEL_CALL_BUDGET", raising=False)
-    monkeypatch.delenv("APPLYPILOT_EXECUTOR_MODEL", raising=False)
-    monkeypatch.delenv("APPLYPILOT_SUPERVISOR_MODEL", raising=False)
 
     settings = load_settings(agent_backend="codex")
 
