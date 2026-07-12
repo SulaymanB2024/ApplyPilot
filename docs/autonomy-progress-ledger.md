@@ -23,30 +23,30 @@ were the main causes.
 | Form review | At most one application form inspected without filling, uploading, or submitting | Complete: stale Capital One Workday page returned `form_review_blocked`; no side effects |
 | Submission | Signed applicant facts, one exact candidate, reviewed material/form bytes, expiring one-time authorization, and durable typed confirmation evidence | Implemented fail-closed gates; no signed fact approval or live authorization issued |
 | Token reduction | Fresh run usage ledger below 1.935 million token events (90% below baseline), using at most three rich model calls and no repeated thread context | Synthetic estimate: 6,257 model tokens, 99.96767% below baseline; reviewed personal run still blocked on facts |
-| Doctor | `applypilot doctor --autonomy --strict --json` succeeds in a fresh shell on the active machine | Correctly fails closed while the fixed root-owned approval trust store is absent; artifact transport passes without a legacy API key |
+| Doctor | `applypilot doctor --autonomy --strict --json` reports separate static and runtime readiness in a fresh shell | Correctly fails closed while the fixed root-owned approval trust store, signed facts, or fresh Chronicle/Chrome observation is absent; no legacy model API key is required |
 | Durable campaign | Immutable target-100 manifest, serialized/recoverable state, one writer lease, dedupe, typed evidence, unknown-outcome pause, bounded heartbeat | Implemented locally; pre-campaign and live-campaign fixed-name heartbeats are regression-covered |
-| Publish | Targeted tests, lint, diff review, commit, and push to `SulaymanB2024/ApplyPilot` fork branch | `2638a13` pushed; current campaign/signature work pending final gate and push |
+| Publish | Targeted tests, lint, diff review, commit, and push to `SulaymanB2024/ApplyPilot` fork branches | Feature and campaign branches are hash-verified with `git ls-remote` before each second-Mac rollout |
 
 ## 2026-07-12 second-Mac checkpoint
 
-- The active second-Mac checkout is preserved on `codex/apply-harness-stage1-hardening` at
-  `b1f266e`; it is ahead by two commits and has untracked `outputs/` and `tmp/`, so it must not be
-  pulled or switched in place.
-- The fork branch `codex/tool-first-autonomy` is confirmed at `2638a13`. The safe update path is a
-  clean worktree under `~/Projects/CodexWork/ApplyPilot-campaign`, followed by a fresh venv and a
-  latest-code autonomy doctor.
+- The original dirty second-Mac checkout remains preserved. Campaign work uses the separate clean
+  worktree under `~/Projects/CodexWork/ApplyPilot-campaign` on
+  `codex/second-mac-campaign-20260712`; updates are fetch plus `--ff-only`, never an in-place switch
+  of the preserved checkout.
+- Both `codex/tool-first-autonomy` and `codex/second-mac-campaign-20260712` publish only to the
+  `SulaymanB2024/ApplyPilot` fork and are verified with `git ls-remote` before remote rollout.
 - Terra is the persistent Codex model label `gpt-5.6-terra`, not a separate executable. Nested
   `codex exec` orchestration previously failed and must not own the campaign.
-- Memories maps to Codex Chronicle. The recorder process now starts on the second Mac, but frame
-  updates are intermittent (the latest recheck was 214 seconds old rather than a few seconds).
-  Chronicle remains excluded from reporting until recorder identity and continuous fresh frame
-  timestamps both pass.
+- Memories maps to Codex Chronicle. A fresh frame and recorder identity were recovered and visually
+  verified, and the new runtime contract records only coarse freshness/evidence codes. It refuses
+  to treat an idle-paused or stale frame as continuous capture and never retains screenshot text.
 - The local v2 context pack now selects 71 confirmed facts from the current applicant data for a
   representative query, up from 30, while the resulting discovery prompt is 7,817 characters
   against the existing 40,000-character cap.
-- A dedicated second-Mac Codex task is active in the clean worktree with `gpt-5.6-terra` and the
-  normal authenticated Chrome surface. Its first pass produced useful approval-gate evidence,
-  but a raw Gmail-message-ID receipt was rejected because the self-delivery thread cannot prove
+- A dedicated second-Mac Codex task is pinned in the clean worktree with `gpt-5.6-terra` and the
+  normal authenticated Chrome connector. It produced useful approval-gate evidence before the
+  host went offline; reactivation and the next ff-only sync wait for the host control plane to
+  return. A raw Gmail-message-ID receipt was rejected because the self-delivery thread cannot prove
   applicant intent. The replacement requires an external OpenSSH signature.
 - That collaborator also consumed roughly 4.9 million token events after broad tool inventory,
   full-thread reads, and repeated release checks. Follow-ups must read only the campaign heartbeat

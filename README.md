@@ -40,6 +40,7 @@ applypilot autonomy heartbeat --run-dir RUN_DIR  # fixed-name five-minute pre-ca
 applypilot autonomy status --latest  # resolve the newest canonical app-data run without a path
 applypilot autonomy heartbeat --latest
 applypilot autonomy heartbeat --latest --compact  # bounded 5-minute decision/liveness output
+applypilot autonomy observe-runtime --latest ...  # attest fresh Chronicle + Codex Chrome connector state
 applypilot autonomy advance --run-dir RUN_DIR --approved-fact-digest DIGEST  # emit next ChatGPT Web handoff
 applypilot autonomy import-response --request REQUEST --input RESPONSE  # bind strict JSON response
 # Repeat advance -> browser handoff -> import until review_ready (at most 3 model calls)
@@ -50,7 +51,8 @@ applypilot autonomy import-fact-approval --run-dir RUN_DIR --approved-fact-diges
 applypilot campaign create --run-dir RUN_DIR --approved-fact-digest DIGEST \
   --campaign-id campaign-100 --submit
 applypilot campaign heartbeat --campaign-dir CAMPAIGN_DIR  # bounded five-minute progress artifact
-applypilot doctor --autonomy --strict --json  # artifacts + facts + system approval trust readiness
+applypilot campaign observe-runtime --campaign-dir CAMPAIGN_DIR ...
+applypilot doctor --autonomy --strict --json  # separate static and fresh runtime readiness
 applypilot autonomy probe-chatgpt --cdp-port 9222 --allow-legacy-cdp  # explicit legacy diagnostic only
 applypilot apply --url URL --approved-fact-digest DIGEST  # dry-run; writes one-time submit manifest
 applypilot apply --url URL --submit --approved-fact-digest DIGEST --authorization-manifest PATH
@@ -217,6 +219,7 @@ applypilot autonomy status --latest
 applypilot autonomy heartbeat --latest
 applypilot autonomy status --latest --compact
 applypilot autonomy heartbeat --latest --compact
+applypilot autonomy observe-runtime --latest [RUNTIME OPTIONS]
 applypilot autonomy advance --run-dir RUN_DIR --approved-fact-digest DIGEST
 applypilot autonomy import-response --request REQUEST --input RESPONSE
 applypilot autonomy prepare-fact-approval --run-dir RUN_DIR --approved-fact-digest DIGEST [OPTIONS]
@@ -227,6 +230,7 @@ applypilot campaign create --run-dir RUN_DIR --approved-fact-digest DIGEST --cam
   --submit
 applypilot campaign status --campaign-dir CAMPAIGN_DIR
 applypilot campaign heartbeat --campaign-dir CAMPAIGN_DIR
+applypilot campaign observe-runtime --campaign-dir CAMPAIGN_DIR [RUNTIME OPTIONS]
 applypilot autonomy probe-chatgpt --allow-legacy-cdp  # Explicit legacy CDP compatibility probe
 applypilot autonomy run --query QUERY --approved-fact-digest DIGEST --allow-legacy-cdp
 applypilot apply                        # Launch deterministic dry-run (safe default)

@@ -668,6 +668,86 @@ def autonomy_heartbeat(
     console.print_json(data=result)
 
 
+@autonomy_app.command("observe-runtime")
+def autonomy_observe_runtime(
+    run_dir: Optional[Path] = typer.Option(None, "--run-dir", help="Autonomy run directory."),
+    latest: bool = typer.Option(
+        False,
+        "--latest",
+        help="Use the newest canonical run under the ApplyPilot data directory.",
+    ),
+    chronicle_state: str = typer.Option(
+        ...,
+        "--chronicle-state",
+        help="capturing, idle_paused, stale, unavailable, or unknown.",
+    ),
+    chronicle_evidence_code: str = typer.Option(
+        ...,
+        "--chronicle-evidence-code",
+        help="Bounded evidence code matching the Chronicle state.",
+    ),
+    latest_frame_at: Optional[str] = typer.Option(
+        None,
+        "--latest-frame-at",
+        help="Canonical UTC timestamp of the explicitly observed latest Chronicle frame.",
+    ),
+    browser_surface: str = typer.Option(
+        ...,
+        "--browser-surface",
+        help="codex_chrome_connector, wrong_surface, unavailable, or unknown.",
+    ),
+    browser_readiness: str = typer.Option(
+        ...,
+        "--browser-readiness",
+        help="ready, unauthenticated, unavailable, or unknown.",
+    ),
+    ttl_seconds: int = typer.Option(
+        360,
+        "--ttl-seconds",
+        min=30,
+        max=600,
+        help="Seconds before the external observation expires.",
+    ),
+) -> None:
+    """Record one redacted, expiring browser/Chronicle diagnostic observation."""
+    _bootstrap_config_only()
+    import json as json_module
+
+    from applypilot.autonomy.handoff import RunBindings
+    from applypilot.autonomy.supervisor import record_runtime_observation
+
+    try:
+        selected_run_dir = _resolve_autonomy_run_selector(run_dir=run_dir, latest=latest)
+        if selected_run_dir.is_symlink():
+            raise ValueError("autonomy run directory must not be a symlink")
+        selected_run_dir = selected_run_dir.resolve(strict=True)
+        manifest_path = selected_run_dir / "run_manifest.json"
+        if manifest_path.is_symlink() or not manifest_path.is_file():
+            raise ValueError("autonomy run manifest must be a regular non-symlink file")
+        bindings = RunBindings.from_manifest(
+            json_module.loads(manifest_path.read_text(encoding="utf-8"))
+        )
+        if bindings.run_id != selected_run_dir.name:
+            raise ValueError("autonomy run directory differs from its manifest run id")
+        result = record_runtime_observation(
+            root=selected_run_dir,
+            scope_kind="run",
+            scope_id=bindings.run_id,
+            chronicle_state=chronicle_state,
+            chronicle_evidence_code=chronicle_evidence_code,
+            latest_frame_at=latest_frame_at,
+            browser_surface=browser_surface,
+            browser_readiness=browser_readiness,
+            ttl_seconds=ttl_seconds,
+        )
+    except Exception as exc:
+        console.print(
+            f"[red]Runtime observation failed:[/red] {type(exc).__name__}: {str(exc)[:160]}"
+        )
+        raise typer.Exit(code=1) from exc
+    console.print_json(data=result)
+
+
 @autonomy_app.command("advance")
 def autonomy_advance(
     run_dir: Path = typer.Option(..., "--run-dir", help="Reviewed autonomy run directory."),
@@ -971,6 +1051,69 @@ def campaign_heartbeat(
     console.print_json(data=snapshot)
 
 
+@campaign_app.command("observe-runtime")
+def campaign_observe_runtime(
+    campaign_dir: Path = typer.Option(..., "--campaign-dir", help="Campaign state directory."),
+    chronicle_state: str = typer.Option(
+        ...,
+        "--chronicle-state",
+        help="capturing, idle_paused, stale, unavailable, or unknown.",
+    ),
+    chronicle_evidence_code: str = typer.Option(
+        ...,
+        "--chronicle-evidence-code",
+        help="Bounded evidence code matching the Chronicle state.",
+    ),
+    latest_frame_at: Optional[str] = typer.Option(
+        None,
+        "--latest-frame-at",
+        help="Canonical UTC timestamp of the explicitly observed latest Chronicle frame.",
+    ),
+    browser_surface: str = typer.Option(
+        ...,
+        "--browser-surface",
+        help="codex_chrome_connector, wrong_surface, unavailable, or unknown.",
+    ),
+    browser_readiness: str = typer.Option(
+        ...,
+        "--browser-readiness",
+        help="ready, unauthenticated, unavailable, or unknown.",
+    ),
+    ttl_seconds: int = typer.Option(
+        360,
+        "--ttl-seconds",
+        min=30,
+        max=600,
+        help="Seconds before the external observation expires.",
+    ),
+) -> None:
+    """Record one redacted, expiring campaign runtime observation."""
+    _bootstrap_config_only()
+    from applypilot.autonomy.campaign import CampaignStore
+    from applypilot.autonomy.supervisor import record_runtime_observation
+
+    try:
+        store = CampaignStore.open(campaign_dir)
+        result = record_runtime_observation(
+            root=store.root,
+            scope_kind="campaign",
+            scope_id=store.manifest.campaign_id,
+            chronicle_state=chronicle_state,
+            chronicle_evidence_code=chronicle_evidence_code,
+            latest_frame_at=latest_frame_at,
+            browser_surface=browser_surface,
+            browser_readiness=browser_readiness,
+            ttl_seconds=ttl_seconds,
+        )
+    except Exception as exc:
+        console.print(
+            f"[red]Campaign runtime observation failed:[/red] "
+            f"{type(exc).__name__}: {str(exc)[:160]}"
+        )
+        raise typer.Exit(code=1) from exc
+    console.print_json(data=result)
+
+
 @improve_app.command("plan")
 def improve_plan(
     scope: str = typer.Option("apply", "--scope", help="Improvement scope label."),
@@ -1193,6 +1336,7 @@ def doctor(
     warn_mark = "[yellow]WARN[/yellow]"
 
     results: list[tuple[str, str, str]] = []  # (check, status, note)
+    autonomy_runtime_ready: bool | None = None
 
     # --- Tier 1 checks ---
     # Profile
@@ -1310,6 +1454,41 @@ def doctor(
             results.append(("System approval trust store", fail_mark, str(exc)))
         else:
             results.append(("System approval trust store", ok_mark, str(trust_store)))
+        try:
+            from applypilot.autonomy.runner import latest_autonomy_run_dir
+            from applypilot.autonomy.supervisor import runtime_observation_snapshot
+
+            latest_run_dir = latest_autonomy_run_dir()
+            runtime_status = runtime_observation_snapshot(
+                root=latest_run_dir,
+                scope_kind="run",
+                scope_id=latest_run_dir.name,
+            )
+        except Exception as exc:
+            autonomy_runtime_ready = False
+            results.append(
+                (
+                    "Autonomy runtime observation",
+                    fail_mark,
+                    f"latest-run runtime check failed: {type(exc).__name__}",
+                )
+            )
+        else:
+            autonomy_runtime_ready = bool(runtime_status["runtime_ready"])
+            results.append(
+                (
+                    "Autonomy runtime observation",
+                    ok_mark if autonomy_runtime_ready else fail_mark,
+                    "; ".join(
+                        (
+                            f"observation={runtime_status['observation_state']}",
+                            f"chronicle={runtime_status['chronicle_state']}",
+                            f"browser={runtime_status['browser_surface']}",
+                            f"readiness={runtime_status['browser_readiness']}",
+                        )
+                    ),
+                )
+            )
         if chatgpt_cdp_port is not None:
             try:
                 from applypilot.autonomy.runner import probe_chatgpt_cdp
@@ -1515,11 +1694,20 @@ def doctor(
         for check, status, note in results
     ]
     missing_checks = [item["check"] for item in serialized_results if item["status"] == "missing"]
+    runtime_check_name = "Autonomy runtime observation"
+    static_missing_checks = [
+        check for check in missing_checks if check != runtime_check_name
+    ]
+    static_ready = not static_missing_checks
+    runtime_ready = autonomy_runtime_ready if autonomy else None
+    ready = static_ready and bool(runtime_ready) if autonomy else not missing_checks
 
     if json_output:
         console.print_json(
             data={
-                "ready": not missing_checks,
+                "ready": ready,
+                "static_ready": static_ready,
+                "runtime_ready": runtime_ready,
                 "strict": strict,
                 "missing_checks": missing_checks,
                 "checks": serialized_results,

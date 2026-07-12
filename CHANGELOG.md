@@ -34,6 +34,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Compact supervisor decision** - Added human-gate-first action ownership, stable progress
   fingerprints, and `--compact` status/heartbeat output so five-minute pollers separate liveness
   from material progress without repeatedly loading nested run context.
+- **Runtime observation contract** - Added fixed-name, exact-schema, expiring diagnostics for
+  Chronicle freshness and the Codex Chrome connector. Browser handoffs now pause on missing,
+  stale, unauthenticated, unavailable, or wrong-surface observations without storing screenshots,
+  URLs, profiles, or cookies.
 - **Apply harness hardening** - Added structured field resolution, structural safety gates,
   and tri-state submission verification for the deterministic apply controller.
 - **Apply runtime guards** - Added canonical job IDs, retry scheduling with full jitter,
@@ -72,10 +76,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from job evidence. Every first-person or possessive assertion must exactly match a structured
   claim supported by applicant facts; `JOB` evidence cannot establish an applicant skill. Final
   letters are rejected above four paragraphs, 450 words, or 20 structured applicant claims.
-- **Autonomy-aware doctor** - `doctor --autonomy` validates artifact transport, required contact,
-  work-authorization, sponsorship, availability, preferred-location, and root-protected trust
-  readiness without requiring a legacy model API key; optional corrections use
-  `--autonomy-corrections`.
+- **Autonomy-aware doctor** - `doctor --autonomy` separately reports static readiness and fresh
+  runtime readiness for artifact transport, required applicant facts, root-protected approval
+  trust, Chronicle capture, and the Codex Chrome connector without requiring a legacy model API
+  key; optional corrections use `--autonomy-corrections`.
 - **Explicit legacy browser opt-in** - Caller-provided CDP commands fail closed unless
   `--allow-legacy-cdp` is supplied; the normal campaign path uses the authenticated Chrome
   connector and portable handoff artifacts.
