@@ -198,8 +198,10 @@ applied, permanently failed, or out of attempts cannot be reacquired.
 
 The artifact runner is review-only. It may discover roles, verify first-party evidence, and
 write local cover-letter packets. It never fills, uploads, submits, sends email, or changes an
-external account. `probe-chatgpt` and `run` remain available as optional caller-provided CDP
-compatibility commands, but they are no longer the recommended authenticated-browser path.
+external account. `probe-chatgpt` and `run` remain available only as caller-provided legacy CDP
+compatibility commands and require the explicit `--allow-legacy-cdp` acknowledgement. Campaign
+automation must use the portable handoff through the Codex Chrome connector; it must not launch
+an isolated browser or silently fall back to CDP.
 
 First-party verification does not trust a hostname merely because it contains the company
 name. Shared Greenhouse, Lever, Ashby, Workday, and Avature surfaces must bind their tenant to

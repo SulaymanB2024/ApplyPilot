@@ -122,6 +122,28 @@ PROFILE = {
 CLI_RUNNER = CliRunner()
 
 
+def test_legacy_cdp_probe_requires_explicit_opt_in():
+    with pytest.raises(PermissionError, match="legacy CDP transport is disabled by default"):
+        autonomy_runner.probe_chatgpt_cdp(cdp_port=9222)
+
+
+def test_legacy_cdp_run_requires_explicit_opt_in(tmp_path):
+    with pytest.raises(PermissionError, match="legacy CDP transport is disabled by default"):
+        autonomy_runner.run_with_cdp(
+            query="product analyst intern",
+            cdp_port=9222,
+            output_dir=tmp_path,
+            approved_fact_digest="unused-before-opt-in",
+        )
+
+
+def test_legacy_cdp_cli_requires_visible_acknowledgement():
+    result = CLI_RUNNER.invoke(app, ["autonomy", "probe-chatgpt"])
+
+    assert result.exit_code == 1
+    assert "--allow-legacy-cdp" in result.output
+
+
 def role(**overrides):
     values = {
         "company": "Example",

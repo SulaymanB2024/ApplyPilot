@@ -722,13 +722,21 @@ def autonomy_prepare_fact_approval(
 @autonomy_app.command("probe-chatgpt")
 def autonomy_probe_chatgpt(
     cdp_port: int = typer.Option(9222, "--cdp-port", help="Authenticated Chrome debugging port."),
+    allow_legacy_cdp: bool = typer.Option(
+        False,
+        "--allow-legacy-cdp",
+        help="Explicitly opt into caller-provided CDP instead of the normal Chrome connector handoff.",
+    ),
 ) -> None:
-    """Read ChatGPT Web auth/composer state without sending a prompt."""
+    """Read legacy CDP auth/composer state without sending a prompt."""
     _bootstrap_config_only()
     from applypilot.autonomy.runner import probe_chatgpt_cdp
 
     try:
-        result = probe_chatgpt_cdp(cdp_port=cdp_port)
+        result = probe_chatgpt_cdp(
+            cdp_port=cdp_port,
+            allow_legacy_cdp=allow_legacy_cdp,
+        )
     except Exception as exc:
         console.print(f"[red]ChatGPT Web probe failed:[/red] {type(exc).__name__}: {str(exc)[:160]}")
         raise typer.Exit(code=1) from exc
@@ -741,6 +749,11 @@ def autonomy_probe_chatgpt(
 def autonomy_run(
     query: str = typer.Option(..., "--query", "-q", help="Bounded role-search query."),
     cdp_port: int = typer.Option(9222, "--cdp-port", help="Authenticated Chrome debugging port."),
+    allow_legacy_cdp: bool = typer.Option(
+        False,
+        "--allow-legacy-cdp",
+        help="Explicitly opt into caller-provided CDP instead of the normal Chrome connector handoff.",
+    ),
     out: Optional[Path] = typer.Option(None, "--out", help="Run artifact directory."),
     corrections: Optional[Path] = typer.Option(
         None,
@@ -753,7 +766,7 @@ def autonomy_run(
         help="Exact digest from a reviewed autonomy plan fact_ledger.json.",
     ),
 ) -> None:
-    """Run the review-only ChatGPT Web funnel; never upload or submit."""
+    """Run the legacy review-only CDP funnel; never upload or submit."""
     _bootstrap_config_only()
     from applypilot import config
     from applypilot.autonomy.runner import run_with_cdp
@@ -766,6 +779,7 @@ def autonomy_run(
             output_dir=output_dir,
             corrections_path=corrections,
             approved_fact_digest=approved_fact_digest,
+            allow_legacy_cdp=allow_legacy_cdp,
         )
     except Exception as exc:
         console.print(f"[red]Autonomy run failed:[/red] {type(exc).__name__}: {str(exc)[:160]}")
@@ -1203,7 +1217,10 @@ def doctor(
             try:
                 from applypilot.autonomy.runner import probe_chatgpt_cdp
 
-                probe = probe_chatgpt_cdp(cdp_port=chatgpt_cdp_port)
+                probe = probe_chatgpt_cdp(
+                    cdp_port=chatgpt_cdp_port,
+                    allow_legacy_cdp=True,
+                )
             except Exception as exc:
                 results.append(("Optional ChatGPT CDP probe", warn_mark, f"probe failed: {type(exc).__name__}"))
             else:
@@ -1225,7 +1242,10 @@ def doctor(
             try:
                 from applypilot.autonomy.runner import probe_chatgpt_cdp
 
-                probe = probe_chatgpt_cdp(cdp_port=chatgpt_cdp_port)
+                probe = probe_chatgpt_cdp(
+                    cdp_port=chatgpt_cdp_port,
+                    allow_legacy_cdp=True,
+                )
             except Exception as exc:
                 results.append(("ChatGPT Web", fail_mark, f"probe failed: {type(exc).__name__}"))
             else:

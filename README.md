@@ -46,7 +46,7 @@ applypilot campaign create --run-dir RUN_DIR --approved-fact-digest DIGEST \
   --campaign-id campaign-100 --submit
 applypilot campaign heartbeat --campaign-dir CAMPAIGN_DIR  # bounded five-minute progress artifact
 applypilot doctor --autonomy --strict --json  # artifact transport + required fact readiness
-applypilot autonomy probe-chatgpt --cdp-port 9222  # optional legacy CDP no-send probe
+applypilot autonomy probe-chatgpt --cdp-port 9222 --allow-legacy-cdp  # explicit legacy diagnostic only
 applypilot apply --url URL --approved-fact-digest DIGEST  # dry-run; writes one-time submit manifest
 applypilot apply --url URL --submit --approved-fact-digest DIGEST --authorization-manifest PATH
 applypilot apply --allow-account-creation  # separate per-run account-change permission
@@ -216,8 +216,8 @@ applypilot campaign create --run-dir RUN_DIR --approved-fact-digest DIGEST --cam
   --submit
 applypilot campaign status --campaign-dir CAMPAIGN_DIR
 applypilot campaign heartbeat --campaign-dir CAMPAIGN_DIR
-applypilot autonomy probe-chatgpt       # Optional CDP compatibility probe
-applypilot autonomy run --query QUERY --approved-fact-digest DIGEST  # Optional CDP compatibility path
+applypilot autonomy probe-chatgpt --allow-legacy-cdp  # Explicit legacy CDP compatibility probe
+applypilot autonomy run --query QUERY --approved-fact-digest DIGEST --allow-legacy-cdp
 applypilot apply                        # Launch deterministic dry-run (safe default)
 applypilot apply --url URL --approved-fact-digest DIGEST  # Dry-run and mint one-time manifest
 applypilot apply --url URL --submit --approved-fact-digest DIGEST --authorization-manifest PATH
