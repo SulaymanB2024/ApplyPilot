@@ -1895,6 +1895,38 @@ def test_autonomy_plan_cli_writes_compact_secret_free_request(monkeypatch, tmp_p
     assert "private" not in status.output.lower()
     assert '"submitted_confirmed": 0' in status.output
     assert '"runtime_ready": true' in status.output
+    compact_status = CLI_RUNNER.invoke(
+        app,
+        [
+            "campaign",
+            "status",
+            "--campaign-dir",
+            str(campaign_dir),
+            "--compact",
+        ],
+    )
+    assert compact_status.exit_code == 0, compact_status.output
+    assert len(compact_status.output) < 1_600
+    assert '"next_action_code": "discover_candidate_roles"' in compact_status.output
+    for omitted in (
+        "candidate_state_counts",
+        "pending_artifact_counts_by_kind",
+        "latest_frame_at",
+        "private",
+    ):
+        assert omitted not in compact_status.output.lower()
+    compact_heartbeat = CLI_RUNNER.invoke(
+        app,
+        [
+            "campaign",
+            "heartbeat",
+            "--campaign-dir",
+            str(campaign_dir),
+            "--compact",
+        ],
+    )
+    assert compact_heartbeat.exit_code == 0, compact_heartbeat.output
+    assert '"heartbeat_due": false' in compact_heartbeat.output
 
 
 def test_pre_campaign_status_and_heartbeat_are_fixed_name_and_redacted(

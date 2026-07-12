@@ -51,6 +51,7 @@ applypilot autonomy import-fact-approval --run-dir RUN_DIR --approved-fact-diges
 applypilot campaign create --run-dir RUN_DIR --approved-fact-digest DIGEST \
   --campaign-id campaign-100 --submit
 applypilot campaign heartbeat --campaign-dir CAMPAIGN_DIR  # bounded five-minute progress artifact
+applypilot campaign heartbeat --campaign-dir CAMPAIGN_DIR --compact
 applypilot campaign observe-runtime --campaign-dir CAMPAIGN_DIR ...
 applypilot doctor --autonomy --strict --json  # separate static and fresh runtime readiness
 applypilot autonomy probe-chatgpt --cdp-port 9222 --allow-legacy-cdp  # explicit legacy diagnostic only
@@ -230,6 +231,8 @@ applypilot campaign create --run-dir RUN_DIR --approved-fact-digest DIGEST --cam
   --submit
 applypilot campaign status --campaign-dir CAMPAIGN_DIR
 applypilot campaign heartbeat --campaign-dir CAMPAIGN_DIR
+applypilot campaign status --campaign-dir CAMPAIGN_DIR --compact
+applypilot campaign heartbeat --campaign-dir CAMPAIGN_DIR --compact
 applypilot campaign observe-runtime --campaign-dir CAMPAIGN_DIR [RUNTIME OPTIONS]
 applypilot autonomy probe-chatgpt --allow-legacy-cdp  # Explicit legacy CDP compatibility probe
 applypilot autonomy run --query QUERY --approved-fact-digest DIGEST --allow-legacy-cdp

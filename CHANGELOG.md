@@ -38,6 +38,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Chronicle freshness and the Codex Chrome connector. Browser handoffs now pause on missing,
   stale, unauthenticated, unavailable, or wrong-surface observations without storing screenshots,
   URLs, profiles, or cookies.
+- **Compact live-campaign supervision** - Added `campaign status --compact` and
+  `campaign heartbeat --compact` with durable progress age/fingerprints, action ownership,
+  runtime gating, blockers, and 0/100 accounting without nested candidate or artifact maps.
 - **Apply harness hardening** - Added structured field resolution, structural safety gates,
   and tri-state submission verification for the deterministic apply controller.
 - **Apply runtime guards** - Added canonical job IDs, retry scheduling with full jitter,

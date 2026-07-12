@@ -1,5 +1,6 @@
 import hashlib
 import json
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -20,6 +21,8 @@ from applypilot.autonomy.campaign import (
     EvidenceKind,
     SubmissionBindings,
     SubmissionConfirmation,
+    _campaign_supervisor_decision,
+    compact_heartbeat_snapshot,
 )
 from applypilot.autonomy.supervisor import record_runtime_observation
 
@@ -546,6 +549,13 @@ def test_heartbeat_defaults_to_five_minutes_and_persists_timestamp(tmp_path):
     initial = store.heartbeat_snapshot(now=NOW)
     assert initial["heartbeat_interval_seconds"] == 300
     assert initial["heartbeat_due"] is True
+    assert initial["state_changed"] is True
+    assert initial["last_progress_at"] == NOW.isoformat()
+    assert initial["progress_age_seconds"] == 0
+    assert len(initial["progress_fingerprint"]) == 64
+    assert initial["next_action_owner"] == "controller"
+    assert initial["next_action_code"] == "refresh_runtime_observation"
+    assert initial["browser_required"] is False
     assert initial["runtime_ready"] is False
     assert initial["runtime_observation_state"] == "missing"
     record_runtime_observation(
@@ -559,14 +569,149 @@ def test_heartbeat_defaults_to_five_minutes_and_persists_timestamp(tmp_path):
         browser_readiness="ready",
         now=NOW,
     )
+    runtime_ready = store.heartbeat_snapshot(now=NOW)
+    assert runtime_ready["next_action_owner"] == "browser_connector"
+    assert runtime_ready["next_action_code"] == "discover_candidate_roles"
+    assert runtime_ready["browser_required"] is True
     with store.acquire_lease("controller"):
         recorded = store.record_heartbeat(now=NOW)
     assert recorded["heartbeat_due"] is False
+    assert recorded["state_changed"] is True
     assert recorded["runtime_ready"] is True
     assert recorded["browser_surface"] == "codex_chrome_connector"
-    assert store.heartbeat_snapshot(now=NOW + timedelta(seconds=299))["heartbeat_due"] is False
+    with store.acquire_lease("controller-unchanged"):
+        repeated = store.record_heartbeat(now=NOW)
+    assert repeated["state_changed"] is False
+    assert repeated["last_progress_at"] == NOW.isoformat()
+    heartbeat_path = store.root / store.HEARTBEAT_NAME
+    valid_heartbeat = heartbeat_path.read_bytes()
+    future_heartbeat = json.loads(valid_heartbeat)
+    future_heartbeat["recorded_at"] = (NOW + timedelta(days=1)).isoformat()
+    heartbeat_path.write_text(json.dumps(future_heartbeat), encoding="utf-8")
+    with pytest.raises(CampaignCorruptionError, match="outside its campaign"):
+        store.heartbeat_snapshot(now=NOW)
+    heartbeat_path.write_bytes(valid_heartbeat)
+    unchanged = store.heartbeat_snapshot(now=NOW + timedelta(seconds=299))
+    assert unchanged["heartbeat_due"] is False
+    assert unchanged["state_changed"] is False
+    assert unchanged["progress_age_seconds"] == 299
+    assert unchanged["next_action_code"] == "refresh_runtime_observation"
     assert store.heartbeat_snapshot(now=NOW + timedelta(seconds=300))["heartbeat_due"] is True
     assert CampaignStore.open(store.root).heartbeat_snapshot(now=NOW)["last_heartbeat_at"] == NOW.isoformat()
+
+    before_fingerprint = unchanged["progress_fingerprint"]
+    with store.acquire_lease("controller-progress"):
+        store.register_candidate("greenhouse:new-role", now=NOW + timedelta(seconds=301))
+    progressed = store.heartbeat_snapshot(now=NOW + timedelta(seconds=301))
+    assert progressed["state_changed"] is True
+    assert progressed["last_progress_at"] == (NOW + timedelta(seconds=301)).isoformat()
+    assert progressed["progress_age_seconds"] == 0
+    assert progressed["progress_fingerprint"] != before_fingerprint
+    assert progressed["next_action_code"] == "evaluate_candidate_eligibility"
+
+    compact = compact_heartbeat_snapshot(progressed)
+    assert len(json.dumps(compact)) < 1_600
+    assert compact["submitted_confirmed"] == 0
+    assert "candidate_state_counts" not in compact
+    assert "runtime_observation" not in compact
+    many_blockers = dict(progressed)
+    many_blockers["blocker_codes"] = [f"blocked_{index}" for index in range(25)]
+    bounded = compact_heartbeat_snapshot(many_blockers)
+    assert bounded["blocker_code_count"] == 25
+    assert len(bounded["blocker_codes"]) == 10
+    assert bounded["blocker_codes_truncated"] is True
+
+
+def test_campaign_supervisor_prioritizes_submission_and_approval_gates(tmp_path):
+    store = CampaignStore.create(tmp_path / "campaign", _manifest())
+    missing_runtime = store.heartbeat_snapshot(now=NOW)["runtime_observation"]
+    pending = Counter({"chatgpt_web_request": 1})
+
+    assert _campaign_supervisor_decision(
+        manifest=store.manifest,
+        current=NOW,
+        campaign_status=CampaignStatus.ACTIVE,
+        counts=Counter({CandidateState.SUBMITTING.value: 1}),
+        pending_counts=pending,
+        runtime_status=missing_runtime,
+        candidate_authorization_ready=True,
+    ) == ("controller", "reconcile_submission_outcome", False)
+    assert _campaign_supervisor_decision(
+        manifest=store.manifest,
+        current=NOW,
+        campaign_status=CampaignStatus.OUTCOME_REVIEW_REQUIRED,
+        counts=Counter(),
+        pending_counts=pending,
+        runtime_status=missing_runtime,
+        candidate_authorization_ready=True,
+    ) == ("applicant", "reconcile_unknown_submission_outcome", False)
+    assert _campaign_supervisor_decision(
+        manifest=store.manifest,
+        current=NOW,
+        campaign_status=CampaignStatus.TARGET_REACHED,
+        counts=Counter(),
+        pending_counts=pending,
+        runtime_status=missing_runtime,
+        candidate_authorization_ready=True,
+    ) == ("none", "target_reached", False)
+    assert _campaign_supervisor_decision(
+        manifest=store.manifest,
+        current=NOW + timedelta(days=2),
+        campaign_status=CampaignStatus.ACTIVE,
+        counts=Counter({CandidateState.AUTHORIZED.value: 1}),
+        pending_counts=pending,
+        runtime_status=missing_runtime,
+        candidate_authorization_ready=True,
+    ) == ("applicant", "renew_signed_fact_approval", False)
+    assert _campaign_supervisor_decision(
+        manifest=store.manifest,
+        current=NOW,
+        campaign_status=CampaignStatus.ACTIVE,
+        counts=Counter({CandidateState.AUTHORIZED.value: 1}),
+        pending_counts=pending,
+        runtime_status=missing_runtime,
+        candidate_authorization_ready=False,
+    ) == ("applicant", "renew_candidate_authorization", False)
+    ready_runtime = record_runtime_observation(
+        root=store.root,
+        scope_kind="campaign",
+        scope_id=store.manifest.campaign_id,
+        chronicle_state="capturing",
+        chronicle_evidence_code="fresh_frame_observed",
+        latest_frame_at=NOW,
+        browser_surface="codex_chrome_connector",
+        browser_readiness="ready",
+        now=NOW,
+    )
+    assert _campaign_supervisor_decision(
+        manifest=store.manifest,
+        current=NOW,
+        campaign_status=CampaignStatus.ACTIVE,
+        counts=Counter({CandidateState.AUTHORIZED.value: 1}),
+        pending_counts=pending,
+        runtime_status=ready_runtime,
+        candidate_authorization_ready=True,
+    ) == ("browser_connector", "execute_scoped_submission", True)
+    assert _campaign_supervisor_decision(
+        manifest=store.manifest,
+        current=NOW,
+        campaign_status=CampaignStatus.ACTIVE,
+        counts=Counter({CandidateState.FORM_REVIEWED.value: 1}),
+        pending_counts=Counter(),
+        runtime_status=missing_runtime,
+        candidate_authorization_ready=True,
+    ) == ("applicant", "authorize_reviewed_candidate", False)
+
+    review_only_manifest = _manifest(submit_authorized=False)
+    assert _campaign_supervisor_decision(
+        manifest=review_only_manifest,
+        current=NOW,
+        campaign_status=CampaignStatus.ACTIVE,
+        counts=Counter({CandidateState.FORM_REVIEWED.value: 1}),
+        pending_counts=Counter(),
+        runtime_status=missing_runtime,
+        candidate_authorization_ready=True,
+    ) == ("applicant", "create_submit_authorized_campaign", False)
 
 
 def test_event_log_is_append_only_and_recovers_state_ahead_of_projection(tmp_path):

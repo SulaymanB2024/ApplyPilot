@@ -35,11 +35,13 @@ from typing import Any, Mapping, Self
 CAMPAIGN_SCHEMA_VERSION = "applypilot-campaign-v2"
 EVENT_SCHEMA_VERSION = "applypilot-campaign-event-v1"
 HEARTBEAT_SCHEMA_VERSION = "applypilot-campaign-heartbeat-v1"
+COMPACT_HEARTBEAT_SCHEMA_VERSION = "applypilot-campaign-supervisor-v1"
 HEARTBEAT_RECORD_SCHEMA_VERSION = "applypilot-campaign-heartbeat-record-v1"
 DEFAULT_TARGET_CONFIRMED = 100
 MAX_TARGET_CONFIRMED = 100
 DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 300
 MAX_EVIDENCE_ARTIFACT_BYTES = 10_000_000
+MAX_COMPACT_BLOCKER_CODES = 10
 
 _SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,199}\Z")
 _SAFE_ISSUER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._@:+-]{0,199}\Z")
@@ -100,6 +102,113 @@ class EvidenceKind(StrEnum):
     CONTROLLER_RESULT = "controller_result"
     JOBS_ROW = "jobs_row"
     NOT_SUBMITTED_EVIDENCE = "not_submitted_evidence"
+
+
+def compact_heartbeat_snapshot(snapshot: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the bounded decision/progress view for five-minute campaign loops."""
+    if snapshot.get("schema_version") != HEARTBEAT_SCHEMA_VERSION:
+        raise ValueError("campaign heartbeat schema is invalid")
+    fields = (
+        "campaign_id",
+        "recorded_at",
+        "campaign_status",
+        "target_confirmed",
+        "submitted_confirmed",
+        "remaining",
+        "next_action_owner",
+        "next_action_code",
+        "browser_required",
+        "progress_fingerprint",
+        "state_changed",
+        "last_progress_at",
+        "progress_age_seconds",
+        "sequence",
+        "pending_artifact_count",
+        "last_heartbeat_at",
+        "heartbeat_due",
+        "runtime_ready",
+        "runtime_observation_state",
+        "chronicle_state",
+        "browser_surface",
+        "browser_readiness",
+    )
+    if any(field not in snapshot for field in fields):
+        raise ValueError("campaign heartbeat is missing compact supervisor fields")
+    blocker_codes = snapshot.get("blocker_codes")
+    if not isinstance(blocker_codes, list) or not all(
+        isinstance(code, str) for code in blocker_codes
+    ):
+        raise ValueError("campaign heartbeat blocker codes are invalid")
+    return {
+        "schema_version": COMPACT_HEARTBEAT_SCHEMA_VERSION,
+        **{field: snapshot[field] for field in fields},
+        "blocker_code_count": len(blocker_codes),
+        "blocker_codes": blocker_codes[:MAX_COMPACT_BLOCKER_CODES],
+        "blocker_codes_truncated": len(blocker_codes) > MAX_COMPACT_BLOCKER_CODES,
+        "state_trust": "local_diagnostic_not_submission_evidence",
+    }
+
+
+def _campaign_supervisor_decision(
+    *,
+    manifest: "CampaignManifest",
+    current: datetime,
+    campaign_status: str,
+    counts: Counter[str],
+    pending_counts: Counter[str],
+    runtime_status: Mapping[str, Any],
+    candidate_authorization_ready: bool,
+) -> tuple[str, str, bool]:
+    """Derive one precedence-resolved action without inspecting private values."""
+    if campaign_status == CampaignStatus.TARGET_REACHED:
+        return "none", "target_reached", False
+    if campaign_status == CampaignStatus.OUTCOME_REVIEW_REQUIRED:
+        return "applicant", "reconcile_unknown_submission_outcome", False
+    if counts.get(CandidateState.SUBMITTING.value):
+        return "controller", "reconcile_submission_outcome", False
+    if manifest.submit_authorized and current > datetime.fromisoformat(
+        manifest.fact_approval_expires_at
+    ):
+        return "applicant", "renew_signed_fact_approval", False
+    if counts.get(CandidateState.AUTHORIZED.value) and not candidate_authorization_ready:
+        return "applicant", "renew_candidate_authorization", False
+
+    if counts.get(CandidateState.AUTHORIZED.value):
+        base = ("browser_connector", "execute_scoped_submission", True)
+    elif pending_counts:
+        if pending_counts.get("chatgpt_web_request"):
+            base = (
+                "browser_connector",
+                "service_pending_chatgpt_web_request",
+                True,
+            )
+        else:
+            base = ("controller", "inspect_pending_campaign_artifact", False)
+    elif counts.get(CandidateState.FORM_REVIEWED.value):
+        base = (
+            ("applicant", "authorize_reviewed_candidate", False)
+            if manifest.submit_authorized
+            else ("applicant", "create_submit_authorized_campaign", False)
+        )
+    elif counts.get(CandidateState.MATERIALS_READY.value):
+        base = ("browser_connector", "perform_read_only_form_review", True)
+    elif counts.get(CandidateState.VERIFIED.value):
+        base = ("browser_connector", "prepare_candidate_materials", True)
+    elif counts.get(CandidateState.ELIGIBLE.value):
+        base = ("controller", "verify_candidate_first_party", False)
+    elif counts.get(CandidateState.DISCOVERED.value):
+        base = ("controller", "evaluate_candidate_eligibility", False)
+    else:
+        base = ("browser_connector", "discover_candidate_roles", True)
+
+    from applypilot.autonomy.supervisor import runtime_gated_decision
+
+    return runtime_gated_decision(
+        next_action_owner=base[0],
+        next_action_code=base[1],
+        browser_required=base[2],
+        runtime_status=runtime_status,
+    )
 
 
 _ALLOWED_TRANSITIONS: dict[CandidateState, frozenset[CandidateState]] = {
@@ -1169,11 +1278,24 @@ class CampaignStore:
             scope_id=self.manifest.campaign_id,
             now=current,
         )
-        last_heartbeat = self._read_last_heartbeat_at()
+        heartbeat_record = self._read_last_heartbeat()
+        last_heartbeat = (
+            str(heartbeat_record["recorded_at"])
+            if heartbeat_record is not None
+            else None
+        )
         due = True
+        last_heartbeat_time: datetime | None = None
         if isinstance(last_heartbeat, str):
-            last = datetime.fromisoformat(last_heartbeat)
-            due = current >= last + timedelta(seconds=self.manifest.heartbeat_interval_seconds)
+            last_heartbeat_time = datetime.fromisoformat(last_heartbeat)
+            manifest_created_at = datetime.fromisoformat(self.manifest.created_at)
+            if last_heartbeat_time < manifest_created_at or last_heartbeat_time > current:
+                raise CampaignCorruptionError(
+                    "campaign heartbeat timestamp is outside its campaign"
+                )
+            due = current >= last_heartbeat_time + timedelta(
+                seconds=self.manifest.heartbeat_interval_seconds
+            )
         counts = Counter(record["state"] for record in self._state["candidates"].values())
         pending_counts = Counter(
             str(metadata["kind"])
@@ -1194,9 +1316,69 @@ class CampaignStore:
                 and record["last_reason_code"]
             }
         )
+        state_updated_at = datetime.fromisoformat(str(self._state["updated_at"]))
+        if (
+            heartbeat_record is not None
+            and heartbeat_record["sequence"] == self._state["sequence"]
+            and last_heartbeat_time is not None
+            and last_heartbeat_time < state_updated_at
+        ):
+            raise CampaignCorruptionError(
+                "campaign heartbeat timestamp predates its bound state"
+            )
+        progress_age_seconds = max(
+            0,
+            int((current - state_updated_at).total_seconds()),
+        )
+        state_changed = (
+            heartbeat_record is None
+            or heartbeat_record["sequence"] != self._state["sequence"]
+        )
+        candidate_authorization_ready = True
+        for canonical_job_id, record in self._state["candidates"].items():
+            if record["state"] != CandidateState.AUTHORIZED:
+                continue
+            try:
+                self._require_valid_authorization_grant(
+                    canonical_job_id=canonical_job_id,
+                    bindings=record["bindings"],
+                    now=current,
+                )
+            except CampaignCorruptionError:
+                raise
+            except CampaignError:
+                candidate_authorization_ready = False
+                break
+        next_action_owner, next_action_code, browser_required = (
+            _campaign_supervisor_decision(
+                manifest=self.manifest,
+                current=current,
+                campaign_status=str(self._state["status"]),
+                counts=counts,
+                pending_counts=pending_counts,
+                runtime_status=runtime_status,
+                candidate_authorization_ready=candidate_authorization_ready,
+            )
+        )
+        progress_fingerprint = _digest_json(
+            {
+                "campaign_id": self.manifest.campaign_id,
+                "campaign_status": self._state["status"],
+                "target_confirmed": self.manifest.target_confirmed,
+                "submitted_confirmed": self.confirmed_count,
+                "candidate_state_counts": {
+                    state.value: counts.get(state.value, 0)
+                    for state in CandidateState
+                },
+                "pending_artifact_counts_by_kind": dict(sorted(pending_counts.items())),
+                "blocker_codes": blocker_codes,
+                "sequence": self._state["sequence"],
+            }
+        )
         return {
             "schema_version": HEARTBEAT_SCHEMA_VERSION,
             "campaign_id": self.manifest.campaign_id,
+            "recorded_at": current.isoformat(),
             "campaign_status": self._state["status"],
             "target_confirmed": self.manifest.target_confirmed,
             "submitted_confirmed": self.confirmed_count,
@@ -1213,6 +1395,13 @@ class CampaignStore:
             "evidence_artifact_counts_by_kind": dict(sorted(evidence_counts.items())),
             "blocker_codes": blocker_codes,
             "sequence": self._state["sequence"],
+            "next_action_owner": next_action_owner,
+            "next_action_code": next_action_code,
+            "browser_required": browser_required,
+            "progress_fingerprint": progress_fingerprint,
+            "state_changed": state_changed,
+            "last_progress_at": state_updated_at.isoformat(),
+            "progress_age_seconds": progress_age_seconds,
             "heartbeat_interval_seconds": self.manifest.heartbeat_interval_seconds,
             "last_heartbeat_at": last_heartbeat,
             "heartbeat_due": due,
@@ -1227,6 +1416,7 @@ class CampaignStore:
     def record_heartbeat(self, *, now: datetime | None = None) -> dict[str, Any]:
         self._require_lease()
         timestamp = _iso_now(now)
+        snapshot = self.heartbeat_snapshot(now=datetime.fromisoformat(timestamp))
         _atomic_write_json(
             self.root / self.HEARTBEAT_NAME,
             {
@@ -1237,9 +1427,11 @@ class CampaignStore:
                 "recorded_at": timestamp,
             },
         )
-        return self.heartbeat_snapshot(now=datetime.fromisoformat(timestamp))
+        snapshot["last_heartbeat_at"] = timestamp
+        snapshot["heartbeat_due"] = False
+        return snapshot
 
-    def _read_last_heartbeat_at(self) -> str | None:
+    def _read_last_heartbeat(self) -> dict[str, Any] | None:
         path = self.root / self.HEARTBEAT_NAME
         if not path.exists():
             return None
@@ -1264,7 +1456,7 @@ class CampaignStore:
             _require_aware_iso(str(payload.get("recorded_at") or ""), field="heartbeat recorded_at")
         except ValueError as exc:
             raise CampaignCorruptionError("campaign heartbeat timestamp is invalid") from exc
-        return str(payload["recorded_at"])
+        return payload
 
     def _release_lease(self, lease: CampaignLease) -> None:
         if self._active_lease is not lease:
