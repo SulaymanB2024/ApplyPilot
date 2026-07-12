@@ -238,6 +238,16 @@ evidence proves either `submitted_confirmed` or `not_submitted`. Pending model/b
 are omitted from heartbeat output and deleted after resolution. Exact URLs that are already
 applied, permanently failed, or out of attempts cannot be reacquired.
 
+Add `--compact` to live `campaign status` or `campaign heartbeat` for the five-minute controller.
+The compact schema reports only target/confirmed/remaining counts, durable sequence and progress
+age, a stable state fingerprint, precedence-resolved action owner/code, blocker codes, heartbeat
+timing, and the coarse runtime fields. Heartbeat writes refresh liveness without changing the
+campaign sequence or `last_progress_at`; only a durable campaign event resets progress age. Empty
+or exhausted active queues request browser-based discovery only when the fresh runtime contract
+passes, while unknown submission outcomes and candidate authorization remain applicant-owned.
+The compact blocker list is capped at ten codes and includes total/truncated metadata so a large
+failed queue cannot silently expand every five-minute prompt.
+
 The artifact runner is review-only. It may discover roles, verify first-party evidence, and
 write local cover-letter packets. It never fills, uploads, submits, sends email, or changes an
 external account. `probe-chatgpt` and `run` remain available only as caller-provided legacy CDP

@@ -1020,13 +1020,20 @@ def campaign_create(
 @campaign_app.command("status")
 def campaign_status(
     campaign_dir: Path = typer.Option(..., "--campaign-dir", help="Campaign state directory."),
+    compact: bool = typer.Option(
+        False,
+        "--compact",
+        help="Print only bounded campaign decision, progress, liveness, and runtime fields.",
+    ),
 ) -> None:
     """Print a bounded, redacted campaign heartbeat snapshot."""
     _bootstrap_config_only()
-    from applypilot.autonomy.campaign import CampaignStore
+    from applypilot.autonomy.campaign import CampaignStore, compact_heartbeat_snapshot
 
     try:
         snapshot = CampaignStore.open(campaign_dir).heartbeat_snapshot()
+        if compact:
+            snapshot = compact_heartbeat_snapshot(snapshot)
     except Exception as exc:
         console.print(f"[red]Campaign status failed:[/red] {type(exc).__name__}: {str(exc)[:160]}")
         raise typer.Exit(code=1) from exc
@@ -1036,15 +1043,22 @@ def campaign_status(
 @campaign_app.command("heartbeat")
 def campaign_heartbeat(
     campaign_dir: Path = typer.Option(..., "--campaign-dir", help="Campaign state directory."),
+    compact: bool = typer.Option(
+        False,
+        "--compact",
+        help="Print only bounded campaign decision, progress, liveness, and runtime fields.",
+    ),
 ) -> None:
     """Record and print one redacted five-minute campaign heartbeat."""
     _bootstrap_config_only()
-    from applypilot.autonomy.campaign import CampaignStore
+    from applypilot.autonomy.campaign import CampaignStore, compact_heartbeat_snapshot
 
     try:
         store = CampaignStore.open(campaign_dir)
         with store.acquire_lease("campaign-heartbeat-cli"):
             snapshot = store.record_heartbeat()
+        if compact:
+            snapshot = compact_heartbeat_snapshot(snapshot)
     except Exception as exc:
         console.print(f"[red]Campaign heartbeat failed:[/red] {type(exc).__name__}: {str(exc)[:160]}")
         raise typer.Exit(code=1) from exc
