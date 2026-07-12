@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 from copy import deepcopy
 from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
@@ -80,7 +82,9 @@ from applypilot.autonomy.policy import (
 from applypilot.autonomy.telemetry import BudgetExceeded, UsageLedger
 from applypilot.autonomy.runner import (
     advance_artifact_run,
+    record_run_heartbeat,
     require_approved_fact_digest,
+    run_status_snapshot,
 )
 from applypilot.cli import app
 
@@ -1852,6 +1856,241 @@ def test_autonomy_plan_cli_writes_compact_secret_free_request(monkeypatch, tmp_p
     assert '"submitted_confirmed": 0' in status.output
 
 
+def test_pre_campaign_status_and_heartbeat_are_fixed_name_and_redacted(
+    monkeypatch,
+    tmp_path,
+):
+    from applypilot.autonomy import approval
+
+    app_dir = tmp_path / "app-data"
+    app_dir.mkdir()
+    profile_path = app_dir / "profile.json"
+    resume_path = app_dir / "resume.txt"
+    profile_path.write_text(json.dumps(PROFILE), encoding="utf-8")
+    resume_path.write_text(
+        "Test Candidate | candidate@example.com | 555-0100\n"
+        "Built Python and SQL product analytics tools.\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(config, "APP_DIR", app_dir)
+    monkeypatch.setattr(config, "PROFILE_PATH", profile_path)
+    monkeypatch.setattr(config, "RESUME_PATH", resume_path)
+    monkeypatch.setattr(config, "ENV_PATH", app_dir / ".env")
+    monkeypatch.setattr(
+        approval,
+        "require_system_approval_trust_store",
+        lambda: tmp_path / "allowed_signers",
+    )
+
+    out = tmp_path / "runs"
+    planned = CLI_RUNNER.invoke(
+        app,
+        ["autonomy", "plan", "--query", "product analytics internships", "--out", str(out)],
+    )
+    assert planned.exit_code == 0, planned.output
+    run_dir = next(path for path in out.iterdir() if path.is_dir())
+    now = datetime.fromisoformat(
+        str(json.loads((run_dir / "run_manifest.json").read_text())["created_at"])
+    )
+
+    status = run_status_snapshot(run_dir=run_dir, now=now)
+
+    assert status["review_phase"] == "awaiting_role_candidates"
+    assert status["live_gate"] == "preferred_location"
+    assert status["submitted_confirmed"] == 0
+    assert status["target_confirmed"] == 100
+    assert status["preferred_location_fact_count"] == 0
+    assert status["heartbeat_due"] is True
+    serialized = json.dumps(status, sort_keys=True)
+    for private in (
+        "candidate@example.com",
+        "555-0100",
+        "123 Main Street",
+        "secret-sentinel",
+        "product analytics internships",
+    ):
+        assert private not in serialized
+
+    recorded = record_run_heartbeat(run_dir=run_dir, now=now)
+    heartbeat_path = run_dir / "heartbeat.json"
+    first_text = heartbeat_path.read_text(encoding="utf-8")
+    assert recorded["heartbeat_due"] is False
+    assert run_status_snapshot(
+        run_dir=run_dir,
+        now=now + timedelta(seconds=299),
+    )["heartbeat_due"] is False
+    assert run_status_snapshot(
+        run_dir=run_dir,
+        now=now + timedelta(seconds=300),
+    )["heartbeat_due"] is True
+
+    record_run_heartbeat(run_dir=run_dir, now=now + timedelta(microseconds=1))
+    second_text = heartbeat_path.read_text(encoding="utf-8")
+    assert first_text != second_text
+    assert list(run_dir.glob("heartbeat*.json")) == [heartbeat_path]
+    assert "candidate@example.com" not in second_text
+
+    cli_status = CLI_RUNNER.invoke(
+        app,
+        ["autonomy", "status", "--run-dir", str(run_dir)],
+    )
+    assert cli_status.exit_code == 0, cli_status.output
+    assert '"submitted_confirmed": 0' in cli_status.output
+    assert "candidate@example.com" not in cli_status.output
+    cli_heartbeat = CLI_RUNNER.invoke(
+        app,
+        ["autonomy", "heartbeat", "--run-dir", str(run_dir)],
+    )
+    assert cli_heartbeat.exit_code == 0, cli_heartbeat.output
+    assert '"heartbeat_due": false' in cli_heartbeat.output
+    assert "candidate@example.com" not in cli_heartbeat.output
+
+    valid_heartbeat_text = heartbeat_path.read_text(encoding="utf-8")
+    last_recorded = datetime.fromisoformat(
+        str(json.loads(valid_heartbeat_text)["recorded_at"])
+    )
+    attack_now = last_recorded + timedelta(seconds=600)
+    unbound = json.loads(valid_heartbeat_text)
+    unbound["recorded_at"] = (attack_now + timedelta(days=1)).isoformat()
+    heartbeat_path.write_text(json.dumps(unbound), encoding="utf-8")
+    with pytest.raises(ValueError, match="heartbeat bindings are invalid"):
+        run_status_snapshot(run_dir=run_dir, now=attack_now)
+    heartbeat_path.write_text(valid_heartbeat_text, encoding="utf-8")
+
+    victim = tmp_path / "must-not-be-overwritten.txt"
+    victim.write_text("preserve me", encoding="utf-8")
+    monkeypatch.setattr(autonomy_runner.secrets, "token_hex", lambda _size: "fixed")
+    malicious_temporary = run_dir / f".heartbeat.json.{os.getpid()}.fixed.tmp"
+    malicious_temporary.symlink_to(victim)
+    with pytest.raises(FileExistsError):
+        record_run_heartbeat(run_dir=run_dir, now=attack_now)
+    assert victim.read_text(encoding="utf-8") == "preserve me"
+    malicious_temporary.unlink()
+
+    before_replace_failure = heartbeat_path.read_bytes()
+
+    def fail_replace(*_args):
+        raise OSError("synthetic replace failure")
+
+    with monkeypatch.context() as replace_patch:
+        replace_patch.setattr(autonomy_runner.os, "replace", fail_replace)
+        with pytest.raises(OSError, match="synthetic replace failure"):
+            record_run_heartbeat(run_dir=run_dir, now=attack_now)
+    assert heartbeat_path.read_bytes() == before_replace_failure
+    assert list(run_dir.glob(".heartbeat.json.*.tmp")) == []
+
+    wrong_interval = json.loads(valid_heartbeat_text)
+    wrong_interval["status"]["heartbeat_interval_seconds"] = 299
+    wrong_interval["status_sha256"] = hashlib.sha256(
+        json.dumps(
+            wrong_interval["status"],
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    heartbeat_path.write_text(json.dumps(wrong_interval), encoding="utf-8")
+    with pytest.raises(ValueError, match="heartbeat bindings are invalid"):
+        run_status_snapshot(run_dir=run_dir, now=attack_now)
+    heartbeat_path.write_text(valid_heartbeat_text, encoding="utf-8")
+
+    heartbeat = json.loads(heartbeat_path.read_text(encoding="utf-8"))
+    future = (attack_now + timedelta(days=1)).isoformat()
+    heartbeat["recorded_at"] = future
+    heartbeat["status"]["recorded_at"] = future
+    heartbeat["status"]["last_heartbeat_at"] = future
+    heartbeat["status_sha256"] = hashlib.sha256(
+        json.dumps(
+            heartbeat["status"],
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    heartbeat_path.write_text(json.dumps(heartbeat), encoding="utf-8")
+    with pytest.raises(ValueError, match="timestamp is in the future"):
+        run_status_snapshot(run_dir=run_dir, now=attack_now)
+    heartbeat_path.unlink()
+
+    original_request = json.loads(
+        (run_dir / "handoff" / "discovery.request.json").read_text(encoding="utf-8")
+    )
+    extra_request = dict(original_request)
+    extra_request["kind"] = "material_packet"
+    extra_request["response_path"] = "handoff/extra.response.json"
+    extra_request_path = run_dir / "handoff" / "extra.request.json"
+    extra_request_path.write_text(json.dumps(extra_request), encoding="utf-8")
+    with pytest.raises(ValueError, match="more than one active handoff exchange"):
+        run_status_snapshot(run_dir=run_dir, now=attack_now)
+    extra_request_path.unlink()
+
+    base_result = {
+        "run_id": status["run_id"],
+        "status": "candidate@example.com",
+        "pending_requests": [],
+        "source_attempts": [],
+        "discoveries": [],
+        "eligibility": [],
+        "freshness": [],
+        "materials": [],
+        "form_reviews": [],
+        "final_actions": [],
+        "blockers": [],
+        "usage": {"run_id": status["run_id"]},
+    }
+    (run_dir / "result_ledger.json").write_text(json.dumps(base_result), encoding="utf-8")
+    with pytest.raises(ValueError, match="result ledger status is invalid"):
+        run_status_snapshot(run_dir=run_dir, now=attack_now)
+
+    mismatched_pending = dict(base_result)
+    mismatched_pending["status"] = "awaiting_chatgpt_web"
+    mismatched_pending["pending_requests"] = [
+        {
+            "surface": "browser_tool",
+            "kind": "form_review",
+            "request_id": "request-1",
+            "request_path": "request.json",
+            "response_path": "response.json",
+        }
+    ]
+    (run_dir / "result_ledger.json").write_text(
+        json.dumps(mismatched_pending),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="ChatGPT wait has no matching request"):
+        run_status_snapshot(run_dir=run_dir, now=attack_now)
+
+    budget_exhausted = dict(base_result)
+    budget_exhausted["status"] = "budget_exhausted"
+    budget_exhausted["pending_requests"] = [
+        {
+            "surface": "chatgpt_web",
+            "kind": "role_candidates",
+            "request_id": "request-1",
+            "request_path": "request.json",
+            "response_path": "response.json",
+        }
+    ]
+    (run_dir / "result_ledger.json").write_text(
+        json.dumps(budget_exhausted),
+        encoding="utf-8",
+    )
+    budget_status = run_status_snapshot(run_dir=run_dir, now=attack_now)
+    assert budget_status["review_phase"] == "reported_budget_exhausted"
+
+    forged_submitted = dict(base_result)
+    forged_submitted["status"] = "submitted"
+    forged_submitted["final_actions"] = [
+        {"status": "submitted_confirmed", "candidate_id": "candidate-1"}
+    ]
+    (run_dir / "result_ledger.json").write_text(
+        json.dumps(forged_submitted),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="result ledger status is invalid"):
+        run_status_snapshot(run_dir=run_dir, now=attack_now)
+
+
 def test_artifact_advance_blocks_unreviewed_required_facts_before_tools(monkeypatch, tmp_path):
     app_dir = tmp_path / "app-data"
     app_dir.mkdir()
@@ -1922,6 +2161,10 @@ def test_artifact_handoff_advances_to_review_ready_without_browser(monkeypatch, 
     )
     assert pending["status"] == "awaiting_chatgpt_web", pending
     assert pending["pending_requests"][0]["kind"] == "role_candidates"
+    pending_status = run_status_snapshot(run_dir=run_dir)
+    assert pending_status["review_phase"] == "awaiting_role_candidates"
+    assert pending_status["result"]["trust"] == "validated_but_mutable_untrusted"
+    assert pending_status["result"]["reported_status"] == "awaiting_chatgpt_web"
 
     discovery_request = json.loads(
         (run_dir / "handoff" / "discovery.request.json").read_text(encoding="utf-8")
@@ -1955,6 +2198,9 @@ def test_artifact_handoff_advances_to_review_ready_without_browser(monkeypatch, 
     import_response_artifact(
         request_path=run_dir / "handoff" / "discovery.request.json",
         input_path=discovery_input,
+    )
+    assert run_status_snapshot(run_dir=run_dir)["review_phase"] == (
+        "response_ready_to_advance"
     )
 
     awaiting_material = advance_artifact_run(
