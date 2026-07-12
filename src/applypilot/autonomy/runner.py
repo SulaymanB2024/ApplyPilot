@@ -363,9 +363,11 @@ def run_with_cdp(
     output_dir: Path,
     corrections_path: Path | None = None,
     approved_fact_digest: str,
+    allow_legacy_cdp: bool = False,
     policy: RunPolicy | None = None,
 ) -> dict[str, Any]:
-    """Run the review-only funnel against a caller-provided Chrome CDP session."""
+    """Run the review-only funnel against an explicitly approved legacy CDP session."""
+    _require_legacy_cdp_opt_in(allow_legacy_cdp)
     from playwright.sync_api import sync_playwright
 
     active_policy = policy or RunPolicy(review_only=True)
@@ -439,8 +441,9 @@ def run_with_cdp(
     return result.to_dict()
 
 
-def probe_chatgpt_cdp(*, cdp_port: int) -> dict[str, Any]:
-    """Perform a no-send ChatGPT composer/auth probe."""
+def probe_chatgpt_cdp(*, cdp_port: int, allow_legacy_cdp: bool = False) -> dict[str, Any]:
+    """Perform an explicitly approved legacy CDP composer/auth probe."""
+    _require_legacy_cdp_opt_in(allow_legacy_cdp)
     from playwright.sync_api import sync_playwright
 
     policy = RunPolicy()
@@ -456,6 +459,15 @@ def probe_chatgpt_cdp(*, cdp_port: int) -> dict[str, Any]:
         finally:
             page.close()
     return result
+
+
+def _require_legacy_cdp_opt_in(allowed: bool) -> None:
+    if not allowed:
+        raise PermissionError(
+            "legacy CDP transport is disabled by default; use the portable ChatGPT Web "
+            "artifact handoff with the Codex Chrome connector, or pass --allow-legacy-cdp "
+            "only for a deliberate caller-provided compatibility session"
+        )
 
 
 def require_approved_fact_digest(actual: str, approved: str) -> None:
