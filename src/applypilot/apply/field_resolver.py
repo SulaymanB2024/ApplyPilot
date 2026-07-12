@@ -11,6 +11,8 @@ from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
+from applypilot.autonomy.facts import FactLedger
+
 
 HIDDEN_FIELD_TYPES = {"hidden", "submit", "button", "reset", "image"}
 FALLBACK_MIN_CONFIDENCE = 0.5
@@ -531,7 +533,7 @@ class CodexResolver:
         *,
         model: str,
         worker_dir: Path,
-        timeout: int = 60,
+        timeout: float | None = None,
         max_calls: int = 2,
     ) -> None:
         self.model = model
@@ -871,6 +873,33 @@ def _flatten_fact_ids(value: Any, prefix: str = "") -> set[str]:
             result.update(_flatten_fact_ids(item, next_prefix))
     elif value not in (None, "", [], {}):
         result.add(prefix)
+    return result
+
+
+def model_field_profile_from_ledger(ledger: FactLedger) -> dict[str, Any]:
+    """Build the exact confirmed profile subset allowed into field-model calls."""
+    allowed_sections = {
+        "availability",
+        "compensation",
+        "eeo_voluntary",
+        "personal",
+        "work_authorization",
+    }
+    result: dict[str, Any] = {}
+    for record in ledger.confirmed():
+        if not record.fact_id.startswith("profile."):
+            continue
+        path = record.fact_id.removeprefix("profile.").split(".")
+        if len(path) < 2 or path[0] not in allowed_sections:
+            continue
+        current = result
+        for part in path[:-1]:
+            child = current.get(part)
+            if not isinstance(child, dict):
+                child = {}
+                current[part] = child
+            current = child
+        current[path[-1]] = record.value
     return result
 
 

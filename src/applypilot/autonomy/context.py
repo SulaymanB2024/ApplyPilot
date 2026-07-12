@@ -11,7 +11,7 @@ from typing import Any
 from applypilot.autonomy.facts import FactLedger
 from applypilot.autonomy.models import CandidateProfile, RoleCandidate
 
-CONTEXT_VERSION = "applypilot-context-v1"
+CONTEXT_VERSION = "applypilot-context-v2"
 SENSITIVE_KEYS = {
     "address",
     "api_key",
@@ -90,10 +90,10 @@ def build_context_pack(
     resume_text: str = "",
     job_text: str = "",
     max_chars: int = 24_000,
-    max_evidence: int = 30,
+    max_evidence: int = 72,
     fact_ledger: FactLedger | None = None,
 ) -> CompactContextPack:
-    """Build a minimal fact pack without contact details or raw resume dumps."""
+    """Build a rich bounded fact pack without contact details or raw resume dumps."""
     personal = profile.get("personal") or {}
     identity_values = tuple(
         str(value)
@@ -140,8 +140,10 @@ def build_context_pack(
             "evidence": numbered,
         }
         serialized = json.dumps(core, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-        if len(serialized) <= max_chars or not evidence:
+        if len(serialized) <= max_chars:
             break
+        if not evidence:
+            raise ValueError("confirmed profile exceeds context character budget")
         evidence.pop()
 
     digest = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
@@ -198,7 +200,7 @@ def build_discovery_prompt(
             "Cross-check promising roles against official employer or ATS pages.",
             "Do not expose chain-of-thought or research notes; return only the final contract object.",
         ],
-        "candidate_profile": pack.profile,
+        "candidate_context": pack.to_dict(),
         "output_contract": {
             "schema_version": "applypilot.chatgpt_web.v1",
             "kind": "role_candidates",
@@ -237,6 +239,20 @@ def build_material_prompt(
     request_id: str = "",
 ) -> str:
     """Build a provenance-oriented cover-letter request."""
+    ranked_context = {
+        **pack.to_dict(),
+        "evidence": _rank_evidence(
+            pack.evidence,
+            " ".join(
+                (
+                    candidate.company,
+                    candidate.title,
+                    candidate.location,
+                    verified_job_text,
+                )
+            ),
+        ),
+    }
     payload = {
         "task": "Draft a concise cover letter for human review using only supplied facts.",
         "rules": [
@@ -248,6 +264,7 @@ def build_material_prompt(
             "Keep applicant assertions as simple evidence-grounded sentences; put job requirements or role fit in separate sentences.",
             "Flag unsupported requirements as verification gaps.",
             "Do not include phone, email, street address, salary, demographics, or passwords.",
+            "Use no more than four short paragraphs and 450 words total.",
         ],
         "reasoning_guidance": [
             "Think deeply about the strongest truthful narrative connecting this candidate to this specific role.",
@@ -262,7 +279,7 @@ def build_material_prompt(
             "official_url": candidate.official_url,
             "verified_description": verified_job_text[:12_000],
         },
-        "context": pack.to_dict(),
+        "context": ranked_context,
         "output_contract": {
             "schema_version": "applypilot.chatgpt_web.v1",
             "kind": "material_packet",
@@ -663,6 +680,22 @@ def _drop_empty(value: Any) -> Any:
 def _tokens(value: str) -> set[str]:
     stop = {"and", "for", "from", "that", "the", "this", "with", "your"}
     return {token for token in TOKEN_RE.findall(value.lower()) if token not in stop}
+
+
+def _rank_evidence(
+    evidence: tuple[dict[str, str], ...],
+    relevance_text: str,
+) -> list[dict[str, str]]:
+    """Put role-relevant facts first while preserving the complete bounded pack."""
+    relevance_tokens = _tokens(relevance_text)
+    ranked = sorted(
+        enumerate(evidence),
+        key=lambda item: (
+            -len(_tokens(item[1].get("fact", "")) & relevance_tokens),
+            item[0],
+        ),
+    )
+    return [dict(item) for _, item in ranked]
 
 
 def _dedupe(values: list[str]) -> list[str]:

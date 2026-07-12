@@ -13,14 +13,22 @@ from applypilot import config
 from applypilot.autonomy.batch import AutonomousBatch, BatchDependencies, _mapping_digest
 from applypilot.autonomy.chatgpt_web import (
     ChatGPTWebClient,
+    ChatGPTWebConfig,
     ChatGPTContractError,
+    material_packet_from_payload,
     parse_chatgpt_json,
     temporary_chat_is_active,
     validate_material_provenance,
 )
 from applypilot.autonomy import direct_ats as autonomy_direct_ats
 from applypilot.autonomy.direct_ats import DirectATSDiscovery
-from applypilot.autonomy.context import build_context_pack, candidate_profile_from_data
+from applypilot.autonomy.context import (
+    CompactContextPack,
+    build_context_pack,
+    build_discovery_prompt,
+    build_material_prompt,
+    candidate_profile_from_data,
+)
 from applypilot.autonomy.facts import (
     FactCorrection,
     FactState,
@@ -371,6 +379,86 @@ def test_context_pack_is_compact_relevant_and_contact_free():
     assert derived.graduation_year == 2028
 
 
+def test_context_pack_default_keeps_broad_confirmed_background():
+    resume = "\n".join(
+        f"Built verified project capability number {index} using Python and analytics."
+        for index in range(1, 61)
+    )
+    ledger = build_fact_ledger(PROFILE, resume_text=resume)
+
+    pack = build_context_pack(
+        PROFILE,
+        resume_text=resume,
+        job_text="entry level product roles",
+        fact_ledger=ledger,
+    )
+
+    assert len(pack.evidence) > 30
+    assert len(pack.evidence) <= 72
+    assert pack.serialized_chars <= 24_000
+
+
+def test_context_pack_fails_closed_when_confirmed_profile_exceeds_budget():
+    oversized = deepcopy(PROFILE)
+    oversized["skills_boundary"] = {
+        "tools": [f"verified-capability-{index}-" + ("x" * 80) for index in range(20)]
+    }
+    ledger = build_fact_ledger(oversized, resume_text="")
+
+    with pytest.raises(ValueError, match="profile exceeds context character budget"):
+        build_context_pack(
+            oversized,
+            max_chars=200,
+            fact_ledger=ledger,
+        )
+
+
+def test_discovery_prompt_includes_full_evidence_and_deep_reasoning_contract():
+    pack = CompactContextPack(
+        version="test-context",
+        profile={"target_role": "Product analyst"},
+        evidence=(
+            {"id": "F01", "fact": "Built a verified analytics system."},
+            {"id": "F02", "fact": "Led a verified product research project."},
+        ),
+        digest="context-digest",
+        serialized_chars=100,
+    )
+
+    payload = json.loads(build_discovery_prompt(pack, query="early career roles", limit=5))
+
+    assert payload["candidate_context"] == pack.to_dict()
+    assert any("as much internal analysis" in rule for rule in payload["reasoning_guidance"])
+    assert payload["response_rule"].startswith("Return exactly one JSON object")
+
+
+def test_material_prompt_prioritizes_relevant_facts_without_dropping_context():
+    pack = CompactContextPack(
+        version="test-context",
+        profile={"target_role": "Product analyst"},
+        evidence=(
+            {"id": "F01", "fact": "Coordinated community music rehearsals."},
+            {"id": "F02", "fact": "Built Python and SQL product analytics tooling."},
+            {"id": "F03", "fact": "Wrote a verified market research report."},
+        ),
+        digest="context-digest",
+        serialized_chars=200,
+    )
+
+    payload = json.loads(
+        build_material_prompt(
+            pack,
+            role(description="Python SQL product analytics"),
+            verified_job_text="Build product analytics workflows using Python and SQL.",
+        )
+    )
+
+    ranked = payload["context"]["evidence"]
+    assert ranked[0]["id"] == "F02"
+    assert {item["id"] for item in ranked} == {"F01", "F02", "F03"}
+    assert any("Think deeply" in rule for rule in payload["reasoning_guidance"])
+
+
 def test_fact_ledger_context_excludes_identity_and_eeo_facts():
     profile = {
         **PROFILE,
@@ -432,6 +520,17 @@ Built Python and SQL product analytics tools.
     assert "unknown" not in serialized
     assert "Python and SQL product analytics" in serialized
     assert "Austin" in serialized
+
+    discovery_prompt = build_discovery_prompt(
+        pack,
+        query="Python SQL product analytics in Austin",
+        limit=5,
+    )
+    assert "Test Candidate" not in discovery_prompt
+    assert "123 Main Street" not in discovery_prompt
+    assert "90,000" not in discovery_prompt
+    assert "Sensitive demographic" not in discovery_prompt
+    assert "unknown" not in discovery_prompt
 
 
 def test_fact_ledger_prevents_rejected_experience_and_placeholders_from_returning():
@@ -634,6 +733,78 @@ def test_chatgpt_response_uses_dom_text_content_not_rendered_inner_text():
     )
 
     assert client._wait_for_assistant(0) == raw
+
+
+def test_chatgpt_default_wait_has_no_generation_deadline():
+    raw = (
+        '{"schema_version":"applypilot.chatgpt_web.v1",'
+        '"kind":"role_candidates","items":[]}'
+    )
+
+    class Locator:
+        def __init__(self, page, *, assistant=False):
+            self.page = page
+            self.assistant = assistant
+
+        def count(self):
+            return 1 if self.assistant and self.page.polls >= 4 else 0
+
+        def is_visible(self):
+            return False
+
+        def nth(self, _index):
+            return self
+
+        def text_content(self, **_kwargs):
+            return raw
+
+    class Page:
+        def __init__(self):
+            self.polls = 0
+
+        def locator(self, _selector):
+            return Locator(self, assistant=True)
+
+        def get_by_role(self, *_args, **_kwargs):
+            return Locator(self)
+
+        def wait_for_timeout(self, _timeout):
+            self.polls += 1
+
+    page = Page()
+    client = ChatGPTWebClient(
+        page=page,
+        ledger=UsageLedger(run_id="unbounded-wait", budget=FunnelBudget()),
+        config=ChatGPTWebConfig(),
+    )
+
+    assert client.config.timeout_ms is None
+    assert client._wait_for_assistant(0) == raw
+    assert page.polls == 4
+
+
+def test_material_packet_rejects_oversized_final_output():
+    candidate = role()
+    pack = build_context_pack(PROFILE, job_text=candidate.description)
+    payload = {
+        "candidate_id": candidate.candidate_id,
+        "paragraphs": [
+            {
+                "text": "role " * 451,
+                "evidence_ids": ["JOB"],
+                "applicant_claims": [],
+            }
+        ],
+        "verification_gaps": [],
+    }
+
+    with pytest.raises(ChatGPTContractError, match="word limit"):
+        material_packet_from_payload(
+            payload,
+            pack=pack,
+            candidate=candidate,
+            verified_job_text="role",
+        )
 
 
 def test_chatgpt_discovery_rejects_aggregator_urls():

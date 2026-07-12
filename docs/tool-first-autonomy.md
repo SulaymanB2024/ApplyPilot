@@ -59,8 +59,10 @@ Telemetry stores hashes, counts, durations, and observed or estimated token fiel
 store raw prompts in the usage ledger. Model calls may research and reason for as long as they
 need; limits apply to the number and size of calls, not their thinking time. Context is curated
 and evidence-rich rather than intentionally sparse: the default pack allows up to 24,000
-characters and 30 confirmed facts while excluding contact details, demographics, secrets,
-unknowns, and rejected claims. The acceptance target for a representative end-to-end run is at
+characters and 72 confirmed facts while excluding contact details, demographics, secrets,
+unknowns, and rejected claims. Discovery receives that complete bounded pack. Material calls
+preserve every stable evidence ID while putting the facts most relevant to the verified role
+first. The acceptance target for a representative end-to-end run is at
 least a 90% token reduction from the 19.35-million-token failure baseline. That target must be
 measured on a fresh run after the applicant fact ledger is corrected; it is not claimed from
 unit tests.
@@ -142,13 +144,15 @@ The browser form artifact is also bound to the verified role site and cannot rep
 when CAPTCHA, login, or account creation is required. Unknown JSON fields and all field-value
 aliases are rejected.
 
-Material prompt schema v2 separates applicant assertions from job evidence. Every prose
+Material prompt schema v3 separates applicant assertions from job evidence. Every prose
 sentence that asserts something about the applicant through `I`, `me`, or `my` must be copied
 verbatim into a structured `applicant_claims` entry. Those entries may cite confirmed `F` facts
 only—never `JOB`—and their terms, named entities, and numbers are validated against exactly
 those facts. This prevents a job requirement from becoming an applicant skill merely through
 different grammar while leaving ChatGPT free to reason deeply about narrative and fit before
 it emits the audited artifact.
+The final letter is limited to four paragraphs, 450 words, and 20 structured applicant claims;
+those output limits reduce response tokens without limiting private research or deliberation.
 
 The existing deterministic form controller also defaults to dry-run:
 
@@ -164,7 +168,12 @@ bound to the candidate, fact ledger, exact material bytes, filled-form review di
 policy, then consumed before the click. Its field model-call budget defaults to zero, so it does
 not require or spawn Codex/Claude.
 Set `APPLYPILOT_FIELD_MODEL_CALL_BUDGET=1` only when a bounded schema-constrained fallback is
-needed. All unresolved required fields still fail closed.
+needed. The fallback has no default model-process deadline, receives only confirmed ledger facts,
+and requires an approved fact ledger even during a dry-run. All unresolved required fields still
+fail closed.
+
+Context pack v2 and prompt schema v3 intentionally require a fresh `autonomy plan`. Do not try to
+advance a run packet created with context v1 or prompt schema v2 after upgrading.
 
 ## Remaining live gate
 

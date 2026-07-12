@@ -26,6 +26,22 @@ were the main causes.
 | Doctor | `applypilot doctor --autonomy --strict --json` succeeds in a fresh shell on the active machine | Correctly blocked only on 4 unreviewed applicant facts; artifact transport passes without a legacy API key |
 | Publish | Targeted tests, lint, diff review, commit, and push to `SulaymanB2024/ApplyPilot` fork branch | Pending continuation verification |
 
+## 2026-07-12 second-Mac checkpoint
+
+- The active second-Mac checkout is preserved on `codex/apply-harness-stage1-hardening` at
+  `b1f266e`; it is ahead by two commits and has untracked `outputs/` and `tmp/`, so it must not be
+  pulled or switched in place.
+- The fork branch `codex/tool-first-autonomy` is confirmed at `d5604a1`. The safe update path is a
+  clean worktree under `~/Projects/CodexWork/ApplyPilot-campaign`, followed by a fresh venv and a
+  latest-code autonomy doctor.
+- Terra is the persistent Codex model label `gpt-5.6-terra`, not a separate executable. Nested
+  `codex exec` orchestration previously failed and must not own the campaign.
+- Memories maps to Codex Chronicle. Chronicle is installed but disabled on the second Mac; no
+  current recorder process or fresh capture files were observed.
+- The local v2 context pack now selects 71 confirmed facts from the current applicant data for a
+  representative query, up from 30, while the resulting discovery prompt is 7,817 characters
+  against the existing 40,000-character cap.
+
 ## Synthetic end-to-end evidence
 
 The external authenticated-browser run

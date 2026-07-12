@@ -42,17 +42,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and imported responses are digest-bound; missing responses remain pending and stale,
   swapped, or one-sided edits inconsistent with the receipt fail closed. Receipts are not
   claimed to resist a hostile local writer who can modify both files.
-- **Rich model context** - ChatGPT Web receives up to 30 confirmed, contact-free facts plus
+- **Rich model context** - ChatGPT Web receives up to 72 confirmed, contact-free facts plus
   structured work samples, results, skills, preferences, and longer verified job evidence.
-  Calls may research and deliberate without a fixed time deadline while final artifacts remain
-  strict, bounded JSON.
+  The v2 context pack now carries up to 72 confirmed facts into discovery, reorders the complete
+  bounded evidence set for each verified role, and still excludes contact details, demographics,
+  secrets, unknowns, and rejected claims. Calls may research and deliberate without a fixed time
+  deadline while final artifacts remain strict, bounded JSON.
 - **Handoff and evidence hardening** - Dynamic query/job inputs now bind request receipts,
   semantically rejected material can be corrected after quarantine, fact approvals bind source
   hashes, shared ATS tenants bind to employers, and form-review success rejects unrelated URLs,
   challenges, logins, account creation, unknown fields, and field-value aliases.
-- **Structured applicant claims** - Material prompt schema v2 separates applicant assertions
+- **Structured applicant claims** - Material prompt schema v3 separates applicant assertions
   from job evidence. Every first-person or possessive assertion must exactly match a structured
-  claim supported by applicant facts; `JOB` evidence cannot establish an applicant skill.
+  claim supported by applicant facts; `JOB` evidence cannot establish an applicant skill. Final
+  letters are rejected above four paragraphs, 450 words, or 20 structured applicant claims.
 - **Autonomy-aware doctor** - `doctor --autonomy` validates artifact transport and the required
   contact, work-authorization, sponsorship, and availability facts without requiring a legacy
   model API key; optional corrections use `--autonomy-corrections`.
@@ -65,7 +68,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Dry-run apply semantics** - `applypilot apply --dry-run` records dry-run verification
   confidence without marking the job applied.
 - **Codex resolver compatibility** - Field fallback execution now uses the current
-  `codex exec` flag surface without the removed approval flag.
+  `codex exec` flag surface without the removed approval flag, has no default model deadline,
+  and receives only the exact confirmed fact-ledger subset rather than an unchecked raw profile.
 
 ## [0.2.0] - 2026-02-17
 

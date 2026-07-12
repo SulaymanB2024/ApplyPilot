@@ -24,6 +24,7 @@ from applypilot.apply.field_resolver import (
     ResolvedField,
     detect_ats,
     field_value_for,
+    model_field_profile_from_ledger,
     needs_llm_fallback,
     split_name,
 )
@@ -128,6 +129,11 @@ class DeterministicApplyController:
         self.settings = settings
         self.dry_run = dry_run
         self.fact_ledger = fact_ledger
+        self._model_profile = (
+            model_field_profile_from_ledger(fact_ledger)
+            if fact_ledger is not None
+            else None
+        )
         self.authorization_manifest = authorization_manifest
         self.profile = config.load_profile()
         self.events: list[str] = []
@@ -175,6 +181,8 @@ class DeterministicApplyController:
             )
 
     def _preflight(self) -> None:
+        if self._resolver is not None and self.fact_ledger is None:
+            raise RuntimeError("approved_fact_ledger_required_for_model_fallback")
         if not self.dry_run:
             if self.fact_ledger is None:
                 raise RuntimeError("approved_fact_ledger_required")
@@ -480,7 +488,7 @@ class DeterministicApplyController:
             if fallback_specs and self._resolver is not None:
                 fallback = self._resolver.resolve_fields(
                     fallback_specs,
-                    profile=self.profile,
+                    profile=self._model_profile or {},
                     job=self.job,
                 )
 

@@ -5,9 +5,11 @@ from applypilot.apply.field_resolver import (
     CodexResolver,
     FieldSpec,
     field_value_for,
+    model_field_profile_from_ledger,
     needs_llm_fallback,
     validate_resolved_value,
 )
+from applypilot.autonomy.facts import FactCorrection, FactState, build_fact_ledger
 
 
 PROFILE = {
@@ -171,6 +173,7 @@ def test_codex_resolver_uses_current_exec_flags(monkeypatch, tmp_path):
 
     def fake_run(cmd, input, capture_output, text, timeout):
         assert "--ask-for-approval" not in cmd
+        assert timeout is None
         output_path = tmp_path / "unused.json"
         if "--output-last-message" in cmd:
             output_path = tmp_path / cmd[cmd.index("--output-last-message") + 1].split("/")[-1]
@@ -215,6 +218,7 @@ def test_codex_resolver_batches_required_fields_into_one_call(monkeypatch, tmp_p
 
     def fake_run(cmd, input, capture_output, text, timeout):
         calls.append(cmd)
+        assert timeout is None
         prompt = json.loads(input)
         assert len(prompt["fields"]) == 8
         output_path = tmp_path / cmd[cmd.index("--output-last-message") + 1].split("/")[-1]
@@ -247,6 +251,33 @@ def test_codex_resolver_batches_required_fields_into_one_call(monkeypatch, tmp_p
     assert len(resolved) == 8
     assert resolved["#question-7"].value == "Test Candidate"
     assert resolver.calls == 1
+
+
+def test_model_field_profile_uses_only_confirmed_ledger_facts():
+    profile = {
+        **PROFILE,
+        "personal": {**PROFILE["personal"], "phone": "unknown"},
+        "compensation": {"salary_expectation": "120000"},
+    }
+    ledger = build_fact_ledger(
+        profile,
+        resume_text="Test Candidate",
+        corrections=(
+            FactCorrection(
+                fact_id="profile.compensation.salary_expectation",
+                match="120000",
+                state=FactState.REJECTED,
+                reason="applicant rejected stale salary expectation",
+            ),
+        ),
+    )
+
+    model_profile = model_field_profile_from_ledger(ledger)
+    serialized = json.dumps(model_profile)
+
+    assert "unknown" not in serialized
+    assert "120000" not in serialized
+    assert model_profile["personal"]["email"] == PROFILE["personal"]["email"]
 
 
 def test_codex_resolver_rejects_value_not_derived_from_cited_fact(monkeypatch, tmp_path):

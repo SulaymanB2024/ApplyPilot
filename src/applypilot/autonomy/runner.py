@@ -14,6 +14,7 @@ from applypilot import config
 from applypilot.autonomy.batch import AutonomousBatch, BatchDependencies
 from applypilot.autonomy.chatgpt_web import ChatGPTWebClient
 from applypilot.autonomy.context import (
+    CONTEXT_VERSION,
     CompactContextPack,
     build_context_pack,
     build_discovery_prompt,
@@ -355,7 +356,7 @@ def _verify_immutable_artifacts(run_dir: Path, manifest: dict[str, Any]) -> None
 def _context_from_dict(payload: dict[str, Any]) -> CompactContextPack:
     evidence = payload.get("evidence")
     profile = payload.get("profile")
-    if payload.get("version") != "applypilot-context-v1":
+    if payload.get("version") != CONTEXT_VERSION:
         raise ValueError("unsupported context pack version")
     if not isinstance(profile, dict) or not isinstance(evidence, list):
         raise ValueError("context pack has invalid profile or evidence")

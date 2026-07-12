@@ -58,6 +58,9 @@ DISALLOWED_DISCOVERY_HOSTS = (
     "ziprecruiter.com",
     "google.com",
 )
+MAX_MATERIAL_PARAGRAPHS = 4
+MAX_MATERIAL_WORDS = 450
+MAX_MATERIAL_CLAIMS = 20
 
 
 class ChatGPTWebUnavailable(RuntimeError):
@@ -288,11 +291,14 @@ def material_packet_from_payload(
     raw_paragraphs = payload.get("paragraphs")
     if not isinstance(raw_paragraphs, list):
         raise ChatGPTContractError("material packet paragraphs must be a list")
+    if len(raw_paragraphs) > MAX_MATERIAL_PARAGRAPHS:
+        raise ChatGPTContractError("material packet exceeds paragraph limit")
     raw_gaps = payload.get("verification_gaps") or []
     if not isinstance(raw_gaps, list):
         raise ChatGPTContractError("material verification_gaps must be a list")
     allowed_ids = {item["id"] for item in pack.evidence} | {"JOB"}
     paragraphs: list[MaterialParagraph] = []
+    claim_count = 0
     for raw in raw_paragraphs:
         if not isinstance(raw, dict):
             raise ChatGPTContractError("material paragraph entries must be objects")
@@ -309,6 +315,9 @@ def material_packet_from_payload(
         raw_claims = raw.get("applicant_claims")
         if not isinstance(raw_claims, list):
             raise ChatGPTContractError("material applicant_claims must be a list")
+        claim_count += len(raw_claims)
+        if claim_count > MAX_MATERIAL_CLAIMS:
+            raise ChatGPTContractError("material packet exceeds applicant claim limit")
         applicant_claims: list[ApplicantClaim] = []
         for raw_claim in raw_claims:
             if not isinstance(raw_claim, dict):
@@ -345,6 +354,8 @@ def material_packet_from_payload(
         )
     if not paragraphs:
         raise ChatGPTContractError("material packet has no supported paragraphs")
+    if sum(len(paragraph.text.split()) for paragraph in paragraphs) > MAX_MATERIAL_WORDS:
+        raise ChatGPTContractError("material packet exceeds word limit")
     packet = MaterialPacket(
         candidate_id=candidate.candidate_id,
         paragraphs=tuple(paragraphs),
