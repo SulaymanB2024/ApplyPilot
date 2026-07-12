@@ -45,7 +45,7 @@ applypilot autonomy import-fact-approval --run-dir RUN_DIR --approved-fact-diges
 applypilot campaign create --run-dir RUN_DIR --approved-fact-digest DIGEST \
   --campaign-id campaign-100 --submit
 applypilot campaign heartbeat --campaign-dir CAMPAIGN_DIR  # bounded five-minute progress artifact
-applypilot doctor --autonomy --strict --json  # artifact transport + required fact readiness
+applypilot doctor --autonomy --strict --json  # artifacts + facts + system approval trust readiness
 applypilot autonomy probe-chatgpt --cdp-port 9222 --allow-legacy-cdp  # explicit legacy diagnostic only
 applypilot apply --url URL --approved-fact-digest DIGEST  # dry-run; writes one-time submit manifest
 applypilot apply --url URL --submit --approved-fact-digest DIGEST --authorization-manifest PATH

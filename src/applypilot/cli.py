@@ -1180,6 +1180,7 @@ def doctor(
                 from applypilot.autonomy.facts import (
                     REQUIRED_AUTONOMY_FACT_IDS,
                     build_fact_ledger,
+                    confirmed_preferred_location_fact_ids,
                     load_corrections,
                     require_confirmed_facts,
                 )
@@ -1199,6 +1200,7 @@ def doctor(
                     fact_ledger,
                     REQUIRED_AUTONOMY_FACT_IDS,
                 )
+                location_fact_ids = confirmed_preferred_location_fact_ids(fact_ledger)
             except Exception as exc:
                 results.append((
                     "Autonomy facts",
@@ -1213,6 +1215,24 @@ def doctor(
                     if fact_blockers
                     else "required contact, work authorization, sponsorship, and availability confirmed",
                 ))
+                results.append((
+                    "Autonomy preferred locations",
+                    ok_mark if location_fact_ids else fail_mark,
+                    f"{len(location_fact_ids)} confirmed location fact(s)"
+                    if location_fact_ids
+                    else "add at least one confirmed preferred location before live approval",
+                ))
+        try:
+            from applypilot.autonomy.approval import (
+                FactApprovalError,
+                require_system_approval_trust_store,
+            )
+
+            trust_store = require_system_approval_trust_store()
+        except FactApprovalError as exc:
+            results.append(("System approval trust store", fail_mark, str(exc)))
+        else:
+            results.append(("System approval trust store", ok_mark, str(trust_store)))
         if chatgpt_cdp_port is not None:
             try:
                 from applypilot.autonomy.runner import probe_chatgpt_cdp
