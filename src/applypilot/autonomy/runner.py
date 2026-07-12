@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import secrets
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
@@ -46,6 +47,7 @@ from applypilot.autonomy.telemetry import UsageLedger
 
 
 RUN_STATUS_SCHEMA_VERSION = "applypilot-autonomy-status-v1"
+RUN_COMPACT_STATUS_SCHEMA_VERSION = "applypilot-autonomy-supervisor-v1"
 RUN_HEARTBEAT_SCHEMA_VERSION = "applypilot-autonomy-heartbeat-v1"
 RUN_HEARTBEAT_NAME = "heartbeat.json"
 RUN_HEARTBEAT_INTERVAL_SECONDS = 300
@@ -80,6 +82,7 @@ RUN_PENDING_FIELDS = frozenset(
 ACCEPTED_FORM_REVIEW_STATUSES = frozenset(
     {"form_surface_reviewed", "dry_run_verified"}
 )
+RUN_DIRECTORY_PATTERN = re.compile(r"^\d{8}T\d{12}Z-[0-9a-f]{10}$")
 
 
 def prepare_run(
@@ -151,6 +154,58 @@ def prepare_run(
     _write_json(Path(paths["manifest"]), manifest)
     paths["request"] = str(request_path)
     return paths
+
+
+def latest_autonomy_run_dir(*, root: Path | None = None) -> Path:
+    """Resolve the newest immediate run without falling back past corrupt state."""
+    candidate_root = (root or config.APP_DIR / "autonomy-runs").expanduser()
+    if candidate_root.is_symlink():
+        raise ValueError("autonomy run root must not be a symlink")
+    try:
+        resolved_root = candidate_root.resolve(strict=True)
+    except OSError as exc:
+        raise FileNotFoundError("autonomy run root does not exist") from exc
+    if not resolved_root.is_dir():
+        raise NotADirectoryError("autonomy run root is not a directory")
+
+    candidates = sorted(
+        (
+            entry
+            for entry in resolved_root.iterdir()
+            if RUN_DIRECTORY_PATTERN.fullmatch(entry.name)
+        ),
+        key=lambda entry: entry.name,
+        reverse=True,
+    )
+    if not candidates:
+        raise FileNotFoundError("no autonomy runs exist")
+    selected = candidates[0]
+    selected_stamp = selected.name.split("-", 1)[0]
+    if len(candidates) > 1 and candidates[1].name.split("-", 1)[0] == selected_stamp:
+        raise ValueError("newest autonomy run timestamp is ambiguous; use --run-dir")
+    if selected.is_symlink():
+        raise ValueError(f"autonomy run directory must not be a symlink: {selected.name}")
+    if not selected.is_dir():
+        raise ValueError(f"autonomy run path is not a directory: {selected.name}")
+    resolved_run = selected.resolve(strict=True)
+    if resolved_run.parent != resolved_root:
+        raise ValueError("autonomy run directory escaped its configured root")
+    manifest_path = resolved_run / "run_manifest.json"
+    if manifest_path.is_symlink() or not manifest_path.is_file():
+        raise ValueError(f"autonomy run is incomplete: {selected.name}")
+    manifest = _read_json(manifest_path)
+    bindings = RunBindings.from_manifest(manifest)
+    if bindings.run_id != selected.name:
+        raise ValueError("autonomy run directory differs from its manifest run id")
+    created_at = _parse_aware_datetime(
+        str(manifest.get("created_at") or ""),
+        field="autonomy run creation timestamp",
+    )
+    if str(manifest.get("created_at") or "") != created_at.isoformat():
+        raise ValueError("autonomy run creation timestamp must use canonical UTC")
+    if created_at > datetime.now(timezone.utc):
+        raise ValueError("autonomy run creation timestamp is in the future")
+    return resolved_run
 
 
 def run_status_snapshot(
@@ -244,12 +299,55 @@ def run_status_snapshot(
     else:
         review_phase = "ready_to_advance"
 
-    last_heartbeat_at = _read_run_heartbeat_at(
+    next_action_owner, next_action_code, browser_required = _supervisor_decision(
+        live_gate=live_gate,
+        review_phase=review_phase,
+    )
+    progress_fingerprint = _sha256_text(
+        _canonical_json(
+            {
+                "run_id": bindings.run_id,
+                "review_phase": review_phase,
+                "live_gate": live_gate,
+                "submitted_confirmed": 0,
+                "fact_states": state_counts,
+                "required_fact_blockers": required_fact_blockers,
+                "preferred_location_fact_count": len(location_fact_ids),
+                "system_approval_trust_store_ready": trust_store_ready,
+                "fact_approval_state": approval_state,
+                "handoff": handoff,
+                "result": result,
+                "next_action_owner": next_action_owner,
+                "next_action_code": next_action_code,
+                "browser_required": browser_required,
+            }
+        )
+    )
+
+    heartbeat_record = _read_run_heartbeat(
         run_dir=run_dir,
         run_id=bindings.run_id,
         current=current,
         run_created_at=run_created_at,
     )
+    last_heartbeat_at = heartbeat_record[0] if heartbeat_record is not None else None
+    previous_status = heartbeat_record[1] if heartbeat_record is not None else {}
+    state_changed = previous_status.get("progress_fingerprint") != progress_fingerprint
+    if state_changed:
+        last_progress_at = current
+    else:
+        last_progress_raw = str(previous_status.get("last_progress_at") or "")
+        last_progress_at = _parse_aware_datetime(
+            last_progress_raw,
+            field="autonomy last-progress timestamp",
+        )
+        if last_progress_raw != last_progress_at.isoformat():
+            raise ValueError("autonomy last-progress timestamp must use canonical UTC")
+        if last_progress_at < run_created_at or (
+            last_heartbeat_at is not None and last_progress_at > last_heartbeat_at
+        ):
+            raise ValueError("autonomy last-progress timestamp is outside its run")
+    progress_age_seconds = max(0, int((current - last_progress_at).total_seconds()))
     heartbeat_due = True
     if last_heartbeat_at is not None:
         heartbeat_due = current >= last_heartbeat_at + timedelta(
@@ -263,6 +361,13 @@ def run_status_snapshot(
         "run_created_at": run_created_at.isoformat(),
         "review_phase": review_phase,
         "live_gate": live_gate,
+        "next_action_owner": next_action_owner,
+        "next_action_code": next_action_code,
+        "browser_required": browser_required,
+        "progress_fingerprint": progress_fingerprint,
+        "state_changed": state_changed,
+        "last_progress_at": last_progress_at.isoformat(),
+        "progress_age_seconds": progress_age_seconds,
         "target_confirmed": 100,
         "submitted_confirmed": 0,
         "fact_states": state_counts,
@@ -280,6 +385,34 @@ def run_status_snapshot(
         else None,
         "heartbeat_due": heartbeat_due,
         "external_side_effects": "none_from_status_tool",
+    }
+
+
+def compact_run_status(status: dict[str, Any]) -> dict[str, Any]:
+    """Return the bounded decision/liveness view for five-minute supervisors."""
+    if status.get("schema_version") != RUN_STATUS_SCHEMA_VERSION:
+        raise ValueError("autonomy status schema is invalid")
+    fields = (
+        "run_id",
+        "recorded_at",
+        "target_confirmed",
+        "submitted_confirmed",
+        "next_action_owner",
+        "next_action_code",
+        "browser_required",
+        "progress_fingerprint",
+        "state_changed",
+        "last_progress_at",
+        "progress_age_seconds",
+        "last_heartbeat_at",
+        "heartbeat_due",
+    )
+    if any(field not in status for field in fields):
+        raise ValueError("autonomy status is missing compact supervisor fields")
+    return {
+        "schema_version": RUN_COMPACT_STATUS_SCHEMA_VERSION,
+        **{field: status[field] for field in fields},
+        "state_trust": "local_diagnostic_not_submission_evidence",
     }
 
 
@@ -863,13 +996,64 @@ def _validate_result_pending_request(pending: dict[str, Any]) -> None:
         raise ValueError("result ledger pending request surface or kind is invalid")
 
 
-def _read_run_heartbeat_at(
+def _supervisor_decision(*, live_gate: str, review_phase: str) -> tuple[str, str, bool]:
+    gate_decisions = {
+        "required_facts": ("applicant", "review_required_facts", False),
+        "preferred_location": ("applicant", "confirm_preferred_location", False),
+        "system_approval_trust_store": (
+            "system_admin",
+            "install_approval_trust_store",
+            False,
+        ),
+        "signed_fact_approval": ("applicant", "sign_fact_approval", False),
+    }
+    if live_gate in gate_decisions:
+        return gate_decisions[live_gate]
+    phase_decisions = {
+        "reported_budget_exhausted": ("none", "budget_exhausted", False),
+        "response_ready_to_advance": ("controller", "advance_imported_response", False),
+        "awaiting_role_candidates": (
+            "browser_connector",
+            "provide_chatgpt_web_role_candidates",
+            True,
+        ),
+        "awaiting_material_packet": (
+            "browser_connector",
+            "provide_chatgpt_web_material_packet",
+            True,
+        ),
+        "awaiting_form_review": (
+            "browser_connector",
+            "perform_read_only_form_review",
+            True,
+        ),
+        "reported_review_ready": ("applicant", "review_candidate_packet", False),
+        "reported_form_review_blocked": (
+            "controller",
+            "inspect_form_review_blocker",
+            False,
+        ),
+        "reported_no_eligible_verified_roles": (
+            "controller",
+            "plan_next_bounded_run",
+            False,
+        ),
+        "reported_failed_closed": ("controller", "inspect_failed_closed", False),
+        "ready_to_advance": ("controller", "advance_run", False),
+    }
+    return phase_decisions.get(
+        review_phase,
+        ("controller", "inspect_supervisor_status", False),
+    )
+
+
+def _read_run_heartbeat(
     *,
     run_dir: Path,
     run_id: str,
     current: datetime,
     run_created_at: datetime,
-) -> datetime | None:
+) -> tuple[datetime, dict[str, Any]] | None:
     path = run_dir / RUN_HEARTBEAT_NAME
     if not path.exists():
         return None
@@ -909,7 +1093,22 @@ def _read_run_heartbeat_at(
         raise ValueError("autonomy heartbeat timestamp predates its run")
     if parsed > current:
         raise ValueError("autonomy heartbeat timestamp is in the future")
-    return parsed
+    progress_fingerprint = status.get("progress_fingerprint")
+    last_progress_raw = status.get("last_progress_at")
+    if (progress_fingerprint is None) != (last_progress_raw is None):
+        raise ValueError("autonomy heartbeat progress fields are incomplete")
+    if progress_fingerprint is not None:
+        if not re.fullmatch(r"[0-9a-f]{64}", str(progress_fingerprint)):
+            raise ValueError("autonomy heartbeat progress fingerprint is invalid")
+        last_progress_at = _parse_aware_datetime(
+            str(last_progress_raw),
+            field="autonomy last-progress timestamp",
+        )
+        if str(last_progress_raw) != last_progress_at.isoformat():
+            raise ValueError("autonomy last-progress timestamp must use canonical UTC")
+        if last_progress_at < run_created_at or last_progress_at > parsed:
+            raise ValueError("autonomy last-progress timestamp is outside its heartbeat")
+    return parsed, status
 
 
 def _validate_discovery_request(

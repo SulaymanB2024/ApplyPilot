@@ -82,6 +82,7 @@ from applypilot.autonomy.policy import (
 from applypilot.autonomy.telemetry import BudgetExceeded, UsageLedger
 from applypilot.autonomy.runner import (
     advance_artifact_run,
+    latest_autonomy_run_dir,
     record_run_heartbeat,
     require_approved_fact_digest,
     run_status_snapshot,
@@ -1901,6 +1902,13 @@ def test_pre_campaign_status_and_heartbeat_are_fixed_name_and_redacted(
     assert status["target_confirmed"] == 100
     assert status["preferred_location_fact_count"] == 0
     assert status["heartbeat_due"] is True
+    assert status["next_action_owner"] == "applicant"
+    assert status["next_action_code"] == "confirm_preferred_location"
+    assert status["browser_required"] is False
+    assert status["state_changed"] is True
+    assert status["last_progress_at"] == now.isoformat()
+    assert status["progress_age_seconds"] == 0
+    assert len(status["progress_fingerprint"]) == 64
     serialized = json.dumps(status, sort_keys=True)
     for private in (
         "candidate@example.com",
@@ -1915,14 +1923,45 @@ def test_pre_campaign_status_and_heartbeat_are_fixed_name_and_redacted(
     heartbeat_path = run_dir / "heartbeat.json"
     first_text = heartbeat_path.read_text(encoding="utf-8")
     assert recorded["heartbeat_due"] is False
-    assert run_status_snapshot(
+    legacy_heartbeat = json.loads(first_text)
+    for field in (
+        "next_action_owner",
+        "next_action_code",
+        "browser_required",
+        "progress_fingerprint",
+        "state_changed",
+        "last_progress_at",
+        "progress_age_seconds",
+    ):
+        legacy_heartbeat["status"].pop(field)
+    legacy_heartbeat["status_sha256"] = hashlib.sha256(
+        json.dumps(
+            legacy_heartbeat["status"],
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    heartbeat_path.write_text(json.dumps(legacy_heartbeat), encoding="utf-8")
+    migrated = run_status_snapshot(run_dir=run_dir, now=now + timedelta(seconds=1))
+    assert migrated["state_changed"] is True
+    heartbeat_path.write_text(first_text, encoding="utf-8")
+    unchanged = run_status_snapshot(
         run_dir=run_dir,
         now=now + timedelta(seconds=299),
-    )["heartbeat_due"] is False
-    assert run_status_snapshot(
+    )
+    assert unchanged["heartbeat_due"] is False
+    assert unchanged["state_changed"] is False
+    assert unchanged["progress_fingerprint"] == recorded["progress_fingerprint"]
+    assert unchanged["last_progress_at"] == now.isoformat()
+    assert unchanged["progress_age_seconds"] == 299
+    due = run_status_snapshot(
         run_dir=run_dir,
         now=now + timedelta(seconds=300),
-    )["heartbeat_due"] is True
+    )
+    assert due["heartbeat_due"] is True
+    assert due["state_changed"] is False
+    assert due["progress_age_seconds"] == 300
 
     record_run_heartbeat(run_dir=run_dir, now=now + timedelta(microseconds=1))
     second_text = heartbeat_path.read_text(encoding="utf-8")
@@ -1937,6 +1976,15 @@ def test_pre_campaign_status_and_heartbeat_are_fixed_name_and_redacted(
     assert cli_status.exit_code == 0, cli_status.output
     assert '"submitted_confirmed": 0' in cli_status.output
     assert "candidate@example.com" not in cli_status.output
+    cli_compact = CLI_RUNNER.invoke(
+        app,
+        ["autonomy", "status", "--run-dir", str(run_dir), "--compact"],
+    )
+    assert cli_compact.exit_code == 0, cli_compact.output
+    assert len(cli_compact.output) < 1_200
+    assert '"next_action_code": "confirm_preferred_location"' in cli_compact.output
+    for omitted in ("fact_states", "handoff", "result", "candidate@example.com"):
+        assert omitted not in cli_compact.output
     cli_heartbeat = CLI_RUNNER.invoke(
         app,
         ["autonomy", "heartbeat", "--run-dir", str(run_dir)],
@@ -2091,6 +2139,123 @@ def test_pre_campaign_status_and_heartbeat_are_fixed_name_and_redacted(
         run_status_snapshot(run_dir=run_dir, now=attack_now)
 
 
+def test_latest_run_selector_is_deterministic_and_fails_closed(monkeypatch, tmp_path):
+    from applypilot.autonomy import approval
+
+    app_dir = tmp_path / "app-data"
+    app_dir.mkdir()
+    profile_path = app_dir / "profile.json"
+    resume_path = app_dir / "resume.txt"
+    profile_path.write_text(json.dumps(PROFILE), encoding="utf-8")
+    resume_path.write_text(
+        "Test Candidate | candidate@example.com | 555-0100\n"
+        "Built Python and SQL product analytics tools.\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(config, "APP_DIR", app_dir)
+    monkeypatch.setattr(config, "PROFILE_PATH", profile_path)
+    monkeypatch.setattr(config, "RESUME_PATH", resume_path)
+    monkeypatch.setattr(config, "ENV_PATH", app_dir / ".env")
+    monkeypatch.setattr(
+        approval,
+        "require_system_approval_trust_store",
+        lambda: tmp_path / "allowed_signers",
+    )
+
+    for query in ("older private query", "newer private query"):
+        planned = CLI_RUNNER.invoke(
+            app,
+            ["autonomy", "plan", "--query", query],
+        )
+        assert planned.exit_code == 0, planned.output
+
+    run_root = app_dir / "autonomy-runs"
+    run_dirs = sorted(path for path in run_root.iterdir() if path.is_dir())
+    assert len(run_dirs) == 2
+    expected_latest = max(run_dirs, key=lambda path: path.name)
+    assert latest_autonomy_run_dir() == expected_latest
+
+    ignored_noise = run_root / "operator-notes"
+    ignored_noise.mkdir()
+    old_incomplete = run_root / "20000101T000000000000Z-0000000000"
+    old_incomplete.mkdir()
+    older_valid = next(run_dir for run_dir in run_dirs if run_dir != expected_latest)
+    os.utime(older_valid, (4_102_444_800, 4_102_444_800))
+    assert latest_autonomy_run_dir() == expected_latest
+
+    status = CLI_RUNNER.invoke(app, ["autonomy", "status", "--latest"])
+    assert status.exit_code == 0, status.output
+    assert expected_latest.name in status.output
+    assert "newer private query" not in status.output
+    assert str(expected_latest) not in status.output
+    compact = CLI_RUNNER.invoke(app, ["autonomy", "status", "--latest", "--compact"])
+    assert compact.exit_code == 0, compact.output
+    assert len(compact.output) < 1_200
+    assert '"next_action_owner": "applicant"' in compact.output
+    assert "fact_states" not in compact.output
+    heartbeat = CLI_RUNNER.invoke(
+        app,
+        ["autonomy", "heartbeat", "--latest", "--compact"],
+    )
+    assert heartbeat.exit_code == 0, heartbeat.output
+    assert len(heartbeat.output) < 1_200
+    assert '"heartbeat_due": false' in heartbeat.output
+    assert (expected_latest / "heartbeat.json").is_file()
+    assert all(
+        not (run_dir / "heartbeat.json").exists()
+        for run_dir in run_dirs
+        if run_dir != expected_latest
+    )
+
+    missing_selector = CLI_RUNNER.invoke(app, ["autonomy", "status"])
+    assert missing_selector.exit_code == 1
+    assert "use exactly one of --run-dir or --latest" in missing_selector.output
+    conflicting_selector = CLI_RUNNER.invoke(
+        app,
+        ["autonomy", "heartbeat", "--latest", "--run-dir", str(expected_latest)],
+    )
+    assert conflicting_selector.exit_code == 1
+    assert "use exactly one of --run-dir or --latest" in conflicting_selector.output
+
+    latest_stamp, latest_digest = expected_latest.name.split("-", 1)
+    alternate_digest = "f" * 10 if latest_digest != "f" * 10 else "e" * 10
+    ambiguous = run_root / f"{latest_stamp}-{alternate_digest}"
+    ambiguous.mkdir()
+    with pytest.raises(ValueError, match="timestamp is ambiguous"):
+        latest_autonomy_run_dir()
+    ambiguous.rmdir()
+
+    incomplete = run_root / "20990101T000000000000Z-aaaaaaaaaa"
+    incomplete.mkdir()
+    with pytest.raises(ValueError, match="autonomy run is incomplete"):
+        latest_autonomy_run_dir()
+    heartbeat_before_failure = (expected_latest / "heartbeat.json").read_bytes()
+    failed_latest_heartbeat = CLI_RUNNER.invoke(
+        app,
+        ["autonomy", "heartbeat", "--latest", "--compact"],
+    )
+    assert failed_latest_heartbeat.exit_code == 1
+    assert (expected_latest / "heartbeat.json").read_bytes() == heartbeat_before_failure
+    incomplete.rmdir()
+
+    symlinked = run_root / "20990101T000000000001Z-bbbbbbbbbb"
+    symlinked.symlink_to(expected_latest, target_is_directory=True)
+    with pytest.raises(ValueError, match="must not be a symlink"):
+        latest_autonomy_run_dir()
+    symlinked.unlink()
+
+    malformed = run_root / "20990101T000000000002Z-cccccccccc"
+    malformed.mkdir()
+    (malformed / "run_manifest.json").write_text("{", encoding="utf-8")
+    with pytest.raises(json.JSONDecodeError):
+        latest_autonomy_run_dir()
+
+    linked_root = tmp_path / "linked-run-root"
+    linked_root.symlink_to(run_root, target_is_directory=True)
+    with pytest.raises(ValueError, match="run root must not be a symlink"):
+        latest_autonomy_run_dir(root=linked_root)
+
+
 def test_artifact_advance_blocks_unreviewed_required_facts_before_tools(monkeypatch, tmp_path):
     app_dir = tmp_path / "app-data"
     app_dir.mkdir()
@@ -2165,6 +2330,7 @@ def test_artifact_handoff_advances_to_review_ready_without_browser(monkeypatch, 
     assert pending_status["review_phase"] == "awaiting_role_candidates"
     assert pending_status["result"]["trust"] == "validated_but_mutable_untrusted"
     assert pending_status["result"]["reported_status"] == "awaiting_chatgpt_web"
+    pending_heartbeat = record_run_heartbeat(run_dir=run_dir)
 
     discovery_request = json.loads(
         (run_dir / "handoff" / "discovery.request.json").read_text(encoding="utf-8")
@@ -2199,9 +2365,10 @@ def test_artifact_handoff_advances_to_review_ready_without_browser(monkeypatch, 
         request_path=run_dir / "handoff" / "discovery.request.json",
         input_path=discovery_input,
     )
-    assert run_status_snapshot(run_dir=run_dir)["review_phase"] == (
-        "response_ready_to_advance"
-    )
+    response_status = run_status_snapshot(run_dir=run_dir)
+    assert response_status["review_phase"] == "response_ready_to_advance"
+    assert response_status["state_changed"] is True
+    assert response_status["progress_fingerprint"] != pending_heartbeat["progress_fingerprint"]
 
     awaiting_material = advance_artifact_run(
         run_dir=run_dir,
