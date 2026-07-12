@@ -40,6 +40,11 @@ from applypilot.autonomy.policy import FunnelBudget, RunPolicy, SourcePolicy
 from applypilot.autonomy.telemetry import UsageLedger
 
 
+FACT_APPROVAL_RECEIPT_SCHEMA = "applypilot.fact_approval_receipt.v1"
+FACT_APPROVAL_RECEIPT_NAME = "fact_approval_receipt.json"
+GMAIL_COORDINATION_THREAD_ID = "19f4d5dbd61b6bb9"
+
+
 def prepare_run(
     *,
     query: str,
@@ -110,7 +115,7 @@ def prepare_run(
 def advance_artifact_run(
     *,
     run_dir: Path,
-    approved_fact_digest: str,
+    approval_receipt: Path,
     verifier: Any | None = None,
 ) -> dict[str, Any]:
     """Advance one reviewed run using portable ChatGPT Web artifacts."""
@@ -120,7 +125,12 @@ def advance_artifact_run(
     _verify_immutable_artifacts(run_dir, manifest)
 
     fact_ledger = fact_ledger_from_dict(_read_json(run_dir / "fact_ledger.json"))
-    require_approved_fact_digest(fact_ledger.digest, approved_fact_digest)
+    require_fact_approval_receipt(
+        receipt_path=approval_receipt,
+        run_dir=run_dir,
+        run_id=bindings.run_id,
+        fact_digest=fact_ledger.digest,
+    )
     _require_autonomy_ready_facts(fact_ledger)
     if fact_ledger.digest != bindings.fact_digest:
         raise ValueError("run manifest fact digest mismatch")
@@ -172,6 +182,78 @@ def advance_artifact_run(
         fact_ledger=fact_ledger,
     ).run(query=str(manifest.get("query") or ""))
     return result.to_dict()
+
+
+def write_fact_approval_receipt(
+    *,
+    run_dir: Path,
+    source_message_id: str,
+    source_thread_id: str = GMAIL_COORDINATION_THREAD_ID,
+) -> Path:
+    """Record human-reviewed Gmail gate approval without storing personal values."""
+    run_dir = run_dir.resolve()
+    manifest = _read_json(run_dir / "run_manifest.json")
+    fact_digest = str(manifest.get("fact_digest") or "")
+    run_id = str(manifest.get("run_id") or "")
+    if not fact_digest or not run_id:
+        raise ValueError("run manifest lacks approval bindings")
+    if source_thread_id != GMAIL_COORDINATION_THREAD_ID:
+        raise PermissionError("approval receipt must reference the coordination Gmail thread")
+    if not source_message_id.strip():
+        raise ValueError("approval receipt requires the applicant Gmail message id")
+    receipt_path = run_dir / FACT_APPROVAL_RECEIPT_NAME
+    if receipt_path.exists():
+        raise FileExistsError("fact approval receipt already exists for this run")
+    _write_json(
+        receipt_path,
+        {
+            "schema_version": FACT_APPROVAL_RECEIPT_SCHEMA,
+            "run_id": run_id,
+            "fact_digest": fact_digest,
+            "source": "gmail_thread",
+            "source_thread_id": source_thread_id,
+            "source_message_id": source_message_id.strip(),
+            "approved_at": datetime.now(timezone.utc).isoformat(),
+            "gate_checks": {
+                "approved_phone": True,
+                "location_preference": True,
+                "availability": True,
+                "visible_dry_run_authorization": True,
+            },
+        },
+    )
+    return receipt_path
+
+
+def require_fact_approval_receipt(
+    *,
+    receipt_path: Path,
+    run_dir: Path,
+    run_id: str,
+    fact_digest: str,
+) -> None:
+    """Fail closed unless a current run has a complete, redacted approval receipt."""
+    expected_path = run_dir / FACT_APPROVAL_RECEIPT_NAME
+    if receipt_path.resolve() != expected_path.resolve():
+        raise PermissionError("fact approval receipt must be stored in the reviewed run directory")
+    payload = _read_json(expected_path)
+    if payload.get("schema_version") != FACT_APPROVAL_RECEIPT_SCHEMA:
+        raise PermissionError("unsupported fact approval receipt schema")
+    if payload.get("run_id") != run_id or payload.get("fact_digest") != fact_digest:
+        raise PermissionError("fact approval receipt does not bind this reviewed run")
+    if payload.get("source") != "gmail_thread" or payload.get("source_thread_id") != GMAIL_COORDINATION_THREAD_ID:
+        raise PermissionError("fact approval receipt lacks the required Gmail coordination source")
+    if not isinstance(payload.get("source_message_id"), str) or not payload["source_message_id"].strip():
+        raise PermissionError("fact approval receipt lacks an applicant Gmail message id")
+    checks = payload.get("gate_checks")
+    required_checks = {
+        "approved_phone",
+        "location_preference",
+        "availability",
+        "visible_dry_run_authorization",
+    }
+    if not isinstance(checks, dict) or any(checks.get(key) is not True for key in required_checks):
+        raise PermissionError("fact approval receipt does not resolve the four-choice gate")
 
 
 def run_with_cdp(

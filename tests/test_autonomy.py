@@ -81,6 +81,7 @@ from applypilot.autonomy.telemetry import BudgetExceeded, UsageLedger
 from applypilot.autonomy.runner import (
     advance_artifact_run,
     require_approved_fact_digest,
+    write_fact_approval_receipt,
 )
 from applypilot.cli import app
 
@@ -1818,7 +1819,10 @@ def test_artifact_advance_blocks_unreviewed_required_facts_before_tools(monkeypa
     )
     assert planned.exit_code == 0, planned.output
     run_dir = next(path for path in out.iterdir() if path.is_dir())
-    facts = json.loads((run_dir / "fact_ledger.json").read_text(encoding="utf-8"))
+    approval_receipt = write_fact_approval_receipt(
+        run_dir=run_dir,
+        source_message_id="synthetic-approved-gmail-message",
+    )
 
     class MustNotVerify:
         @staticmethod
@@ -1828,8 +1832,42 @@ def test_artifact_advance_blocks_unreviewed_required_facts_before_tools(monkeypa
     with pytest.raises(PermissionError, match="require_sponsorship"):
         advance_artifact_run(
             run_dir=run_dir,
-            approved_fact_digest=facts["digest"],
+            approval_receipt=approval_receipt,
             verifier=MustNotVerify(),
+        )
+
+
+def test_artifact_advance_rejects_incomplete_fact_approval_receipt(monkeypatch, tmp_path):
+    app_dir = tmp_path / "app-data"
+    app_dir.mkdir()
+    profile_path = app_dir / "profile.json"
+    resume_path = app_dir / "resume.txt"
+    profile_path.write_text(json.dumps(PROFILE), encoding="utf-8")
+    resume_path.write_text("Built Python product analytics tools.", encoding="utf-8")
+    monkeypatch.setattr(config, "APP_DIR", app_dir)
+    monkeypatch.setattr(config, "PROFILE_PATH", profile_path)
+    monkeypatch.setattr(config, "RESUME_PATH", resume_path)
+    monkeypatch.setattr(config, "ENV_PATH", app_dir / ".env")
+
+    out = tmp_path / "runs"
+    planned = CLI_RUNNER.invoke(
+        app,
+        ["autonomy", "plan", "--query", "analyst internships", "--out", str(out)],
+    )
+    assert planned.exit_code == 0, planned.output
+    run_dir = next(path for path in out.iterdir() if path.is_dir())
+    approval_receipt = write_fact_approval_receipt(
+        run_dir=run_dir,
+        source_message_id="synthetic-approved-gmail-message",
+    )
+    payload = json.loads(approval_receipt.read_text(encoding="utf-8"))
+    payload["gate_checks"]["availability"] = False
+    approval_receipt.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(PermissionError, match="four-choice gate"):
+        advance_artifact_run(
+            run_dir=run_dir,
+            approval_receipt=approval_receipt,
         )
 
 
@@ -1856,13 +1894,16 @@ def test_artifact_handoff_advances_to_review_ready_without_browser(monkeypatch, 
     )
     assert planned.exit_code == 0, planned.output
     run_dir = next(path for path in out.iterdir() if path.is_dir())
-    facts = json.loads((run_dir / "fact_ledger.json").read_text(encoding="utf-8"))
+    approval_receipt = write_fact_approval_receipt(
+        run_dir=run_dir,
+        source_message_id="synthetic-approved-gmail-message",
+    )
     candidate = role()
     verifier = FakeVerifier({candidate.candidate_id: fresh(candidate)})
 
     pending = advance_artifact_run(
         run_dir=run_dir,
-        approved_fact_digest=facts["digest"],
+        approval_receipt=approval_receipt,
         verifier=verifier,
     )
     assert pending["status"] == "awaiting_chatgpt_web", pending
@@ -1904,7 +1945,7 @@ def test_artifact_handoff_advances_to_review_ready_without_browser(monkeypatch, 
 
     awaiting_material = advance_artifact_run(
         run_dir=run_dir,
-        approved_fact_digest=facts["digest"],
+        approval_receipt=approval_receipt,
         verifier=verifier,
     )
     assert awaiting_material["status"] == "awaiting_chatgpt_web"
@@ -1941,7 +1982,7 @@ def test_artifact_handoff_advances_to_review_ready_without_browser(monkeypatch, 
 
     awaiting_form = advance_artifact_run(
         run_dir=run_dir,
-        approved_fact_digest=facts["digest"],
+        approval_receipt=approval_receipt,
         verifier=verifier,
     )
     assert awaiting_form["status"] == "awaiting_browser_tool"
@@ -1983,7 +2024,7 @@ def test_artifact_handoff_advances_to_review_ready_without_browser(monkeypatch, 
 
     complete = advance_artifact_run(
         run_dir=run_dir,
-        approved_fact_digest=facts["digest"],
+        approval_receipt=approval_receipt,
         verifier=verifier,
     )
     assert complete["status"] == "review_ready"
@@ -2002,7 +2043,7 @@ def test_artifact_handoff_advances_to_review_ready_without_browser(monkeypatch, 
     )
     resumed = advance_artifact_run(
         run_dir=run_dir,
-        approved_fact_digest=facts["digest"],
+        approval_receipt=approval_receipt,
         verifier=verifier,
     )
     assert resumed["status"] == "review_ready"
@@ -2015,7 +2056,7 @@ def test_artifact_handoff_advances_to_review_ready_without_browser(monkeypatch, 
     material_response_path.write_text(json.dumps(changed), encoding="utf-8")
     replay = advance_artifact_run(
         run_dir=run_dir,
-        approved_fact_digest=facts["digest"],
+        approval_receipt=approval_receipt,
         verifier=verifier,
     )
     assert replay["status"] == "failed_closed"

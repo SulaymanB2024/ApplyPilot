@@ -541,10 +541,10 @@ def autonomy_import_response(
 @autonomy_app.command("advance")
 def autonomy_advance(
     run_dir: Path = typer.Option(..., "--run-dir", help="Reviewed autonomy run directory."),
-    approved_fact_digest: str = typer.Option(
+    approval_receipt: Path = typer.Option(
         ...,
-        "--approved-fact-digest",
-        help="Exact digest from this run's reviewed fact_ledger.json.",
+        "--approval-receipt",
+        help="Run-local redacted receipt created from the applicant's Gmail gate approval.",
     ),
 ) -> None:
     """Advance a reviewed artifact run until the next bounded browser handoff."""
@@ -554,7 +554,7 @@ def autonomy_advance(
     try:
         result = advance_artifact_run(
             run_dir=run_dir,
-            approved_fact_digest=approved_fact_digest,
+            approval_receipt=approval_receipt,
         )
     except Exception as exc:
         console.print(f"[red]Autonomy advance failed:[/red] {type(exc).__name__}: {str(exc)[:160]}")
@@ -567,6 +567,30 @@ def autonomy_advance(
         "no_eligible_verified_roles",
     }:
         raise typer.Exit(code=1)
+
+
+@autonomy_app.command("record-fact-approval")
+def autonomy_record_fact_approval(
+    run_dir: Path = typer.Option(..., "--run-dir", help="Reviewed autonomy run directory."),
+    source_message_id: str = typer.Option(
+        ...,
+        "--source-message-id",
+        help="Applicant Gmail message ID that explicitly resolves the four-choice gate.",
+    ),
+) -> None:
+    """Write a redacted, run-bound receipt after manually reviewing the applicant's Gmail reply."""
+    _bootstrap_config_only()
+    from applypilot.autonomy.runner import write_fact_approval_receipt
+
+    try:
+        receipt = write_fact_approval_receipt(
+            run_dir=run_dir,
+            source_message_id=source_message_id,
+        )
+    except Exception as exc:
+        console.print(f"[red]Fact approval receipt failed:[/red] {type(exc).__name__}: {str(exc)[:160]}")
+        raise typer.Exit(code=1) from exc
+    console.print(f"[green]Wrote redacted fact approval receipt:[/green] {receipt}")
 
 
 @autonomy_app.command("probe-chatgpt")
