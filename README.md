@@ -35,6 +35,8 @@ applypilot run -w 4      # same but parallel (4 threads for discovery/enrichment
 applypilot training-audit  # verify Workday, email draft, Runway, and board coverage
 applypilot improve plan --scope apply --out .applypilot-dev/exp-001  # bounded self-improvement packet
 applypilot autonomy plan --query "entry-level product and data roles"  # compact local run packet
+applypilot autonomy status --run-dir RUN_DIR  # redacted immutable-run-checked pre-campaign status
+applypilot autonomy heartbeat --run-dir RUN_DIR  # fixed-name five-minute pre-campaign heartbeat
 applypilot autonomy advance --run-dir RUN_DIR --approved-fact-digest DIGEST  # emit next ChatGPT Web handoff
 applypilot autonomy import-response --request REQUEST --input RESPONSE  # bind strict JSON response
 # Repeat advance -> browser handoff -> import until review_ready (at most 3 model calls)
@@ -206,6 +208,8 @@ applypilot run --validation lenient     # Relax validation (recommended for Gemi
 applypilot run --validation strict      # Strictest validation (retries on any banned word)
 applypilot training-audit               # Audit apply-agent training coverage
 applypilot autonomy plan --query QUERY  # Write compact facts, policy, and ChatGPT request artifacts
+applypilot autonomy status --run-dir RUN_DIR
+applypilot autonomy heartbeat --run-dir RUN_DIR
 applypilot autonomy advance --run-dir RUN_DIR --approved-fact-digest DIGEST
 applypilot autonomy import-response --request REQUEST --input RESPONSE
 applypilot autonomy prepare-fact-approval --run-dir RUN_DIR --approved-fact-digest DIGEST [OPTIONS]

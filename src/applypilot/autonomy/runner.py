@@ -24,7 +24,9 @@ from applypilot.autonomy.context import (
 from applypilot.autonomy.direct_ats import DirectATSDiscovery
 from applypilot.autonomy.facts import (
     REQUIRED_AUTONOMY_FACT_IDS,
+    FactState,
     build_fact_ledger,
+    confirmed_preferred_location_fact_ids,
     fact_ledger_from_dict,
     load_corrections,
     require_confirmed_facts,
@@ -41,6 +43,43 @@ from applypilot.autonomy.handoff import (
 )
 from applypilot.autonomy.policy import FunnelBudget, RunPolicy, SourcePolicy
 from applypilot.autonomy.telemetry import UsageLedger
+
+
+RUN_STATUS_SCHEMA_VERSION = "applypilot-autonomy-status-v1"
+RUN_HEARTBEAT_SCHEMA_VERSION = "applypilot-autonomy-heartbeat-v1"
+RUN_HEARTBEAT_NAME = "heartbeat.json"
+RUN_HEARTBEAT_INTERVAL_SECONDS = 300
+RUN_RESULT_STATUSES = frozenset(
+    {
+        "awaiting_chatgpt_web",
+        "awaiting_browser_tool",
+        "review_ready",
+        "form_review_blocked",
+        "no_eligible_verified_roles",
+        "budget_exhausted",
+        "failed_closed",
+    }
+)
+RUN_RESULT_LIST_FIELDS = frozenset(
+    {
+        "pending_requests",
+        "source_attempts",
+        "discoveries",
+        "eligibility",
+        "freshness",
+        "materials",
+        "form_reviews",
+        "final_actions",
+        "blockers",
+    }
+)
+RUN_RESULT_FIELDS = frozenset({"run_id", "status", "usage"}) | RUN_RESULT_LIST_FIELDS
+RUN_PENDING_FIELDS = frozenset(
+    {"surface", "kind", "request_id", "request_path", "response_path"}
+)
+ACCEPTED_FORM_REVIEW_STATUSES = frozenset(
+    {"form_surface_reviewed", "dry_run_verified"}
+)
 
 
 def prepare_run(
@@ -112,6 +151,158 @@ def prepare_run(
     _write_json(Path(paths["manifest"]), manifest)
     paths["request"] = str(request_path)
     return paths
+
+
+def run_status_snapshot(
+    *,
+    run_dir: Path,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Return a redacted, immutable-run-checked pre-campaign status snapshot."""
+    current = _aware_utc(now)
+    run_dir = run_dir.resolve()
+    manifest = _read_json(run_dir / "run_manifest.json")
+    bindings = RunBindings.from_manifest(manifest)
+    _verify_immutable_artifacts(run_dir, manifest)
+    run_created_at = _parse_aware_datetime(
+        str(manifest.get("created_at") or ""),
+        field="autonomy run creation timestamp",
+    )
+    if run_created_at > current:
+        raise ValueError("autonomy run creation timestamp is in the future")
+
+    fact_ledger = fact_ledger_from_dict(_read_json(run_dir / "fact_ledger.json"))
+    if fact_ledger.digest != bindings.fact_digest:
+        raise ValueError("run manifest fact digest mismatch")
+    required_fact_blockers = require_confirmed_facts(
+        fact_ledger,
+        REQUIRED_AUTONOMY_FACT_IDS,
+    )
+    location_fact_ids = confirmed_preferred_location_fact_ids(fact_ledger)
+    state_counts = {
+        state.value: sum(record.state is state for record in fact_ledger.records)
+        for state in FactState
+    }
+
+    handoff = _run_handoff_status(run_dir=run_dir, bindings=bindings)
+    result = _run_result_status(run_dir=run_dir, run_id=bindings.run_id)
+
+    from applypilot.autonomy.approval import (
+        FACT_APPROVAL_NAME,
+        FACT_APPROVAL_SIGNATURE_NAME,
+        FactApprovalError,
+        require_system_approval_trust_store,
+    )
+
+    try:
+        require_system_approval_trust_store()
+    except FactApprovalError:
+        trust_store_ready = False
+    else:
+        trust_store_ready = True
+    approval_file_count = sum(
+        (run_dir / name).is_file()
+        for name in (FACT_APPROVAL_NAME, FACT_APPROVAL_SIGNATURE_NAME)
+    )
+    approval_files_present = approval_file_count == 2
+    approval_verified = False
+    approval_state = "missing" if approval_file_count == 0 else "incomplete"
+    if approval_files_present:
+        approval_state = "unverified"
+        if trust_store_ready and not required_fact_blockers and location_fact_ids:
+            try:
+                load_reviewed_run_snapshot(
+                    run_dir=run_dir,
+                    approved_fact_digest=fact_ledger.digest,
+                    require_signed_approval=True,
+                )
+            except Exception:
+                approval_state = "invalid_or_stale"
+            else:
+                approval_verified = True
+                approval_state = "verified"
+
+    if required_fact_blockers:
+        live_gate = "required_facts"
+    elif not location_fact_ids:
+        live_gate = "preferred_location"
+    elif not trust_store_ready:
+        live_gate = "system_approval_trust_store"
+    elif not approval_verified:
+        live_gate = "signed_fact_approval"
+    else:
+        live_gate = "ready_for_candidate_scoped_review"
+
+    if result["present"] and result["reported_status"] == "budget_exhausted":
+        review_phase = "reported_budget_exhausted"
+    elif handoff["responded_unconsumed_count"]:
+        review_phase = "response_ready_to_advance"
+    elif handoff["pending_kinds"]:
+        review_phase = "awaiting_" + str(handoff["pending_kinds"][0])
+    elif result["present"]:
+        review_phase = "reported_" + str(result["reported_status"])
+    else:
+        review_phase = "ready_to_advance"
+
+    last_heartbeat_at = _read_run_heartbeat_at(
+        run_dir=run_dir,
+        run_id=bindings.run_id,
+        current=current,
+        run_created_at=run_created_at,
+    )
+    heartbeat_due = True
+    if last_heartbeat_at is not None:
+        heartbeat_due = current >= last_heartbeat_at + timedelta(
+            seconds=RUN_HEARTBEAT_INTERVAL_SECONDS
+        )
+
+    return {
+        "schema_version": RUN_STATUS_SCHEMA_VERSION,
+        "run_id": bindings.run_id,
+        "recorded_at": current.isoformat(),
+        "run_created_at": run_created_at.isoformat(),
+        "review_phase": review_phase,
+        "live_gate": live_gate,
+        "target_confirmed": 100,
+        "submitted_confirmed": 0,
+        "fact_states": state_counts,
+        "required_fact_blockers": required_fact_blockers,
+        "preferred_location_fact_count": len(location_fact_ids),
+        "system_approval_trust_store_ready": trust_store_ready,
+        "fact_approval_file_count": approval_file_count,
+        "fact_approval_files_present": approval_files_present,
+        "fact_approval_state": approval_state,
+        "handoff": handoff,
+        "result": result,
+        "heartbeat_interval_seconds": RUN_HEARTBEAT_INTERVAL_SECONDS,
+        "last_heartbeat_at": last_heartbeat_at.isoformat()
+        if last_heartbeat_at is not None
+        else None,
+        "heartbeat_due": heartbeat_due,
+        "external_side_effects": "none_from_status_tool",
+    }
+
+
+def record_run_heartbeat(
+    *,
+    run_dir: Path,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Fsync one fixed-name redacted pre-campaign heartbeat."""
+    current = _aware_utc(now)
+    run_dir = run_dir.resolve()
+    status = run_status_snapshot(run_dir=run_dir, now=current)
+    status["last_heartbeat_at"] = current.isoformat()
+    status["heartbeat_due"] = False
+    payload = {
+        "schema_version": RUN_HEARTBEAT_SCHEMA_VERSION,
+        "run_id": status["run_id"],
+        "recorded_at": current.isoformat(),
+        "status_sha256": _sha256_text(_canonical_json(status)),
+        "status": status,
+    }
+    _write_fsynced_json(run_dir / RUN_HEARTBEAT_NAME, payload)
+    return status
 
 
 def load_reviewed_run_snapshot(
@@ -520,6 +711,207 @@ def _restore_artifact_usage(ledger: UsageLedger, run_dir: Path) -> None:
         )
 
 
+def _run_handoff_status(*, run_dir: Path, bindings: RunBindings) -> dict[str, Any]:
+    request_count = 0
+    response_count = 0
+    receipt_count = 0
+    responded_unconsumed_count = 0
+    pending_kinds: list[str] = []
+    handoff_dir = run_dir / "handoff"
+    for request_path in sorted(handoff_dir.glob("*.request.json")):
+        request = _read_json(request_path)
+        if (
+            request.get("run_id") != bindings.run_id
+            or request.get("fact_digest") != bindings.fact_digest
+            or request.get("context_digest") != bindings.context_digest
+            or request.get("policy_digest") != bindings.policy_digest
+        ):
+            raise ValueError("handoff request bindings differ from run manifest")
+        kind = str(request.get("kind") or "")
+        if kind not in {"role_candidates", "material_packet", "form_review"}:
+            raise ValueError("handoff request kind is invalid")
+        response_path = (run_dir / str(request.get("response_path") or "")).resolve()
+        if response_path.parent != handoff_dir.resolve() or not response_path.name.endswith(
+            ".response.json"
+        ):
+            raise ValueError("handoff response path escaped its run directory")
+        receipt_path = response_path.with_name(
+            response_path.name.replace(".response.json", ".receipt.json")
+        )
+        request_count += 1
+        if response_path.is_file():
+            response_count += 1
+            if receipt_path.is_file():
+                receipt_count += 1
+            else:
+                responded_unconsumed_count += 1
+        else:
+            pending_kinds.append(kind)
+    if len(pending_kinds) + responded_unconsumed_count > 1:
+        raise ValueError("autonomy run has more than one active handoff exchange")
+    return {
+        "request_count": request_count,
+        "response_count": response_count,
+        "receipt_count": receipt_count,
+        "responded_unconsumed_count": responded_unconsumed_count,
+        "pending_count": len(pending_kinds),
+        "pending_kinds": sorted(set(pending_kinds)),
+        "rejected_response_count": len(list(handoff_dir.glob("*.rejected.*.json"))),
+    }
+
+
+def _run_result_status(*, run_dir: Path, run_id: str) -> dict[str, Any]:
+    path = run_dir / "result_ledger.json"
+    if not path.is_file():
+        return {
+            "present": False,
+            "trust": "absent",
+            "reported_status": "not_started",
+            "reported_discovery_count": 0,
+            "reported_material_count": 0,
+            "reported_form_review_count": 0,
+            "reported_final_action_count": 0,
+        }
+    result = _read_json(path)
+    if result.get("run_id") != run_id:
+        raise ValueError("result ledger run id mismatch")
+    status = str(result.get("status") or "")
+    if status not in RUN_RESULT_STATUSES:
+        raise ValueError("result ledger status is invalid")
+    if set(result) != RUN_RESULT_FIELDS:
+        raise ValueError("result ledger fields differ from schema")
+    if any(not isinstance(result.get(field), list) for field in RUN_RESULT_LIST_FIELDS):
+        raise ValueError("result ledger collections are invalid")
+    if any(
+        not isinstance(item, dict)
+        for field in RUN_RESULT_LIST_FIELDS
+        for item in result[field]
+    ):
+        raise ValueError("result ledger collections must contain objects")
+    usage = result.get("usage")
+    if not isinstance(usage, dict) or usage.get("run_id") != run_id:
+        raise ValueError("result ledger usage binding is invalid")
+    pending_requests = result["pending_requests"]
+    if len(pending_requests) > 1:
+        raise ValueError("result ledger has more than one pending request")
+    if pending_requests:
+        _validate_result_pending_request(pending_requests[0])
+    if status == "awaiting_chatgpt_web" and (
+        len(pending_requests) != 1
+        or pending_requests[0].get("surface") != "chatgpt_web"
+    ):
+        raise ValueError("result ledger ChatGPT wait has no matching request")
+    if status == "awaiting_browser_tool" and (
+        len(pending_requests) != 1
+        or pending_requests[0].get("surface") != "browser_tool"
+    ):
+        raise ValueError("result ledger browser wait has no matching request")
+    if status not in {
+        "awaiting_chatgpt_web",
+        "awaiting_browser_tool",
+        "budget_exhausted",
+    } and pending_requests:
+        raise ValueError("result ledger terminal state has a pending request")
+    final_actions = result["final_actions"]
+    if final_actions:
+        raise ValueError("pre-campaign result ledger cannot contain final actions")
+    if status == "review_ready" and (
+        not result["materials"]
+        or any(
+            item.get("status") not in ACCEPTED_FORM_REVIEW_STATUSES
+            for item in result["form_reviews"]
+        )
+    ):
+        raise ValueError("result ledger review-ready state is inconsistent")
+    if status == "form_review_blocked" and (
+        not result["materials"]
+        or not result["form_reviews"]
+        or all(
+            item.get("status") in ACCEPTED_FORM_REVIEW_STATUSES
+            for item in result["form_reviews"]
+        )
+    ):
+        raise ValueError("result ledger form-review state is inconsistent")
+    if status == "no_eligible_verified_roles" and (
+        result["materials"] or result["form_reviews"]
+    ):
+        raise ValueError("result ledger empty-role state is inconsistent")
+    return {
+        "present": True,
+        "trust": "validated_but_mutable_untrusted",
+        "reported_status": status,
+        "reported_discovery_count": len(result["discoveries"]),
+        "reported_material_count": len(result["materials"]),
+        "reported_form_review_count": len(result["form_reviews"]),
+        "reported_final_action_count": len(final_actions),
+    }
+
+
+def _validate_result_pending_request(pending: dict[str, Any]) -> None:
+    if set(pending) != RUN_PENDING_FIELDS or any(
+        not isinstance(pending.get(field), str) or not pending[field]
+        for field in RUN_PENDING_FIELDS
+    ):
+        raise ValueError("result ledger pending request fields are invalid")
+    surface = pending["surface"]
+    kind = pending["kind"]
+    allowed = {
+        "chatgpt_web": {"role_candidates", "material_packet"},
+        "browser_tool": {"form_review"},
+    }
+    if surface not in allowed or kind not in allowed[surface]:
+        raise ValueError("result ledger pending request surface or kind is invalid")
+
+
+def _read_run_heartbeat_at(
+    *,
+    run_dir: Path,
+    run_id: str,
+    current: datetime,
+    run_created_at: datetime,
+) -> datetime | None:
+    path = run_dir / RUN_HEARTBEAT_NAME
+    if not path.exists():
+        return None
+    if path.is_symlink():
+        raise ValueError("autonomy heartbeat must not be a symbolic link")
+    payload = _read_json(path)
+    if set(payload) != {
+        "schema_version",
+        "run_id",
+        "recorded_at",
+        "status_sha256",
+        "status",
+    }:
+        raise ValueError("autonomy heartbeat fields differ from schema")
+    status = payload.get("status")
+    recorded_at = str(payload.get("recorded_at") or "")
+    if (
+        payload.get("schema_version") != RUN_HEARTBEAT_SCHEMA_VERSION
+        or payload.get("run_id") != run_id
+        or not isinstance(status, dict)
+        or status.get("schema_version") != RUN_STATUS_SCHEMA_VERSION
+        or status.get("run_id") != run_id
+        or status.get("recorded_at") != recorded_at
+        or status.get("last_heartbeat_at") != recorded_at
+        or status.get("heartbeat_due") is not False
+        or status.get("heartbeat_interval_seconds") != RUN_HEARTBEAT_INTERVAL_SECONDS
+        or payload.get("status_sha256") != _sha256_text(_canonical_json(status))
+    ):
+        raise ValueError("autonomy heartbeat bindings are invalid")
+    parsed = _parse_aware_datetime(
+        recorded_at,
+        field="autonomy heartbeat timestamp",
+    )
+    if recorded_at != parsed.isoformat():
+        raise ValueError("autonomy heartbeat timestamp must use canonical UTC")
+    if parsed < run_created_at:
+        raise ValueError("autonomy heartbeat timestamp predates its run")
+    if parsed > current:
+        raise ValueError("autonomy heartbeat timestamp is in the future")
+    return parsed
+
+
 def _validate_discovery_request(
     *,
     run_dir: Path,
@@ -589,6 +981,54 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     temporary.write_text(text, encoding="utf-8")
     os.replace(temporary, path)
+
+
+def _write_fsynced_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = (json.dumps(payload, indent=2, default=str, sort_keys=True) + "\n").encode(
+        "utf-8"
+    )
+    temporary = path.with_name(
+        f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
+    )
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(temporary, flags, 0o600)
+    try:
+        try:
+            offset = 0
+            while offset < len(data):
+                written = os.write(descriptor, data[offset:])
+                if written <= 0:
+                    raise OSError("short heartbeat write")
+                offset += written
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.replace(temporary, path)
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _aware_utc(value: datetime | None = None) -> datetime:
+    current = value or datetime.now(timezone.utc)
+    if current.tzinfo is None or current.utcoffset() is None:
+        raise ValueError("autonomy status time must include a timezone")
+    return current.astimezone(timezone.utc)
+
+
+def _parse_aware_datetime(value: str, *, field: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError(f"{field} is invalid") from exc
+    return _aware_utc(parsed)
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -678,3 +1118,12 @@ def _sha256_file(path: Path) -> str:
 
 def _sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _canonical_json(payload: Any) -> str:
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )

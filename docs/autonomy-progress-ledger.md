@@ -24,7 +24,7 @@ were the main causes.
 | Submission | Signed applicant facts, one exact candidate, reviewed material/form bytes, expiring one-time authorization, and durable typed confirmation evidence | Implemented fail-closed gates; no signed fact approval or live authorization issued |
 | Token reduction | Fresh run usage ledger below 1.935 million token events (90% below baseline), using at most three rich model calls and no repeated thread context | Synthetic estimate: 6,257 model tokens, 99.96767% below baseline; reviewed personal run still blocked on facts |
 | Doctor | `applypilot doctor --autonomy --strict --json` succeeds in a fresh shell on the active machine | Correctly fails closed while the fixed root-owned approval trust store is absent; artifact transport passes without a legacy API key |
-| Durable campaign | Immutable target-100 manifest, serialized/recoverable state, one writer lease, dedupe, typed evidence, unknown-outcome pause, bounded heartbeat | Implemented locally; focused regression coverage complete |
+| Durable campaign | Immutable target-100 manifest, serialized/recoverable state, one writer lease, dedupe, typed evidence, unknown-outcome pause, bounded heartbeat | Implemented locally; pre-campaign and live-campaign fixed-name heartbeats are regression-covered |
 | Publish | Targeted tests, lint, diff review, commit, and push to `SulaymanB2024/ApplyPilot` fork branch | `2638a13` pushed; current campaign/signature work pending final gate and push |
 
 ## 2026-07-12 second-Mac checkpoint

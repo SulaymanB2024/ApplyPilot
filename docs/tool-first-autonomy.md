@@ -133,6 +133,18 @@ as signed or tamper-proof.
 The browser transport must extract the assistant message's DOM `textContent`; using ChatGPT's
 rendered "Copy response" action can Markdown-linkify URLs and corrupt otherwise valid JSON.
 
+Before a signed campaign exists, `autonomy status --run-dir RUN_DIR` derives one redacted status
+directly from the immutable run packet. `autonomy heartbeat --run-dir RUN_DIR` fsyncs that same
+status to the fixed `heartbeat.json` name for five-minute supervision. It reports fact-state
+counts, blocker IDs, preferred-location count, trust/approval state, handoff phase, result counts,
+and 0/100 without copying fact values, prompts, URLs, materials, or rejected response contents.
+The fixed name is overwritten atomically, so waiting at a human gate does not grow an event log.
+Handoff requests and receipts take precedence when deriving the actionable phase. Values copied
+from `result_ledger.json` are exact-schema checked but remain explicitly `reported_*` and
+`validated_but_mutable_untrusted`; they never count as authoritative submission confirmation.
+The heartbeat's embedded SHA-256 detects accidental corruption only; it is not a signature or a
+defense against a hostile writer with access to the run directory.
+
 ## Signed applicant approval
 
 `campaign create --submit` rejects a readable fact digest by itself. The run manifest contains

@@ -591,6 +591,42 @@ def autonomy_import_response(
     console.print_json(data=result)
 
 
+@autonomy_app.command("status")
+def autonomy_status(
+    run_dir: Path = typer.Option(..., "--run-dir", help="Autonomy run directory."),
+) -> None:
+    """Print one immutable-run-checked redacted pre-campaign status."""
+    _bootstrap_config_only()
+    from applypilot.autonomy.runner import run_status_snapshot
+
+    try:
+        result = run_status_snapshot(run_dir=run_dir)
+    except Exception as exc:
+        console.print(
+            f"[red]Autonomy status failed:[/red] {type(exc).__name__}: {str(exc)[:160]}"
+        )
+        raise typer.Exit(code=1) from exc
+    console.print_json(data=result)
+
+
+@autonomy_app.command("heartbeat")
+def autonomy_heartbeat(
+    run_dir: Path = typer.Option(..., "--run-dir", help="Autonomy run directory."),
+) -> None:
+    """Fsync one fixed-name redacted five-minute pre-campaign heartbeat."""
+    _bootstrap_config_only()
+    from applypilot.autonomy.runner import record_run_heartbeat
+
+    try:
+        result = record_run_heartbeat(run_dir=run_dir)
+    except Exception as exc:
+        console.print(
+            f"[red]Autonomy heartbeat failed:[/red] {type(exc).__name__}: {str(exc)[:160]}"
+        )
+        raise typer.Exit(code=1) from exc
+    console.print_json(data=result)
+
+
 @autonomy_app.command("advance")
 def autonomy_advance(
     run_dir: Path = typer.Option(..., "--run-dir", help="Reviewed autonomy run directory."),

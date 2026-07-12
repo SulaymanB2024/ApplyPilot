@@ -25,6 +25,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Durable campaign ledger** - Added an immutable target-100 manifest, serialized writer lease,
   crash-recoverable event/state projection, canonical candidate dedupe, typed submission
   evidence, fail-closed unknown-outcome reconciliation, and bounded five-minute heartbeats.
+- **Pre-campaign status heartbeat** - Added immutable-run-checked `autonomy status` and
+  fixed-name, fsynced `autonomy heartbeat` artifacts that report redacted run, gate, and handoff
+  counts while signed campaign creation is still waiting on applicant or system approval.
 - **Apply harness hardening** - Added structured field resolution, structural safety gates,
   and tri-state submission verification for the deterministic apply controller.
 - **Apply runtime guards** - Added canonical job IDs, retry scheduling with full jitter,
@@ -63,9 +66,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from job evidence. Every first-person or possessive assertion must exactly match a structured
   claim supported by applicant facts; `JOB` evidence cannot establish an applicant skill. Final
   letters are rejected above four paragraphs, 450 words, or 20 structured applicant claims.
-- **Autonomy-aware doctor** - `doctor --autonomy` validates artifact transport and the required
-  contact, work-authorization, sponsorship, and availability facts without requiring a legacy
-  model API key; optional corrections use `--autonomy-corrections`.
+- **Autonomy-aware doctor** - `doctor --autonomy` validates artifact transport, required contact,
+  work-authorization, sponsorship, availability, preferred-location, and root-protected trust
+  readiness without requiring a legacy model API key; optional corrections use
+  `--autonomy-corrections`.
+- **Explicit legacy browser opt-in** - Caller-provided CDP commands fail closed unless
+  `--allow-legacy-cdp` is supplied; the normal campaign path uses the authenticated Chrome
+  connector and portable handoff artifacts.
 - **Provider error honesty** - Sequential and streaming discovery retain structured
   provider errors instead of converting failed coverage into a successful empty result.
 - **Training audit semantics** - Zero JobSpy boards are N/A only in `direct_sources`
