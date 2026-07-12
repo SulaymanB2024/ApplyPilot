@@ -84,6 +84,8 @@ Review the generated `fact_ledger.json` before allowing browser or model work. B
 placeholder, and explicitly rejected facts remain blockers instead of being guessed.
 The plan command prints the ledger digest. Copy it only after review; `autonomy run` refuses
 to start if the fresh profile, resume, corrections file, or approved digest differs.
+That copied digest is an integrity binding for review-only work, not proof that the applicant
+approved live use. Live campaign state requires the separately signed approval described below.
 
 ## ChatGPT Web operation
 
@@ -130,6 +132,69 @@ OS account and filesystem permissions; no documentation or UI should describe th
 as signed or tamper-proof.
 The browser transport must extract the assistant message's DOM `textContent`; using ChatGPT's
 rendered "Copy response" action can Markdown-linkify URLs and corrupt otherwise valid JSON.
+
+## Signed applicant approval
+
+`campaign create --submit` rejects a readable fact digest by itself. The run manifest contains
+a one-time challenge and immutably binds its initial discovery request. The applicant reviews
+the fact ledger and an unsigned approval document, then signs the exact JSON bytes on a
+user-controlled machine:
+
+```bash
+applypilot autonomy prepare-fact-approval \
+  --run-dir RUN_DIR \
+  --approved-fact-digest DIGEST \
+  --issuer applicant@example.com \
+  --source-surface codex_user_message \
+  --source-message-sha256 MESSAGE_SHA256 \
+  --source-author-sha256 AUTHOR_SHA256 \
+  --source-observed-at 2026-07-12T13:00:00-05:00 \
+  --out approval.json
+
+ssh-keygen -Y sign -f USER_CONTROLLED_APPROVAL_KEY \
+  -n applypilot-fact-approval approval.json
+
+applypilot autonomy import-fact-approval \
+  --run-dir RUN_DIR \
+  --approved-fact-digest DIGEST \
+  --attestation approval.json \
+  --signature approval.json.sig
+```
+
+Live commands use one fixed trust store at
+`/Library/Application Support/ApplyPilot/approval_allowed_signers` on macOS (or
+`/etc/applypilot/approval_allowed_signers` on other POSIX systems). The file and every parent
+directory must be root-owned and not group/world writable; callers cannot select an alternate
+file. Signature and revision checks likewise pin root-protected `/usr/bin/ssh-keygen` and
+`/usr/bin/git` with a sanitized environment, so `PATH` cannot replace either verifier. The
+private signing key must not be copied to the second Mac. The signed object binds the
+run-manifest hash, one-time challenge, fact/context/policy
+digests, profile and resume hashes, exact approved fact-value hashes, source-message and author
+hashes, issuer, and expiration. The import command can verify and copy an approval; it cannot
+mint one. A Gmail message ID, a self-sent reporting thread, or four booleans is not approval.
+Fact approval never authorizes form filling, upload, final submission, or account creation;
+those remain separate action-scoped gates.
+The approval must still be valid when a candidate enters authorization/submission. Live campaign
+creation also requires a clean reviewed Git checkout and does not accept a caller-supplied
+revision override.
+
+## Durable campaign accounting
+
+Create review-only state with `campaign create` or add `--submit` only
+after signed fact approval is present. The campaign manifest is immutable, caps the authoritative
+target at 100, and binds the exact code revision. One exclusive writer lease refreshes state
+before every mutation. A fsynced event log recovers an interrupted state projection, while a
+fixed-name heartbeat file avoids appending a full campaign snapshot every five minutes.
+
+Candidates move through an exact state graph. Authorization requires a durable copy of the
+one-time candidate grant. The grant's exact schema, candidate/fact/material/form/policy bindings,
+one-hour maximum lifetime, and consumption timestamp are checked at the actual submission time.
+A submission counts only when durable, hash-matching artifacts exist for the authorization,
+consumption marker, submission response, visible confirmation evidence, controller result, and
+database row. An ambiguous click pauses the entire campaign; it can resume only after typed
+evidence proves either `submitted_confirmed` or `not_submitted`. Pending model/browser payloads
+are omitted from heartbeat output and deleted after resolution. Exact URLs that are already
+applied, permanently failed, or out of attempts cannot be reacquired.
 
 The artifact runner is review-only. It may discover roles, verify first-party evidence, and
 write local cover-letter packets. It never fills, uploads, submits, sends email, or changes an
@@ -187,5 +252,7 @@ Before a real submission campaign, complete all of these checks:
 - The authenticated browser tool can service one synthetic handoff without personal data.
 - A review-only artifact run produces official, first-party-verified candidates and clean
   material packets.
+- A user-controlled OpenSSH key signs the exact live fact approval, and the second Mac verifies
+  it against the fixed root-protected allowed-signers file without possessing the private key.
 - The exact role and final materials are reviewed before invoking the separate `--submit`
   boundary.

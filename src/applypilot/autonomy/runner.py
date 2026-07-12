@@ -5,8 +5,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import secrets
 from dataclasses import asdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +34,8 @@ from applypilot.autonomy.form_review import ReadOnlyFormReviewer
 from applypilot.autonomy.form_handoff import ArtifactFormReviewer
 from applypilot.autonomy.handoff import (
     ArtifactChatGPTClient,
+    HANDOFF_SCHEMA_VERSION,
+    PROMPT_SCHEMA_VERSION,
     RunBindings,
     RUN_SCHEMA_VERSION,
 )
@@ -81,6 +84,7 @@ def prepare_run(
         "run_id": run_id,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "query": query,
+        "approval_challenge": secrets.token_hex(32),
         "fact_digest": fact_ledger.digest,
         "context_digest": context.digest,
         "policy_digest": active_policy.digest,
@@ -103,8 +107,186 @@ def prepare_run(
         query=query,
         limit=active_policy.budget.discoveries,
     )
+    relative_request = str(request_path.relative_to(run_dir))
+    manifest["immutable_artifacts"][relative_request] = _sha256_file(request_path)
+    _write_json(Path(paths["manifest"]), manifest)
     paths["request"] = str(request_path)
     return paths
+
+
+def load_reviewed_run_snapshot(
+    *,
+    run_dir: Path,
+    approved_fact_digest: str,
+    require_signed_approval: bool = False,
+) -> dict[str, str]:
+    """Validate one local run packet and return only its campaign-safe bindings."""
+    run_dir = run_dir.resolve()
+    manifest = _read_json(run_dir / "run_manifest.json")
+    bindings = RunBindings.from_manifest(manifest)
+    _verify_immutable_artifacts(run_dir, manifest)
+
+    fact_ledger = fact_ledger_from_dict(_read_json(run_dir / "fact_ledger.json"))
+    require_approved_fact_digest(fact_ledger.digest, approved_fact_digest)
+    _require_autonomy_ready_facts(fact_ledger)
+    if fact_ledger.digest != bindings.fact_digest:
+        raise ValueError("run manifest fact digest mismatch")
+
+    profile = config.load_profile()
+    resume_text = config.RESUME_PATH.read_text(encoding="utf-8")
+    if _sha256_text(json.dumps(profile, sort_keys=True, ensure_ascii=False)) != fact_ledger.profile_sha256:
+        raise ValueError("profile changed after the reviewed autonomy plan")
+    if _sha256_text(resume_text) != fact_ledger.resume_sha256:
+        raise ValueError("resume changed after the reviewed autonomy plan")
+
+    context_pack = _context_from_dict(_read_json(run_dir / "context_pack.json"))
+    if context_pack.digest != bindings.context_digest:
+        raise ValueError("run manifest context digest mismatch")
+    policy = _policy_from_dict(_read_json(run_dir / "run_policy.json"))
+    if policy.digest != bindings.policy_digest:
+        raise ValueError("run manifest policy digest mismatch")
+    query = str(manifest.get("query") or "").strip()
+    if not query:
+        raise ValueError("autonomy run query is missing")
+    _validate_discovery_request(
+        run_dir=run_dir,
+        manifest=manifest,
+        query=query,
+        discovery_limit=policy.budget.discoveries,
+    )
+    snapshot = {
+        "run_id": bindings.run_id,
+        "query": query,
+        "fact_digest": bindings.fact_digest,
+        "context_digest": bindings.context_digest,
+        "policy_digest": bindings.policy_digest,
+        "fact_approval_receipt_sha256": "",
+        "fact_approval_signature_sha256": "",
+        "approval_issuer": "",
+        "approval_trust_store_sha256": "",
+        "fact_approval_expires_at": "",
+    }
+    if require_signed_approval:
+        from applypilot.autonomy.approval import (
+            FactApprovalExpectation,
+            load_verified_fact_approval,
+            require_system_approval_trust_store,
+        )
+
+        expectation = FactApprovalExpectation.from_run(
+            manifest=manifest,
+            manifest_sha256=_sha256_file(run_dir / "run_manifest.json"),
+            fact_ledger=fact_ledger,
+        )
+        approval = load_verified_fact_approval(
+            run_dir=run_dir,
+            expectation=expectation,
+            trust_store_path=require_system_approval_trust_store(),
+        )
+        snapshot.update(
+            {
+                "fact_approval_receipt_sha256": approval.receipt_sha256,
+                "fact_approval_signature_sha256": approval.signature_sha256,
+                "approval_issuer": approval.issuer,
+                "approval_trust_store_sha256": approval.trust_store_sha256,
+                "fact_approval_expires_at": approval.expires_at,
+            }
+        )
+    return snapshot
+
+
+def import_signed_fact_approval(
+    *,
+    run_dir: Path,
+    approved_fact_digest: str,
+    attestation_path: Path,
+    signature_path: Path,
+) -> dict[str, str]:
+    """Verify and import a user-signed fact approval into one immutable run."""
+    load_reviewed_run_snapshot(
+        run_dir=run_dir,
+        approved_fact_digest=approved_fact_digest,
+    )
+    run_dir = run_dir.resolve()
+    manifest = _read_json(run_dir / "run_manifest.json")
+    fact_ledger = fact_ledger_from_dict(_read_json(run_dir / "fact_ledger.json"))
+    from applypilot.autonomy.approval import (
+        FactApprovalExpectation,
+        require_system_approval_trust_store,
+        verify_and_import_fact_approval,
+    )
+
+    expectation = FactApprovalExpectation.from_run(
+        manifest=manifest,
+        manifest_sha256=_sha256_file(run_dir / "run_manifest.json"),
+        fact_ledger=fact_ledger,
+    )
+    approval = verify_and_import_fact_approval(
+        run_dir=run_dir,
+        expectation=expectation,
+        attestation_path=attestation_path,
+        signature_path=signature_path,
+        trust_store_path=require_system_approval_trust_store(),
+    )
+    return {
+        "issuer": approval.issuer,
+        "receipt_sha256": approval.receipt_sha256,
+        "signature_sha256": approval.signature_sha256,
+        "trust_store_sha256": approval.trust_store_sha256,
+    }
+
+
+def prepare_fact_approval_attestation(
+    *,
+    run_dir: Path,
+    approved_fact_digest: str,
+    issuer: str,
+    source_surface: str,
+    source_message_sha256: str,
+    source_author_sha256: str,
+    source_observed_at: datetime,
+    valid_hours: int,
+    output_path: Path,
+) -> dict[str, str]:
+    """Prepare unsigned, run-bound bytes for user-controlled OpenSSH signing."""
+    load_reviewed_run_snapshot(
+        run_dir=run_dir,
+        approved_fact_digest=approved_fact_digest,
+    )
+    if not 1 <= valid_hours <= 168:
+        raise ValueError("fact approval validity must be between 1 and 168 hours")
+    run_dir = run_dir.resolve()
+    manifest = _read_json(run_dir / "run_manifest.json")
+    fact_ledger = fact_ledger_from_dict(_read_json(run_dir / "fact_ledger.json"))
+    from applypilot.autonomy.approval import (
+        FactApprovalExpectation,
+        approval_json_bytes,
+        build_unsigned_fact_approval,
+        write_unsigned_fact_approval,
+    )
+
+    expectation = FactApprovalExpectation.from_run(
+        manifest=manifest,
+        manifest_sha256=_sha256_file(run_dir / "run_manifest.json"),
+        fact_ledger=fact_ledger,
+    )
+    issued_at = datetime.now(timezone.utc)
+    payload = build_unsigned_fact_approval(
+        expectation,
+        issuer=issuer,
+        source_surface=source_surface,
+        source_message_sha256=source_message_sha256,
+        source_author_sha256=source_author_sha256,
+        source_observed_at=source_observed_at,
+        issued_at=issued_at,
+        expires_at=issued_at + timedelta(hours=valid_hours),
+    )
+    path = write_unsigned_fact_approval(output_path, payload)
+    return {
+        "attestation_path": str(path),
+        "attestation_sha256": _sha256_text(approval_json_bytes(payload).decode("utf-8")),
+        "signature_namespace": "applypilot-fact-approval",
+    }
 
 
 def advance_artifact_run(
@@ -326,6 +508,69 @@ def _restore_artifact_usage(ledger: UsageLedger, run_dir: Path) -> None:
         )
 
 
+def _validate_discovery_request(
+    *,
+    run_dir: Path,
+    manifest: dict[str, Any],
+    query: str,
+    discovery_limit: int,
+) -> None:
+    relative_path = "handoff/discovery.request.json"
+    artifacts = manifest.get("immutable_artifacts")
+    if not isinstance(artifacts, dict) or relative_path not in artifacts:
+        raise ValueError("autonomy run does not immutably bind its discovery request")
+    request = _read_json(run_dir / relative_path)
+    input_payload = {
+        "prompt_schema_version": PROMPT_SCHEMA_VERSION,
+        "stage": "discovery",
+        "inputs": {"query": query, "limit": discovery_limit},
+    }
+    input_digest = _sha256_text(
+        json.dumps(
+            input_payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    )
+    request_id_payload = {
+        "schema_version": HANDOFF_SCHEMA_VERSION,
+        "prompt_schema_version": PROMPT_SCHEMA_VERSION,
+        "run_id": str(manifest.get("run_id") or ""),
+        "stage": "discovery",
+        "candidate_id": "",
+        "input_digest": input_digest,
+        "fact_digest": str(manifest.get("fact_digest") or ""),
+        "context_digest": str(manifest.get("context_digest") or ""),
+        "policy_digest": str(manifest.get("policy_digest") or ""),
+    }
+    request_id = _sha256_text(
+        json.dumps(
+            request_id_payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    )
+    expected = {
+        "schema_version": HANDOFF_SCHEMA_VERSION,
+        "prompt_schema_version": PROMPT_SCHEMA_VERSION,
+        "run_id": request_id_payload["run_id"],
+        "stage": "discovery",
+        "kind": "role_candidates",
+        "request_id": request_id,
+        "input_digest": input_digest,
+        "fact_digest": request_id_payload["fact_digest"],
+        "context_digest": request_id_payload["context_digest"],
+        "policy_digest": request_id_payload["policy_digest"],
+        "response_path": "handoff/discovery.response.json",
+    }
+    mismatches = [key for key, value in expected.items() if request.get(key) != value]
+    prompt = str(request.get("prompt") or "")
+    if mismatches or not prompt or request.get("prompt_sha256") != _sha256_text(prompt):
+        raise ValueError("immutable discovery request differs from the reviewed run")
+
+
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     text = json.dumps(payload, indent=2, default=str, sort_keys=True) + "\n"
@@ -347,7 +592,9 @@ def _verify_immutable_artifacts(run_dir: Path, manifest: dict[str, Any]) -> None
         raise ValueError("autonomy run manifest has no immutable artifacts")
     for name, expected in artifacts.items():
         path = (run_dir / str(name)).resolve()
-        if path.parent != run_dir or not path.is_file():
+        if path != run_dir and run_dir not in path.parents:
+            raise ValueError(f"immutable autonomy artifact escaped run directory: {name}")
+        if not path.is_file():
             raise ValueError(f"immutable autonomy artifact missing: {name}")
         if _sha256_file(path) != expected:
             raise ValueError(f"immutable autonomy artifact changed: {name}")

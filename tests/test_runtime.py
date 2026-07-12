@@ -1,3 +1,4 @@
+from applypilot import config
 from applypilot.apply import launcher
 from applypilot.apply.runtime import canonical_job_id, domain_from_job_url, full_jitter_delay_seconds
 from applypilot.database import backfill_runtime_columns, close_connection, init_db, store_jobs
@@ -129,6 +130,74 @@ def test_acquire_job_skips_future_retry_and_open_breaker(monkeypatch, tmp_path):
 
     assert job is not None
     assert job["url"] == "https://ready.example.com/job"
+
+
+def test_acquire_exact_job_accepts_pending_but_never_reacquires_applied(monkeypatch, tmp_path):
+    db_path = tmp_path / "applypilot.db"
+    conn = init_db(db_path)
+    url = "https://jobs.example.com/apply?id=123&utm_source=campaign"
+    canonical = canonical_job_id(url)
+    conn.execute(
+        "INSERT INTO jobs (url, title, tailored_resume_path, application_url, fit_score, "
+        "canonical_job_id, apply_domain) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            url,
+            "Product Analyst",
+            "/tmp/resume.txt",
+            url,
+            9,
+            canonical,
+            "jobs.example.com",
+        ),
+    )
+    conn.commit()
+    monkeypatch.setattr(launcher, "get_connection", lambda: conn)
+
+    acquired = launcher.acquire_job(
+        target_url="https://jobs.example.com/apply?id=123&utm_source=other",
+        worker_id=0,
+    )
+    assert acquired is not None
+    launcher.mark_result(url, "applied", verification_confidence="confirmed")
+
+    assert launcher.acquire_job(target_url=url, worker_id=0) is None
+    close_connection(db_path)
+
+
+def test_acquire_exact_job_never_retries_permanent_or_exhausted_failures(monkeypatch, tmp_path):
+    db_path = tmp_path / "applypilot.db"
+    conn = init_db(db_path)
+    permanent_url = "https://jobs.example.com/permanent"
+    exhausted_url = "https://jobs.example.com/exhausted"
+    for url in (permanent_url, exhausted_url):
+        conn.execute(
+            "INSERT INTO jobs (url, title, tailored_resume_path, application_url, fit_score, "
+            "canonical_job_id, apply_domain, apply_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                url,
+                "Product Analyst",
+                "/tmp/resume.txt",
+                url,
+                9,
+                canonical_job_id(url),
+                "jobs.example.com",
+                "failed",
+            ),
+        )
+    conn.execute(
+        "UPDATE jobs SET apply_error_class = 'permanent', apply_attempts = 99 WHERE url = ?",
+        (permanent_url,),
+    )
+    conn.execute(
+        "UPDATE jobs SET apply_error_class = 'retryable', apply_attempts = ? WHERE url = ?",
+        (config.DEFAULTS["max_apply_attempts"], exhausted_url),
+    )
+    conn.commit()
+    monkeypatch.setattr(launcher, "get_connection", lambda: conn)
+
+    assert launcher.acquire_job(target_url=permanent_url, worker_id=0) is None
+    assert launcher.acquire_job(target_url=exhausted_url, worker_id=0) is None
+    close_connection(db_path)
 
 
 def test_mark_result_sets_retry_metadata_and_opens_breaker(monkeypatch, tmp_path):

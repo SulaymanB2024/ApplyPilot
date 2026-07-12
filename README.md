@@ -38,6 +38,13 @@ applypilot autonomy plan --query "entry-level product and data roles"  # compact
 applypilot autonomy advance --run-dir RUN_DIR --approved-fact-digest DIGEST  # emit next ChatGPT Web handoff
 applypilot autonomy import-response --request REQUEST --input RESPONSE  # bind strict JSON response
 # Repeat advance -> browser handoff -> import until review_ready (at most 3 model calls)
+applypilot autonomy prepare-fact-approval --run-dir RUN_DIR --approved-fact-digest DIGEST ... --out approval.json
+# Review, then sign approval.json on a user-controlled machine with OpenSSH namespace applypilot-fact-approval
+applypilot autonomy import-fact-approval --run-dir RUN_DIR --approved-fact-digest DIGEST \
+  --attestation approval.json --signature approval.json.sig
+applypilot campaign create --run-dir RUN_DIR --approved-fact-digest DIGEST \
+  --campaign-id campaign-100 --submit
+applypilot campaign heartbeat --campaign-dir CAMPAIGN_DIR  # bounded five-minute progress artifact
 applypilot doctor --autonomy --strict --json  # artifact transport + required fact readiness
 applypilot autonomy probe-chatgpt --cdp-port 9222  # optional legacy CDP no-send probe
 applypilot apply --url URL --approved-fact-digest DIGEST  # dry-run; writes one-time submit manifest
@@ -56,7 +63,9 @@ applypilot apply --dry-run  # explicit spelling of the safe default
 > JSON handoff queue through an already-authenticated ChatGPT tab without giving ApplyPilot
 > cookies, credentials, or chat history. Model calls receive a rich, sanitized evidence pack
 > and may research and deliberate without a time limit; only call count, input/output size, and
-> the final JSON contract are bounded. See
+> the final JSON contract are bounded. A copied ledger digest is enough only for review-only
+> work. Live campaign creation additionally requires an applicant-controlled OpenSSH signature
+> over the exact run, approved fact-value hashes, and one-time challenge. See
 > [the diagnosis and operating contract](docs/tool-first-autonomy.md).
 
 ---
@@ -199,6 +208,14 @@ applypilot training-audit               # Audit apply-agent training coverage
 applypilot autonomy plan --query QUERY  # Write compact facts, policy, and ChatGPT request artifacts
 applypilot autonomy advance --run-dir RUN_DIR --approved-fact-digest DIGEST
 applypilot autonomy import-response --request REQUEST --input RESPONSE
+applypilot autonomy prepare-fact-approval --run-dir RUN_DIR --approved-fact-digest DIGEST [OPTIONS]
+applypilot autonomy import-fact-approval --run-dir RUN_DIR --approved-fact-digest DIGEST \
+  --attestation FILE --signature FILE.sig
+applypilot campaign create --run-dir RUN_DIR --approved-fact-digest DIGEST --campaign-id ID
+applypilot campaign create --run-dir RUN_DIR --approved-fact-digest DIGEST --campaign-id ID \
+  --submit
+applypilot campaign status --campaign-dir CAMPAIGN_DIR
+applypilot campaign heartbeat --campaign-dir CAMPAIGN_DIR
 applypilot autonomy probe-chatgpt       # Optional CDP compatibility probe
 applypilot autonomy run --query QUERY --approved-fact-digest DIGEST  # Optional CDP compatibility path
 applypilot apply                        # Launch deterministic dry-run (safe default)
