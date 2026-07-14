@@ -50,6 +50,24 @@ def test_direct_ats_filter_uses_title_and_location_boundaries():
     assert jobs == [{"title": "Product Analyst Intern", "location": "Remote"}]
 
 
+def test_direct_ats_title_keyword_does_not_match_inside_another_word():
+    cfg = normalize_search_config({
+        "queries": [{"query": "intern", "tier": 1}],
+        "direct_ats_title_keywords": ["intern"],
+        "direct_ats_location_filter": False,
+    })
+
+    jobs = _filter_jobs(
+        [
+            {"title": "Software Engineering Intern", "location": "Remote"},
+            {"title": "Internal Mobility Analyst", "location": "Remote"},
+        ],
+        cfg,
+    )
+
+    assert jobs == [{"title": "Software Engineering Intern", "location": "Remote"}]
+
+
 def test_direct_ats_location_filter_does_not_match_us_inside_australia():
     cfg = normalize_search_config({
         "queries": [{"query": "customer success analyst", "tier": 1}],
