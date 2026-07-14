@@ -40,10 +40,10 @@ applypilot autonomy heartbeat --run-dir RUN_DIR  # fixed-name five-minute pre-ca
 applypilot autonomy status --latest  # resolve the newest canonical app-data run without a path
 applypilot autonomy heartbeat --latest
 applypilot autonomy heartbeat --latest --compact  # bounded 5-minute decision/liveness output
-applypilot autonomy observe-runtime --latest ...  # attest fresh Chronicle + Codex Chrome connector state
+applypilot autonomy observe-runtime --latest ...  # optional coarse connector/Chronicle diagnostic
 applypilot autonomy advance --run-dir RUN_DIR --approved-fact-digest DIGEST  # emit next ChatGPT Web handoff
 applypilot autonomy import-response --request REQUEST --input RESPONSE  # bind strict JSON response
-# Repeat advance -> browser handoff -> import until review_ready (at most 3 model calls)
+# Repeat advance -> browser handoff -> import until review_ready (default cap: 8 model calls)
 applypilot autonomy prepare-fact-approval --run-dir RUN_DIR --approved-fact-digest DIGEST ... --out approval.json
 # Review, then sign approval.json on a user-controlled machine with OpenSSH namespace applypilot-fact-approval
 applypilot autonomy import-fact-approval --run-dir RUN_DIR --approved-fact-digest DIGEST \
@@ -66,14 +66,17 @@ applypilot apply --dry-run  # explicit spelling of the safe default
 
 > **Recommended autonomy path:** `applypilot autonomy` uses ChatGPT Web only for bounded
 > role discovery and evidence-cited cover-letter drafting. Eligibility, first-party freshness,
-> budgets, and action gates are deterministic. It disables broad job-board aggregators and
+> budgets, and action gates are deterministic. It may use broad search surfaces as discovery
+> hints but accepts only resolved official employer or ATS URLs as candidates, and
 > never fills or submits during the artifact run. A browser agent can service the portable
 > JSON handoff queue through an already-authenticated ChatGPT tab without giving ApplyPilot
 > cookies, credentials, or chat history. Model calls receive a rich, sanitized evidence pack
 > and may research and deliberate without a time limit; only call count, input/output size, and
-> the final JSON contract are bounded. A copied ledger digest is enough only for review-only
-> work. Live campaign creation additionally requires an applicant-controlled OpenSSH signature
-> over the exact run, approved fact-value hashes, and one-time challenge. See
+> the final JSON contract are bounded. Unknown live-application facts do not stop reversible
+> discovery, verification, material drafting, or read-only form inspection. A copied ledger
+> digest is enough only for that review-only work. Live campaign creation additionally requires
+> an applicant-controlled OpenSSH signature over the exact run, approved fact-value hashes, and
+> one-time challenge. See
 > [the diagnosis and operating contract](docs/tool-first-autonomy.md).
 
 ---

@@ -43,7 +43,14 @@ direct_ats_title_keywords:
   - "analyst"
   - "new grad"
   - "graduate"
+  - "early career"
+  - "associate"
+  - "coordinator"
 
+# Search every configured query tier. Precision belongs in scoring/ranking;
+# direct discovery should not silently discard the broad-recall tier.
+direct_ats_max_tier: 3
+workday_max_tier: 3
 workday_title_filter: true
 
 # Search queries -- each has a query string and priority tier.
@@ -144,13 +151,14 @@ defaults:
 
 # Negative keywords -- skip jobs with these in the title (case-insensitive)
 exclude_titles:
+  - "senior"
+  - "staff"
+  - "principal"
+  - "lead"
   - "senior director"
   - "VP "
   - "vice president"
   - "chief"
-  - "intern"
-  - "internship"
-  - "co-op"
   - "clearance required"
   - "TS/SCI"
   - "principal scientist"

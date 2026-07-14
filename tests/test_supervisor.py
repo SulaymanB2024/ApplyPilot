@@ -116,6 +116,16 @@ def test_runtime_states_require_explicit_evidence_and_gate_browser_work(tmp_path
         next_action_code="provide_chatgpt_web_role_candidates",
         browser_required=True,
         runtime_status=paused,
+    ) == (
+        "browser_connector",
+        "provide_chatgpt_web_role_candidates",
+        True,
+    )
+    assert runtime_gated_decision(
+        next_action_owner="browser_connector",
+        next_action_code="execute_scoped_submission",
+        browser_required=True,
+        runtime_status=paused,
     ) == ("controller", "restore_chronicle_capture", False)
 
     wrong_browser = record_runtime_observation(
@@ -165,7 +175,11 @@ def test_runtime_states_require_explicit_evidence_and_gate_browser_work(tmp_path
         next_action_code="provide_chatgpt_web_role_candidates",
         browser_required=True,
         runtime_status=expired_wrong_browser,
-    ) == ("controller", "refresh_runtime_observation", False)
+    ) == (
+        "browser_connector",
+        "provide_chatgpt_web_role_candidates",
+        True,
+    )
 
 
 def test_runtime_observation_fails_closed_on_scope_corruption_and_symlinks(tmp_path):
@@ -244,6 +258,12 @@ def test_missing_runtime_observation_is_explicitly_not_ready(tmp_path):
     assert runtime_gated_decision(
         next_action_owner="browser_connector",
         next_action_code="discover_roles",
+        browser_required=True,
+        runtime_status=status,
+    ) == ("browser_connector", "discover_roles", True)
+    assert runtime_gated_decision(
+        next_action_owner="browser_connector",
+        next_action_code="execute_scoped_submission",
         browser_required=True,
         runtime_status=status,
     ) == ("controller", "refresh_runtime_observation", False)

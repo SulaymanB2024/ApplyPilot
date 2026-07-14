@@ -553,9 +553,9 @@ def test_heartbeat_defaults_to_five_minutes_and_persists_timestamp(tmp_path):
     assert initial["last_progress_at"] == NOW.isoformat()
     assert initial["progress_age_seconds"] == 0
     assert len(initial["progress_fingerprint"]) == 64
-    assert initial["next_action_owner"] == "controller"
-    assert initial["next_action_code"] == "refresh_runtime_observation"
-    assert initial["browser_required"] is False
+    assert initial["next_action_owner"] == "browser_connector"
+    assert initial["next_action_code"] == "discover_candidate_roles"
+    assert initial["browser_required"] is True
     assert initial["runtime_ready"] is False
     assert initial["runtime_observation_state"] == "missing"
     record_runtime_observation(
@@ -595,7 +595,7 @@ def test_heartbeat_defaults_to_five_minutes_and_persists_timestamp(tmp_path):
     assert unchanged["heartbeat_due"] is False
     assert unchanged["state_changed"] is False
     assert unchanged["progress_age_seconds"] == 299
-    assert unchanged["next_action_code"] == "refresh_runtime_observation"
+    assert unchanged["next_action_code"] == "discover_candidate_roles"
     assert store.heartbeat_snapshot(now=NOW + timedelta(seconds=300))["heartbeat_due"] is True
     assert CampaignStore.open(store.root).heartbeat_snapshot(now=NOW)["last_heartbeat_at"] == NOW.isoformat()
 

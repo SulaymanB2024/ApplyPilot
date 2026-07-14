@@ -12,7 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   first-party role verification, compact fact packs, review-only form inspection, and
   `applypilot autonomy plan|advance|import-response|probe-chatgpt|run` commands.
 - **Portable browser handoff queue** - Added manifest-bound, request-ID-bound ChatGPT Web
-  artifacts so an authenticated browser tool can service at most three small model calls
+  artifacts so an authenticated browser tool can service up to eight bounded model calls
   without exposing browser credentials or spawning a nested model process.
 - **Bounded funnel telemetry** - Added hard per-run budgets, privacy-preserving usage
   ledgers, deterministic eligibility/freshness gates, and no-progress circuit breakers.
@@ -31,13 +31,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Latest-run supervision** - Added fail-closed `--latest` selectors for pre-campaign status and
   heartbeat commands so unattended workers can find the canonical app-data run without copying
   private absolute paths or falling back past incomplete state.
-- **Compact supervisor decision** - Added human-gate-first action ownership, stable progress
-  fingerprints, and `--compact` status/heartbeat output so five-minute pollers separate liveness
-  from material progress without repeatedly loading nested run context.
+- **Compact supervisor decision** - Added phase-aware action ownership, separate external-action
+  and reversible-research states, stable progress fingerprints, and `--compact` status/heartbeat
+  output so five-minute pollers separate liveness from material progress without repeatedly
+  loading nested run context.
 - **Runtime observation contract** - Added fixed-name, exact-schema, expiring diagnostics for
-  Chronicle freshness and the Codex Chrome connector. Browser handoffs now pause on missing,
-  stale, unauthenticated, unavailable, or wrong-surface observations without storing screenshots,
-  URLs, profiles, or cookies.
+  Chronicle freshness and the Codex Chrome connector. Reversible research and read-only handoffs
+  can proceed when telemetry is missing or stale, while freshly observed connector failures
+  trigger recovery and irreversible actions still require fresh runtime proof. Observations never store
+  screenshots, URLs, profiles, or cookies.
 - **Compact live-campaign supervision** - Added `campaign status --compact` and
   `campaign heartbeat --compact` with durable progress age/fingerprints, action ownership,
   runtime gating, blockers, and 0/100 accounting without nested candidate or artifact maps.
@@ -59,8 +61,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   manifest bound to the candidate, material bytes, filled form, and apply policy.
 - **Explicit account boundary** - Job-site account creation is disabled by default and
   requires the per-run `--allow-account-creation` flag.
-- **Discovery source policy** - The autonomy funnel uses ChatGPT Web first and permits
-  direct ATS fallback only after a recorded primary failure; broad aggregators are disabled.
+- **Discovery source policy** - The autonomy funnel uses ChatGPT Web first, treats the campaign
+  query as an objective rather than an exact-title allowlist, searches adjacent early-career role
+  families, and accepts only resolved official employer or ATS URLs. Direct ATS fallback still
+  requires a recorded primary failure.
+- **Action-proportional gates** - Unknown application facts, unsigned live approval, and stale
+  Chronicle telemetry no longer suppress discovery, first-party verification, local material
+  drafting, response import, or read-only form inspection. The same facts, signatures, and
+  candidate-scoped authorization still fail closed before form filling or submission.
 - **Resumable autonomy contract** - Reviewed facts, context, policy, query, run ID, prompts,
   and imported responses are digest-bound; missing responses remain pending and stale,
   swapped, or one-sided edits inconsistent with the receipt fail closed. Receipts are not
@@ -75,7 +83,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   semantically rejected material can be corrected after quarantine, fact approvals bind source
   hashes, shared ATS tenants bind to employers, and form-review success rejects unrelated URLs,
   challenges, logins, account creation, unknown fields, and field-value aliases.
-- **Structured applicant claims** - Material prompt schema v3 separates applicant assertions
+- **Structured applicant claims** - Material prompt schema v4 separates applicant assertions
   from job evidence. Every first-person or possessive assertion must exactly match a structured
   claim supported by applicant facts; `JOB` evidence cannot establish an applicant skill. Final
   letters are rejected above four paragraphs, 450 words, or 20 structured applicant claims.

@@ -46,21 +46,26 @@ class SourcePolicy:
 
 @dataclass(frozen=True)
 class FunnelBudget:
-    """Hard caps for one autonomous run."""
+    """Hard caps for one autonomous run.
 
-    discoveries: int = 10
-    first_party_verifications: int = 5
-    material_packets: int = 2
-    form_dry_runs: int = 1
-    model_calls: int = 3
-    browser_navigations: int = 8
-    external_calls: int = 15
-    retries: int = 2
-    artifacts: int = 12
-    prompt_chars: int = 40_000
-    response_chars: int = 80_000
+    Discovery is intentionally broad enough to build a useful candidate set.
+    The funnel still narrows before material generation and form inspection,
+    and final external actions remain governed by separate authorization.
+    """
+
+    discoveries: int = 30
+    first_party_verifications: int = 15
+    material_packets: int = 5
+    form_dry_runs: int = 3
+    model_calls: int = 8
+    browser_navigations: int = 32
+    external_calls: int = 50
+    retries: int = 6
+    artifacts: int = 40
+    prompt_chars: int = 60_000
+    response_chars: int = 160_000
     elapsed_seconds: int = 0
-    no_progress_cycles: int = 2
+    no_progress_cycles: int = 3
 
     def validate(self) -> None:
         for name, value in asdict(self).items():

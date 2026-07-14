@@ -185,19 +185,65 @@ def build_discovery_prompt(
 ) -> str:
     """Build one strict-JSON ChatGPT Web role-discovery request."""
     payload = {
-        "task": "Find currently open roles matching this sanitized candidate profile.",
+        "task": (
+            "Build a high-recall, high-quality candidate set of currently open roles "
+            "matching this sanitized candidate profile."
+        ),
         "query": query,
         "limit": limit,
         "source_rules": [
             "Use ChatGPT Web research as the discovery surface.",
+            (
+                "Use general web search, employer career indexes, university recruiting pages, "
+                "and job boards as discovery hints when useful, but return only the resolved "
+                "official employer or ATS posting URL."
+            ),
             "Return official employer or ATS URLs only.",
             "Do not return LinkedIn, Indeed, JobSpy, Glassdoor, ZipRecruiter, or Google Jobs URLs.",
             "Treat every role as an unverified candidate; ApplyPilot will verify first-party status.",
+        ],
+        "search_strategy": [
+            (
+                "Treat the query as a campaign objective, not an exact-title allowlist. Expand it "
+                "into adjacent role families supported by the candidate's experience, projects, "
+                "skills, education, and preferences."
+            ),
+            (
+                "Search across internships, co-ops, apprenticeships, fellowships, new-grad, "
+                "entry-level, analyst, associate, coordinator, operations, program, product, "
+                "strategy, research, finance, growth, and technical-business variants when the "
+                "candidate evidence supports them."
+            ),
+            (
+                "Use graduation timing and availability to identify the appropriate recruiting "
+                "cycle. Do not discard an otherwise plausible role merely because compensation, "
+                "posting date, deadline, or start date is absent; return the field as null for "
+                "first-party verification."
+            ),
+            (
+                "Treat preferred locations as ranking signals rather than discovery exclusions. "
+                "Include remote and broader domestic roles plus exceptional out-of-preference "
+                "roles, unless the supplied facts state a hard geographic restriction."
+            ),
+            (
+                "Favor credible paid roles and a diverse result set: multiple role families and "
+                "employers, no more than two roles per employer unless the evidence strongly "
+                "justifies it."
+            ),
+            (
+                "At discovery time reject only clear mismatches such as senior leadership, a hard "
+                "graduation or work-authorization conflict, unpaid work when paid work is required, "
+                "or an explicitly closed posting. Preserve ambiguous candidates for local review."
+            ),
         ],
         "reasoning_guidance": [
             "Use as much internal analysis and web research as needed before answering.",
             "Consider the candidate's full supplied background, adjacent strengths, trajectory, and preferences rather than matching only title keywords.",
             "Cross-check promising roles against official employer or ATS pages.",
+            (
+                "If one site blocks content extraction, continue through other search routes and "
+                "official indexes instead of returning an empty list."
+            ),
             "Do not expose chain-of-thought or research notes; return only the final contract object.",
         ],
         "candidate_context": pack.to_dict(),
