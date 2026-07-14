@@ -62,6 +62,18 @@ MODEL_SAFE_FACT_PREFIXES = (
     "profile.skills_boundary.",
     "resume.line.",
 )
+DISCOVERY_PROFILE_KEYS = (
+    "education",
+    "target_role",
+    "current_title",
+    "years_of_experience_total",
+    "city_region",
+    "skills",
+    "preferred_locations",
+    "preferences",
+    "availability",
+    "work_authorization",
+)
 TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9+#.-]{1,}")
 
 
@@ -290,7 +302,12 @@ def build_discovery_prompt(
                 "valid candidates found; do not expand into non-job research to fill the quota."
             ),
         ],
-        "candidate_context": pack.to_dict(),
+        "candidate_context": _discovery_candidate_context(pack),
+        "candidate_context_policy": (
+            "Use this bounded matching context as supplied facts only. It intentionally omits "
+            "candidate links, named work samples, current-employer identity, and raw evidence "
+            "so they cannot become web-research targets."
+        ),
         "output_contract": {
             "schema_version": "applypilot.chatgpt_web.v1",
             "kind": "role_candidates",
@@ -443,6 +460,19 @@ def _compact_profile(
         ),
     }
     return {key: value for key, value in result.items() if value not in (None, "", {}, [])}
+
+
+def _discovery_candidate_context(pack: CompactContextPack) -> dict[str, Any]:
+    """Project the rich pack into non-navigable role-matching facts."""
+    return {
+        "version": pack.version,
+        "profile": {
+            key: pack.profile[key]
+            for key in DISCOVERY_PROFILE_KEYS
+            if key in pack.profile
+        },
+        "source_context_digest": pack.digest,
+    }
 
 
 def _compact_confirmed_profile(ledger: FactLedger) -> dict[str, Any]:

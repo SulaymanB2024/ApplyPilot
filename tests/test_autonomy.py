@@ -456,13 +456,20 @@ def test_context_pack_fails_closed_when_confirmed_profile_exceeds_budget():
         )
 
 
-def test_discovery_prompt_includes_full_evidence_and_live_job_search_contract():
+def test_discovery_prompt_uses_non_navigable_matching_context_and_live_job_contract():
     pack = CompactContextPack(
         version="test-context",
-        profile={"target_role": "Product analyst"},
+        profile={
+            "target_role": "Product analyst",
+            "skills": {"analytics": ["SQL", "Python"]},
+            "work_samples_and_results": {
+                "projects": ["Spotify playlist analysis at https://open.spotify.com/example"]
+            },
+            "current_company": "ConsumerBrand",
+        },
         evidence=(
             {"id": "F01", "fact": "Built a verified analytics system."},
-            {"id": "F02", "fact": "Led a verified product research project."},
+            {"id": "F02", "fact": "Led a Spotify product research project."},
         ),
         digest="context-digest",
         serialized_chars=100,
@@ -470,7 +477,14 @@ def test_discovery_prompt_includes_full_evidence_and_live_job_search_contract():
 
     payload = json.loads(build_discovery_prompt(pack, query="early career roles", limit=5))
 
-    assert payload["candidate_context"] == pack.to_dict()
+    assert payload["candidate_context"]["profile"] == {
+        "target_role": "Product analyst",
+        "skills": {"analytics": ["SQL", "Python"]},
+    }
+    assert payload["candidate_context"]["source_context_digest"] == pack.digest
+    assert "Spotify" not in json.dumps(payload["candidate_context"])
+    assert "ConsumerBrand" not in json.dumps(payload["candidate_context"])
+    assert "intentionally omits candidate links" in payload["candidate_context_policy"]
     assert any("live job postings" in rule for rule in payload["reasoning_guidance"])
     assert any("do not invoke long-running deep research" in rule for rule in payload["source_rules"])
     assert any("Do not search scholarly literature" in rule for rule in payload["source_rules"])

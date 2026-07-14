@@ -31,7 +31,7 @@ from applypilot.autonomy.telemetry import BudgetExceeded, UsageLedger
 
 HANDOFF_SCHEMA_VERSION = "applypilot.handoff.v1"
 RUN_SCHEMA_VERSION = "applypilot.autonomy-run.v1"
-PROMPT_SCHEMA_VERSION = "applypilot.chatgpt-prompt.v5"
+PROMPT_SCHEMA_VERSION = "applypilot.chatgpt-prompt.v6"
 
 
 class ArtifactPending(RuntimeError):
