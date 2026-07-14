@@ -63,10 +63,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   requires the per-run `--allow-account-creation` flag.
 - **Discovery source policy** - The autonomy funnel uses ChatGPT Web first, treats the campaign
   query as an objective rather than an exact-title allowlist, searches adjacent early-career role
-  families, and accepts only resolved official employer or ATS URLs. Prompt schema v5 confines
+  families, and accepts only resolved official employer or ATS URLs. Prompt schema v6 confines
   research to bounded live-job routes, excludes scholarly and generic background research, and
-  requires route switching after blocked or irrelevant sources. Direct ATS fallback still requires
-  a recorded primary failure.
+  removes candidate links, named work samples, current-employer identity, and raw evidence from discovery
+  while preserving the rich pack for later material calls. It also requires route switching after
+  blocked or irrelevant sources. Direct ATS fallback still requires a recorded primary failure.
 - **Action-proportional gates** - Unknown application facts, unsigned live approval, and stale
   Chronicle telemetry no longer suppress discovery, first-party verification, local material
   drafting, response import, or read-only form inspection. The same facts, signatures, and
