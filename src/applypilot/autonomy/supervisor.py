@@ -47,6 +47,22 @@ BROWSER_READINESS_STATES = frozenset(
 )
 SCOPE_KINDS = frozenset({"run", "campaign"})
 
+# These actions are reversible research or read-only inspection. A known bad
+# connector state still stops them, but missing or stale Chronicle telemetry is
+# advisory rather than a precondition. State-changing submission actions retain
+# the strict fresh-runtime contract below.
+REVERSIBLE_BROWSER_ACTIONS = frozenset(
+    {
+        "discover_candidate_roles",
+        "discover_roles",
+        "prepare_candidate_materials",
+        "provide_chatgpt_web_material_packet",
+        "provide_chatgpt_web_role_candidates",
+        "perform_read_only_form_review",
+        "service_pending_chatgpt_web_request",
+    }
+)
+
 _SAFE_SCOPE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,199}\Z")
 _OBSERVATION_FIELDS = frozenset(
     {
@@ -213,10 +229,27 @@ def runtime_gated_decision(
     browser_required: bool,
     runtime_status: Mapping[str, Any],
 ) -> tuple[str, str, bool]:
-    """Hold browser work until the correct fresh external runtime is observed."""
+    """Apply action-proportional browser readiness checks.
+
+    Research and read-only inspection may attempt the ordinary connector when
+    telemetry is missing or Chronicle is stale. Fresh, explicit wrong-surface,
+    unavailable, and unauthenticated observations still produce recovery work.
+    Irreversible browser actions continue to require the full fresh runtime.
+    """
     if not browser_required:
         return next_action_owner, next_action_code, False
     semantic = runtime_semantic_state(runtime_status)
+    if next_action_code in REVERSIBLE_BROWSER_ACTIONS:
+        if semantic["observation_state"] == "fresh":
+            if semantic["browser_surface"] == "wrong_surface":
+                return "system_admin", "activate_codex_chrome_connector", False
+            if semantic["browser_readiness"] == "unauthenticated":
+                return "applicant", "authenticate_chatgpt_web", False
+            if semantic["browser_surface"] == "unavailable" or semantic[
+                "browser_readiness"
+            ] == "unavailable":
+                return "controller", "restore_codex_chrome_connector", False
+        return next_action_owner, next_action_code, True
     if semantic["runtime_ready"]:
         return next_action_owner, next_action_code, True
     if semantic["observation_state"] != "fresh":

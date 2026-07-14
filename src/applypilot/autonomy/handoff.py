@@ -31,7 +31,7 @@ from applypilot.autonomy.telemetry import BudgetExceeded, UsageLedger
 
 HANDOFF_SCHEMA_VERSION = "applypilot.handoff.v1"
 RUN_SCHEMA_VERSION = "applypilot.autonomy-run.v1"
-PROMPT_SCHEMA_VERSION = "applypilot.chatgpt-prompt.v3"
+PROMPT_SCHEMA_VERSION = "applypilot.chatgpt-prompt.v4"
 
 
 class ArtifactPending(RuntimeError):
@@ -517,14 +517,6 @@ def import_response_artifact(*, request_path: Path, input_path: Path) -> dict[st
     run_id = str(request.get("run_id") or "")
     if not run_id:
         raise ValueError("handoff request is missing its run binding")
-    from applypilot.autonomy.supervisor import require_browser_runtime
-
-    require_browser_runtime(
-        root=run_dir,
-        scope_kind="run",
-        scope_id=run_id,
-    )
-
     text = input_path.read_text(encoding="utf-8")
     max_chars = int(request.get("max_response_chars") or 0)
     try:

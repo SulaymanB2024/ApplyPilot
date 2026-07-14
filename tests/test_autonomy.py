@@ -472,7 +472,21 @@ def test_discovery_prompt_includes_full_evidence_and_deep_reasoning_contract():
 
     assert payload["candidate_context"] == pack.to_dict()
     assert any("as much internal analysis" in rule for rule in payload["reasoning_guidance"])
+    assert any("not an exact-title allowlist" in rule for rule in payload["search_strategy"])
+    assert any("ranking signals" in rule for rule in payload["search_strategy"])
+    assert any("discovery hints" in rule for rule in payload["source_rules"])
     assert payload["response_rule"].startswith("Return exactly one JSON object")
+
+
+def test_default_funnel_budget_favors_recall_before_narrowing():
+    budget = FunnelBudget()
+
+    assert budget.discoveries == 30
+    assert budget.first_party_verifications == 15
+    assert budget.material_packets == 5
+    assert budget.form_dry_runs == 3
+    assert budget.model_calls == 8
+    budget.validate()
 
 
 def test_material_prompt_prioritizes_relevant_facts_without_dropping_context():
@@ -1974,9 +1988,11 @@ def test_pre_campaign_status_and_heartbeat_are_fixed_name_and_redacted(
     assert status["target_confirmed"] == 100
     assert status["preferred_location_fact_count"] == 0
     assert status["heartbeat_due"] is True
-    assert status["next_action_owner"] == "applicant"
-    assert status["next_action_code"] == "confirm_preferred_location"
-    assert status["browser_required"] is False
+    assert status["external_action_gate"] == "preferred_location"
+    assert status["research_can_progress"] is True
+    assert status["next_action_owner"] == "browser_connector"
+    assert status["next_action_code"] == "provide_chatgpt_web_role_candidates"
+    assert status["browser_required"] is True
     assert status["runtime_ready"] is False
     assert status["runtime_observation_state"] == "missing"
     assert status["browser_surface"] == "unknown"
@@ -2086,7 +2102,9 @@ def test_pre_campaign_status_and_heartbeat_are_fixed_name_and_redacted(
     )
     assert cli_compact.exit_code == 0, cli_compact.output
     assert len(cli_compact.output) < 1_200
-    assert '"next_action_code": "confirm_preferred_location"' in cli_compact.output
+    assert '"next_action_code": "provide_chatgpt_web_role_candidates"' in cli_compact.output
+    assert '"external_action_gate": "preferred_location"' in cli_compact.output
+    assert '"research_can_progress": true' in cli_compact.output
     for omitted in (
         "fact_states",
         "handoff",
@@ -2301,7 +2319,7 @@ def test_latest_run_selector_is_deterministic_and_fails_closed(monkeypatch, tmp_
     compact = CLI_RUNNER.invoke(app, ["autonomy", "status", "--latest", "--compact"])
     assert compact.exit_code == 0, compact.output
     assert len(compact.output) < 1_200
-    assert '"next_action_owner": "applicant"' in compact.output
+    assert '"next_action_owner": "browser_connector"' in compact.output
     assert "fact_states" not in compact.output
     heartbeat = CLI_RUNNER.invoke(
         app,
@@ -2366,7 +2384,7 @@ def test_latest_run_selector_is_deterministic_and_fails_closed(monkeypatch, tmp_
         latest_autonomy_run_dir(root=linked_root)
 
 
-def test_artifact_advance_blocks_unreviewed_required_facts_before_tools(monkeypatch, tmp_path):
+def test_artifact_advance_allows_research_with_unreviewed_live_facts(monkeypatch, tmp_path):
     app_dir = tmp_path / "app-data"
     app_dir.mkdir()
     profile = deepcopy(PROFILE)
@@ -2392,13 +2410,40 @@ def test_artifact_advance_blocks_unreviewed_required_facts_before_tools(monkeypa
     class MustNotVerify:
         @staticmethod
         def verify(_candidate):
-            raise AssertionError("verifier must not run before fact readiness")
+            raise AssertionError("verifier must not run before discovery returns candidates")
+
+    pending = advance_artifact_run(
+        run_dir=run_dir,
+        approved_fact_digest=facts["digest"],
+        verifier=MustNotVerify(),
+    )
+    assert pending["status"] == "awaiting_chatgpt_web"
+    assert pending["pending_requests"][0]["kind"] == "role_candidates"
+
+    status = run_status_snapshot(run_dir=run_dir)
+    assert status["external_action_gate"] == "required_facts"
+    assert status["research_can_progress"] is True
+    assert status["next_action_owner"] == "browser_connector"
+    assert status["next_action_code"] == "provide_chatgpt_web_role_candidates"
+    assert status["browser_required"] is True
 
     with pytest.raises(PermissionError, match="require_sponsorship"):
-        advance_artifact_run(
+        autonomy_runner.load_reviewed_run_snapshot(
             run_dir=run_dir,
             approved_fact_digest=facts["digest"],
-            verifier=MustNotVerify(),
+            require_signed_approval=True,
+        )
+    with pytest.raises(PermissionError, match="require_sponsorship"):
+        autonomy_runner.prepare_fact_approval_attestation(
+            run_dir=run_dir,
+            approved_fact_digest=facts["digest"],
+            issuer="applicant@example.com",
+            source_surface="codex_user_message",
+            source_message_sha256="a" * 64,
+            source_author_sha256="b" * 64,
+            source_observed_at=datetime.now(timezone.utc),
+            valid_hours=24,
+            output_path=tmp_path / "approval.json",
         )
 
 
@@ -2471,16 +2516,6 @@ def test_artifact_handoff_advances_to_review_ready_without_browser(monkeypatch, 
         ),
         encoding="utf-8",
     )
-    direct_response = run_dir / str(discovery_request["response_path"])
-    direct_response.write_text(discovery_input.read_text(encoding="utf-8"), encoding="utf-8")
-    with pytest.raises(PermissionError, match="refresh_runtime_observation"):
-        advance_artifact_run(
-            run_dir=run_dir,
-            approved_fact_digest=facts["digest"],
-            verifier=verifier,
-        )
-    direct_response.unlink()
-    _record_ready_runtime(run_dir, str(discovery_request["run_id"]))
     import_response_artifact(
         request_path=run_dir / "handoff" / "discovery.request.json",
         input_path=discovery_input,
@@ -2645,10 +2680,6 @@ def test_artifact_import_rejects_swapped_request_id(monkeypatch, tmp_path):
         encoding="utf-8",
     )
 
-    with pytest.raises(PermissionError, match="refresh_runtime_observation"):
-        import_response_artifact(request_path=request_path, input_path=bad_input)
-    request = json.loads(request_path.read_text(encoding="utf-8"))
-    _record_ready_runtime(request_path.parent.parent, str(request["run_id"]))
     with pytest.raises(ChatGPTContractError, match="request_id mismatch"):
         import_response_artifact(request_path=request_path, input_path=bad_input)
     rejected_imports = list(request_path.parent.glob("discovery.rejected.*.json"))

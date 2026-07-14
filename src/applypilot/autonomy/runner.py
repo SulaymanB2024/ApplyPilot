@@ -44,7 +44,6 @@ from applypilot.autonomy.handoff import (
 )
 from applypilot.autonomy.policy import FunnelBudget, RunPolicy, SourcePolicy
 from applypilot.autonomy.supervisor import (
-    require_browser_runtime,
     runtime_gated_decision,
     runtime_observation_snapshot,
     runtime_semantic_state,
@@ -305,6 +304,7 @@ def run_status_snapshot(
     else:
         review_phase = "ready_to_advance"
 
+    research_can_progress = _research_can_progress(review_phase)
     next_action_owner, next_action_code, browser_required = _supervisor_decision(
         live_gate=live_gate,
         review_phase=review_phase,
@@ -328,6 +328,8 @@ def run_status_snapshot(
                 "run_id": bindings.run_id,
                 "review_phase": review_phase,
                 "live_gate": live_gate,
+                "external_action_gate": live_gate,
+                "research_can_progress": research_can_progress,
                 "submitted_confirmed": 0,
                 "fact_states": state_counts,
                 "required_fact_blockers": required_fact_blockers,
@@ -381,6 +383,8 @@ def run_status_snapshot(
         "run_created_at": run_created_at.isoformat(),
         "review_phase": review_phase,
         "live_gate": live_gate,
+        "external_action_gate": live_gate,
+        "research_can_progress": research_can_progress,
         "next_action_owner": next_action_owner,
         "next_action_code": next_action_code,
         "browser_required": browser_required,
@@ -423,6 +427,9 @@ def compact_run_status(status: dict[str, Any]) -> dict[str, Any]:
         "recorded_at",
         "target_confirmed",
         "submitted_confirmed",
+        "review_phase",
+        "external_action_gate",
+        "research_can_progress",
         "next_action_owner",
         "next_action_code",
         "browser_required",
@@ -483,7 +490,8 @@ def load_reviewed_run_snapshot(
 
     fact_ledger = fact_ledger_from_dict(_read_json(run_dir / "fact_ledger.json"))
     require_approved_fact_digest(fact_ledger.digest, approved_fact_digest)
-    _require_autonomy_ready_facts(fact_ledger)
+    if require_signed_approval:
+        _require_autonomy_ready_facts(fact_ledger)
     if fact_ledger.digest != bindings.fact_digest:
         raise ValueError("run manifest fact digest mismatch")
 
@@ -565,6 +573,7 @@ def import_signed_fact_approval(
     run_dir = run_dir.resolve()
     manifest = _read_json(run_dir / "run_manifest.json")
     fact_ledger = fact_ledger_from_dict(_read_json(run_dir / "fact_ledger.json"))
+    _require_autonomy_ready_facts(fact_ledger)
     from applypilot.autonomy.approval import (
         FactApprovalExpectation,
         require_system_approval_trust_store,
@@ -613,6 +622,7 @@ def prepare_fact_approval_attestation(
     run_dir = run_dir.resolve()
     manifest = _read_json(run_dir / "run_manifest.json")
     fact_ledger = fact_ledger_from_dict(_read_json(run_dir / "fact_ledger.json"))
+    _require_autonomy_ready_facts(fact_ledger)
     from applypilot.autonomy.approval import (
         FactApprovalExpectation,
         approval_json_bytes,
@@ -658,7 +668,6 @@ def advance_artifact_run(
 
     fact_ledger = fact_ledger_from_dict(_read_json(run_dir / "fact_ledger.json"))
     require_approved_fact_digest(fact_ledger.digest, approved_fact_digest)
-    _require_autonomy_ready_facts(fact_ledger)
     if fact_ledger.digest != bindings.fact_digest:
         raise ValueError("run manifest fact digest mismatch")
 
@@ -677,14 +686,6 @@ def advance_artifact_run(
         raise ValueError("run manifest policy digest mismatch")
     if not policy.review_only:
         raise ValueError("artifact handoff runner is review-only")
-
-    handoff_status = _run_handoff_status(run_dir=run_dir, bindings=bindings)
-    if handoff_status["responded_unconsumed_count"]:
-        require_browser_runtime(
-            root=run_dir,
-            scope_kind="run",
-            scope_id=bindings.run_id,
-        )
 
     ledger = UsageLedger(run_id=bindings.run_id, budget=policy.budget)
     _restore_artifact_usage(ledger, run_dir)
@@ -742,7 +743,6 @@ def run_with_cdp(
     corrections = load_corrections(corrections_path) if corrections_path else ()
     fact_ledger = build_fact_ledger(profile, resume_text=resume_text, corrections=corrections)
     require_approved_fact_digest(fact_ledger.digest, approved_fact_digest)
-    _require_autonomy_ready_facts(fact_ledger)
     context_pack = build_context_pack(
         profile,
         resume_text=resume_text,
@@ -845,7 +845,8 @@ def _require_autonomy_ready_facts(fact_ledger: Any) -> None:
     blockers = require_confirmed_facts(fact_ledger, REQUIRED_AUTONOMY_FACT_IDS)
     if blockers:
         raise PermissionError(
-            "autonomy facts require applicant review before any model or browser call: "
+            "live application facts require applicant review before approval, form filling, "
+            "or submission: "
             + ",".join(blockers)
         )
 
@@ -1046,8 +1047,6 @@ def _supervisor_decision(*, live_gate: str, review_phase: str) -> tuple[str, str
         ),
         "signed_fact_approval": ("applicant", "sign_fact_approval", False),
     }
-    if live_gate in gate_decisions:
-        return gate_decisions[live_gate]
     phase_decisions = {
         "reported_budget_exhausted": ("none", "budget_exhausted", False),
         "response_ready_to_advance": ("controller", "advance_imported_response", False),
@@ -1080,10 +1079,31 @@ def _supervisor_decision(*, live_gate: str, review_phase: str) -> tuple[str, str
         "reported_failed_closed": ("controller", "inspect_failed_closed", False),
         "ready_to_advance": ("controller", "advance_run", False),
     }
-    return phase_decisions.get(
-        review_phase,
-        ("controller", "inspect_supervisor_status", False),
-    )
+    if review_phase in phase_decisions:
+        return phase_decisions[review_phase]
+    if live_gate in gate_decisions:
+        return gate_decisions[live_gate]
+    return "controller", "inspect_supervisor_status", False
+
+
+def _research_can_progress(review_phase: str) -> bool:
+    """Report whether reversible research/review work remains actionable.
+
+    Applicant facts and live approvals are external-action gates. They must not
+    suppress discovery, first-party verification, local material drafting, or
+    read-only form inspection.
+    """
+    return review_phase in {
+        "response_ready_to_advance",
+        "awaiting_role_candidates",
+        "awaiting_material_packet",
+        "awaiting_form_review",
+        "reported_review_ready",
+        "reported_form_review_blocked",
+        "reported_no_eligible_verified_roles",
+        "reported_failed_closed",
+        "ready_to_advance",
+    }
 
 
 def _read_run_heartbeat(

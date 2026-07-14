@@ -27,16 +27,20 @@ The `applypilot autonomy` path is a finite, artifact-first coordinator:
 
 1. Build a source-bound fact ledger and a compact context pack from an explicit allowlist of
    confirmed facts.
-2. Ask ChatGPT Web for a bounded list of official employer or ATS URLs using strict JSON.
-3. Reject senior, experience-ineligible, and known availability-conflicting roles locally.
+2. Ask ChatGPT Web for a high-recall, bounded list of official employer or ATS URLs using
+   broad search routes, adjacent early-career role families, and strict JSON.
+3. Reject only clear senior, experience-ineligible, and known availability-conflicting roles
+   locally; preserve ambiguous level, date, and location cases for review.
 4. Verify each remaining role against a first-party ATS or employer surface without a model.
-5. Ask ChatGPT Web for at most two evidence-cited material packets.
-6. Inspect at most one application form without filling, uploading, or submitting.
+5. Ask ChatGPT Web for at most five evidence-cited material packets.
+6. Inspect at most three application forms without filling, uploading, or submitting.
 7. Write a local result ledger with counts, budgets, decision reasons, and usage estimates.
 
-LinkedIn, Indeed, JobSpy, Glassdoor, ZipRecruiter, and Google Jobs are disabled in this path.
-Direct ATS discovery is allowed only after a recorded ChatGPT Web failure. Challenge pages and
-provider failures are measurement gaps, not evidence that a posting is healthy or closed.
+LinkedIn, Indeed, JobSpy, Glassdoor, ZipRecruiter, and Google Jobs are never accepted as candidate
+URLs in this path; the research model may use indexed references only to locate the official
+posting. Direct ATS discovery is allowed only after a recorded ChatGPT Web failure. Challenge
+pages and provider failures are measurement gaps, not evidence that a posting is healthy or
+closed.
 
 ## Hard budgets
 
@@ -44,15 +48,18 @@ Default limits per run are:
 
 | Resource | Limit |
 | --- | ---: |
-| ChatGPT Web model calls | 3 |
-| Discoveries | 10 |
-| First-party verifications | 5 |
-| Material packets | 2 |
-| Read-only form reviews | 1 |
-| Browser navigations | 8 |
-| External calls | 15 |
-| Prompt characters per model call | 40,000 |
-| Response characters per model call | 80,000 |
+| ChatGPT Web model calls | 8 |
+| Discoveries | 30 |
+| First-party verifications | 15 |
+| Material packets | 5 |
+| Read-only form reviews | 3 |
+| Browser navigations | 32 |
+| External calls | 50 |
+| Retries | 6 |
+| Artifacts | 40 |
+| Prompt characters per model call | 60,000 |
+| Response characters per model call | 160,000 |
+| Consecutive no-progress cycles | 3 |
 | Model-call time | No fixed deadline |
 
 Telemetry stores hashes, counts, durations, and observed or estimated token fields. It does not
@@ -80,10 +87,12 @@ applypilot autonomy plan \
   --corrections ~/applypilot-fact-corrections.json
 ```
 
-Review the generated `fact_ledger.json` before allowing browser or model work. Blank,
-placeholder, and explicitly rejected facts remain blockers instead of being guessed.
-The plan command prints the ledger digest. Copy it only after review; `autonomy run` refuses
-to start if the fresh profile, resume, corrections file, or approved digest differs.
+Review the generated `fact_ledger.json` before advancing the immutable run. Blank,
+placeholder, and explicitly rejected facts are never guessed or sent as confirmed evidence.
+Unknown required application facts do not block discovery, first-party verification, local
+material drafting, or read-only form inspection; they remain blockers for live form filling and
+submission. The plan command prints the ledger digest. Copy it only after review; `autonomy run`
+refuses to start if the fresh profile, resume, corrections file, or approved digest differs.
 That copied digest is an integrity binding for review-only work, not proof that the applicant
 approved live use. Live campaign state requires the separately signed approval described below.
 
@@ -109,7 +118,7 @@ applypilot autonomy import-response \
   --request COPY_THE_PENDING_REQUEST_PATH_HERE \
   --input COPY_THE_BROWSER_RESPONSE_FILE_HERE
 
-# Repeat until status is review_ready; the hard cap is three ChatGPT calls.
+# Repeat until status is review_ready; the default run cap is eight ChatGPT calls.
 applypilot autonomy advance \
   --run-dir COPY_THE_PLAN_RUN_DIRECTORY_HERE \
   --approved-fact-digest COPY_THE_REVIEWED_PLAN_DIGEST_HERE
@@ -123,7 +132,7 @@ one-sided edited, or oversized response fails closed. Semantically rejected mate
 to a hash-named quarantine so a corrected bounded response can be imported without accepting
 the rejected output.
 Accepted receipts and hash-named rejection records are restored into the usage ledger on every
-`advance`, so resuming the CLI cannot reset the three-model-call budget or make a failed tool
+`advance`, so resuming the CLI cannot reset the run's model-call budget or make a failed tool
 attempt disappear.
 
 The receipt is an integrity/replay control, not a cryptographic defense against a hostile local
@@ -153,10 +162,12 @@ but selection never silently falls back past an invalid newest run. Equal newest
 prefixes are treated as ambiguous and require an explicit `--run-dir`.
 Add `--compact` for a bounded supervisor view containing only the precedence-resolved action
 owner/code, whether a browser is required, 0/100 progress, one stable state fingerprint,
-progress age, and poller heartbeat timing. Applicant and system gates always override pending
-browser handoffs. Recording another unchanged heartbeat refreshes liveness without resetting
-`last_progress_at`, allowing a five-minute controller to compare hashes instead of re-reading or
-re-reasoning over nested facts and handoff counts.
+progress age, and poller heartbeat timing. It reports the separate `external_action_gate` and
+`research_can_progress` states. A pending reversible research handoff remains actionable even
+when applicant or system approval still blocks later live actions. Recording another unchanged
+heartbeat refreshes liveness without resetting `last_progress_at`, allowing a five-minute
+controller to compare hashes instead of re-reading or re-reasoning over nested facts and handoff
+counts.
 
 `autonomy observe-runtime` and `campaign observe-runtime` let the external Codex supervisor write
 one fixed-name `runtime_observation.json`. The exact schema contains only its run/campaign binding,
@@ -168,12 +179,16 @@ Observations expire within ten minutes and are always labeled `externally_observ
 They are diagnostic only and can never establish applicant facts, authorization, form review, or
 submission evidence.
 
-Human and system approval gates still take precedence. Once a handoff genuinely needs a browser,
-the supervisor holds it until the observation proves the `codex_chrome_connector`, an authenticated
-composer, and fresh Chronicle capture. A wrong surface yields
-`activate_codex_chrome_connector`; an unauthenticated connector requests applicant authentication;
-stale or idle-paused Chronicle state requests capture restoration. The compact status carries only
-these coarse runtime fields, so the five-minute task does not need to reload screenshots or prose.
+Human and system approval gates still take precedence for form filling, submission, account
+changes, and other irreversible actions. Discovery, material research, and read-only form
+inspection may attempt the normal connector when Chronicle telemetry is missing, stale, or
+idle-paused; telemetry is diagnostic for those reversible actions. A fresh observation of the
+wrong surface yields `activate_codex_chrome_connector`, a freshly observed unauthenticated
+connector requests applicant authentication, and a freshly observed unavailable connector
+requests restoration. Irreversible browser actions
+still require the correct authenticated connector and fresh Chronicle capture. The compact status
+carries only these coarse runtime fields, so the five-minute task does not need to reload
+screenshots or prose.
 
 ## Signed applicant approval
 
@@ -263,7 +278,8 @@ The browser form artifact is also bound to the verified role site and cannot rep
 when CAPTCHA, login, or account creation is required. Unknown JSON fields and all field-value
 aliases are rejected.
 
-Material prompt schema v3 separates applicant assertions from job evidence. Every prose
+Material prompt schema v4 separates applicant assertions from job evidence and binds the
+high-recall discovery instructions. Every prose
 sentence that asserts something about the applicant through `I`, `me`, or `my` must be copied
 verbatim into a structured `applicant_claims` entry. Those entries may cite confirmed `F` facts
 only—never `JOB`—and their terms, named entities, and numbers are validated against exactly
@@ -291,8 +307,8 @@ needed. The fallback has no default model-process deadline, receives only confir
 and requires an approved fact ledger even during a dry-run. All unresolved required fields still
 fail closed.
 
-Context pack v2 and prompt schema v3 intentionally require a fresh `autonomy plan`. Do not try to
-advance a run packet created with context v1 or prompt schema v2 after upgrading.
+Context pack v2 and prompt schema v4 intentionally require a fresh `autonomy plan`. Do not try to
+advance a run packet created with context v1 or an older prompt schema after upgrading.
 
 ## Remaining live gate
 
