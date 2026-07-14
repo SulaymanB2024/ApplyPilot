@@ -235,6 +235,35 @@ class AutonomousBatch:
 
             self.ledger.record_cycle(material_progress=bool(verified))
             verified.sort(key=lambda item: (-item[2], item[0].candidate_id))
+            active_material_candidate_id = _active_candidate_id(
+                self.dependencies.materials,
+                kind="material_packet",
+            )
+            active_form_candidate_id = _active_candidate_id(
+                self.dependencies.form_review,
+                kind="form_review",
+            )
+            if active_material_candidate_id and active_form_candidate_id:
+                raise RuntimeError("multiple artifact stages are simultaneously active")
+            active_candidate_id = active_material_candidate_id or active_form_candidate_id
+            if active_candidate_id:
+                active_verified = [
+                    item for item in verified if item[0].candidate_id == active_candidate_id
+                ]
+                if len(active_verified) != 1:
+                    raise RuntimeError("active handoff candidate is no longer reviewable")
+                if active_form_candidate_id:
+                    # A later-stage form inspection must be consumed before ranking changes
+                    # can create any new material exchange.
+                    verified = active_verified
+                else:
+                    verified.sort(
+                        key=lambda item: (
+                            item[0].candidate_id != active_material_candidate_id,
+                            -item[2],
+                            item[0].candidate_id,
+                        )
+                    )
             packets: list[tuple[RoleCandidate, MaterialPacket]] = []
             for candidate, evidence, score in verified[: self.ledger.remaining("material_packets")]:
                 self.ledger.reserve("material_packets")
@@ -269,7 +298,15 @@ class AutonomousBatch:
                 )
 
             if self.dependencies.form_review and packets and self.ledger.remaining("form_dry_runs"):
-                candidate, packet = packets[0]
+                if active_form_candidate_id:
+                    matching_packets = [
+                        item for item in packets if item[0].candidate_id == active_form_candidate_id
+                    ]
+                    if len(matching_packets) != 1:
+                        raise RuntimeError("active form-review packet cannot be reconstructed")
+                    candidate, packet = matching_packets[0]
+                else:
+                    candidate, packet = packets[0]
                 self.ledger.reserve("form_dry_runs")
                 review = self.dependencies.form_review.dry_run(candidate=candidate, packet=packet)
                 result.form_reviews.append(
@@ -527,6 +564,21 @@ def factual_fit_score(
         return 0.0
     overlap = len(job_tokens & fact_tokens)
     return round(min(10.0, (overlap / max(8, min(len(job_tokens), 40))) * 10), 2)
+
+
+def _active_candidate_id(tool: Any, *, kind: str) -> str | None:
+    """Read optional artifact-resumption metadata without burdening ordinary tools."""
+    if tool is None:
+        return None
+    resolver = getattr(tool, "active_candidate_id", None)
+    if resolver is None:
+        return None
+    if not callable(resolver):
+        raise TypeError("artifact active-candidate resolver is not callable")
+    candidate_id = resolver(kind=kind)
+    if candidate_id is not None and (not isinstance(candidate_id, str) or not candidate_id):
+        raise ValueError("artifact active-candidate resolver returned an invalid value")
+    return candidate_id
 
 
 def _bounded_mapping(value: dict[str, Any]) -> dict[str, Any]:

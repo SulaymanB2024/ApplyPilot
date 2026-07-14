@@ -41,6 +41,7 @@ from applypilot.autonomy.handoff import (
     PROMPT_SCHEMA_VERSION,
     RunBindings,
     RUN_SCHEMA_VERSION,
+    reconcile_unanswered_handoffs,
 )
 from applypilot.autonomy.policy import FunnelBudget, RunPolicy, SourcePolicy
 from applypilot.autonomy.supervisor import (
@@ -720,6 +721,28 @@ def advance_artifact_run(
     return result.to_dict()
 
 
+def reconcile_artifact_handoffs(
+    *,
+    run_dir: Path,
+    approved_fact_digest: str,
+    retain_request_id: str,
+) -> dict[str, Any]:
+    """Auditably retain one of several unanswered requests for a reviewed run."""
+    run_dir = run_dir.resolve()
+    manifest = _read_json(run_dir / "run_manifest.json")
+    bindings = RunBindings.from_manifest(manifest)
+    _verify_immutable_artifacts(run_dir, manifest)
+    fact_ledger = fact_ledger_from_dict(_read_json(run_dir / "fact_ledger.json"))
+    require_approved_fact_digest(fact_ledger.digest, approved_fact_digest)
+    if fact_ledger.digest != bindings.fact_digest:
+        raise ValueError("run manifest fact digest mismatch")
+    return reconcile_unanswered_handoffs(
+        run_dir=run_dir,
+        bindings=bindings,
+        retain_request_id=retain_request_id,
+    )
+
+
 def run_with_cdp(
     *,
     query: str,
@@ -930,6 +953,9 @@ def _run_handoff_status(*, run_dir: Path, bindings: RunBindings) -> dict[str, An
         "pending_count": len(pending_kinds),
         "pending_kinds": sorted(set(pending_kinds)),
         "rejected_response_count": len(list(handoff_dir.glob("*.rejected.*.json"))),
+        "superseded_request_count": len(
+            list(handoff_dir.glob("*.superseded.*.json"))
+        ),
     }
 
 
