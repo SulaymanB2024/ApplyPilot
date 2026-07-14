@@ -106,6 +106,29 @@ sites:
     source_kind: employer_careers
     direct_source: true
 
+  # Explicit aliases cover official brand domains/ATS tenants whose label is not the
+  # normalized company name. Exact company-matching employer domains do not need an entry.
+  - name: "BNP Paribas Careers"
+    company: "BNP Paribas"
+    url: "https://group.bnpparibas"
+    type: static
+    source_kind: employer_careers
+    direct_source: true
+
+  - name: "JPMorganChase Careers"
+    company: "JPMorganChase"
+    url: "https://careers.jpmorgan.com"
+    type: static
+    source_kind: employer_careers
+    direct_source: true
+
+  - name: "M&T Bank Workday"
+    company: "M&T Bank"
+    url: "https://mtb.wd5.myworkdayjobs.com"
+    type: static
+    source_kind: direct_ats
+    direct_source: true
+
   # ── Searchable sites (URL includes query + location params) ──────────
   # Canada-specific
   - name: "Eluta"

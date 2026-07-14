@@ -300,6 +300,12 @@ def test_first_party_requires_exact_employer_or_ats_tenant_identity():
                 path_prefix="/jobs",
                 source_kind="employer_careers",
             ),
+            TrustedFirstPartySource(
+                company="M&T Bank",
+                host="mtb.wd5.myworkdayjobs.com",
+                path_prefix="/",
+                source_kind="direct_ats",
+            ),
         ),
     )
     matching = role(
@@ -329,9 +335,24 @@ def test_first_party_requires_exact_employer_or_ats_tenant_identity():
             "job/Product-Analyst-Intern_R123"
         ),
     )
+    derived_employer = role(
+        company="Acme Corp",
+        official_url="https://careers.acme-corp.com/jobs/123",
+    )
+    derived_country_domain = role(
+        company="Example Labs",
+        official_url="https://jobs.examplelabs.co.uk/openings/123",
+    )
+    configured_tenant_alias = role(
+        company="M&T Bank",
+        official_url="https://mtb.wd5.myworkdayjobs.com/en-US/MTB/job/Analyst-Intern_R123",
+    )
 
     assert verifier.verify(matching).first_party is True
+    assert verifier.verify(derived_employer).first_party is True
+    assert verifier.verify(derived_country_domain).first_party is True
     assert verifier.verify(hosted_ats).first_party is True
+    assert verifier.verify(configured_tenant_alias).first_party is True
     assert verifier.verify(deceptive).first_party is False
     assert verifier.verify(typosquat).first_party is False
     assert verifier.verify(wrong_greenhouse_tenant).first_party is False

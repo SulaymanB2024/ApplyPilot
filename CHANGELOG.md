@@ -86,6 +86,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   semantically rejected material can be corrected after quarantine, fact approvals bind source
   hashes, shared ATS tenants bind to employers, and form-review success rejects unrelated URLs,
   challenges, logins, account creation, unknown fields, and field-value aliases.
+- **First-party employer coverage** - Job-specific employer URLs may now pass the pre-fetch trust
+  gate when their registrable domain label exactly matches the normalized company name. Explicit
+  company/host aliases cover official brand domains and hosted ATS tenant labels without weakening
+  shared-ATS tenant, redirect, title, challenge, or public-network checks.
 - **Structured applicant claims** - Material prompt schema v4 separates applicant assertions
   from job evidence. Every first-person or possessive assertion must exactly match a structured
   claim supported by applicant facts; `JOB` evidence cannot establish an applicant skill. Final

@@ -36,6 +36,15 @@ HOSTED_ATS_SUFFIXES = (
     "avature.net",
     "myworkdayjobs.com",
 )
+COMMON_COUNTRY_SECOND_LEVEL_SUFFIXES = {
+    "ac",
+    "co",
+    "com",
+    "edu",
+    "gov",
+    "net",
+    "org",
+}
 CLOSED_MARKERS = (
     "job is no longer available",
     "no longer accepting applications",
@@ -318,17 +327,20 @@ class FirstPartyVerifier:
         parsed = urlparse(url)
         host = (parsed.hostname or "").lower().removeprefix("www.")
         path = "/" + parsed.path.strip("/")
-        if host in ATS_HOSTS:
-            return _shared_ats_tenant_matches(company, host, path)
-        if any(host == suffix or host.endswith(f".{suffix}") for suffix in HOSTED_ATS_SUFFIXES):
-            return _hosted_ats_tenant_matches(company, host)
-        return any(
+        configured_match = any(
             source.source_kind in {"direct_ats", "employer_careers"}
             and host == source.host
             and _company_identity_matches(company, source.company)
             and _path_is_within(path, source.path_prefix)
             for source in self.trusted_sources
         )
+        if configured_match:
+            return True
+        if host in ATS_HOSTS:
+            return _shared_ats_tenant_matches(company, host, path)
+        if any(host == suffix or host.endswith(f".{suffix}") for suffix in HOSTED_ATS_SUFFIXES):
+            return _hosted_ats_tenant_matches(company, host)
+        return _direct_employer_host_matches(company, host, path)
 
 
 class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -387,6 +399,37 @@ def _hosted_ats_tenant_matches(company: str, host: str) -> bool:
     if not any(host.endswith(f".{suffix}") for suffix in HOSTED_ATS_SUFFIXES):
         return False
     return _tenant_matches_company(company, host.split(".", 1)[0])
+
+
+def _direct_employer_host_matches(company: str, host: str, path: str) -> bool:
+    """Recognize a job-specific employer URL with an exact registrable-name binding."""
+    if not path.strip("/"):
+        return False
+    registrable_label = _registrable_host_label(host)
+    return bool(registrable_label and registrable_label in _company_domain_labels(company))
+
+
+def _company_domain_labels(company: str) -> set[str]:
+    normalized_tokens = re.findall(r"[a-z0-9]+", company.lower())
+    variants = {
+        "".join(_company_tokens(company)),
+        "".join(token for token in normalized_tokens if token not in {"and", "the"}),
+    }
+    return {variant for variant in variants if len(variant) >= 4}
+
+
+def _registrable_host_label(host: str) -> str:
+    labels = [label for label in host.lower().strip(".").split(".") if label]
+    if len(labels) < 2:
+        return ""
+    label_index = -2
+    if (
+        len(labels) >= 3
+        and len(labels[-1]) == 2
+        and labels[-2] in COMMON_COUNTRY_SECOND_LEVEL_SUFFIXES
+    ):
+        label_index = -3
+    return re.sub(r"[^a-z0-9]+", "", labels[label_index])
 
 
 def _path_is_within(path: str, prefix: str) -> bool:
