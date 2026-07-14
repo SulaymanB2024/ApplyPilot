@@ -272,8 +272,10 @@ an isolated browser or silently fall back to CDP.
 
 First-party verification does not trust a hostname merely because it contains the company
 name. Shared Greenhouse, Lever, Ashby, Workday, and Avature surfaces must bind their tenant to
-the candidate company; configured employer sources bind company, exact host, path prefix, and
-source kind. Account-backed recruiters and aggregators cannot become first-party evidence.
+the candidate company. Job-specific employer hosts may derive a narrow binding only when the
+registrable domain label exactly equals the normalized company name; brand domains and ATS tenant
+aliases still require an explicit configured company, exact host, path prefix, and source kind.
+Account-backed recruiters and aggregators cannot become first-party evidence.
 The browser form artifact is also bound to the verified role site and cannot report success
 when CAPTCHA, login, or account creation is required. Unknown JSON fields and all field-value
 aliases are rejected.
