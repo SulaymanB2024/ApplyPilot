@@ -194,13 +194,35 @@ def build_discovery_prompt(
         "source_rules": [
             "Use ChatGPT Web research as the discovery surface.",
             (
+                "This is live job-posting discovery, not topical or academic research. Use "
+                "ordinary web search for employer career pages, ATS postings, and university "
+                "recruiting pages; do not invoke long-running deep research."
+            ),
+            (
                 "Use general web search, employer career indexes, university recruiting pages, "
                 "and job boards as discovery hints when useful, but return only the resolved "
                 "official employer or ATS posting URL."
             ),
+            (
+                "Do not search scholarly literature, arXiv, papers, publications, news, market "
+                "research, or generic company background. The supplied candidate context is "
+                "authoritative; search only for currently open roles."
+            ),
             "Return official employer or ATS URLs only.",
             "Do not return LinkedIn, Indeed, JobSpy, Glassdoor, ZipRecruiter, or Google Jobs URLs.",
             "Treat every role as an unverified candidate; ApplyPilot will verify first-party status.",
+        ],
+        "route_order": [
+            "Employer jobs, careers, students, internships, and early-career indexes.",
+            (
+                "Public Greenhouse, Lever, Ashby, Workday, and Avature posting indexes, using "
+                "supported role-family and location terms."
+            ),
+            "Official university-recruiting and employer program pages with live role links.",
+            (
+                "General search or job-board snippets only as discovery hints; resolve every "
+                "candidate to its official employer or ATS posting before returning it."
+            ),
         ],
         "search_strategy": [
             (
@@ -213,6 +235,12 @@ def build_discovery_prompt(
                 "entry-level, analyst, associate, coordinator, operations, program, product, "
                 "strategy, research, finance, growth, and technical-business variants when the "
                 "candidate evidence supports them."
+            ),
+            (
+                "Start with concrete hiring queries that combine a supported role family, an "
+                "early-career level, a location or recruiting cycle when useful, and terms such "
+                "as jobs, careers, openings, or apply. Follow route_order instead of exploring "
+                "general background pages."
             ),
             (
                 "Use graduation timing and availability to identify the appropriate recruiting "
@@ -235,9 +263,18 @@ def build_discovery_prompt(
                 "graduation or work-authorization conflict, unpaid work when paid work is required, "
                 "or an explicitly closed posting. Preserve ambiguous candidates for local review."
             ),
+            (
+                "Time-box each route. After a blocked page or two irrelevant results, switch to "
+                "another employer, ATS, career index, or search query instead of waiting on one "
+                "domain."
+            ),
         ],
         "reasoning_guidance": [
-            "Use as much internal analysis and web research as needed before answering.",
+            (
+                "Reason privately only as much as needed to locate and compare live job postings; "
+                "do not research the candidate, their projects, academic literature, or industry "
+                "background."
+            ),
             "Consider the candidate's full supplied background, adjacent strengths, trajectory, and preferences rather than matching only title keywords.",
             "Cross-check promising roles against official employer or ATS pages.",
             (
@@ -245,6 +282,13 @@ def build_discovery_prompt(
                 "official indexes instead of returning an empty list."
             ),
             "Do not expose chain-of-thought or research notes; return only the final contract object.",
+        ],
+        "completion_rules": [
+            "Stop when the requested limit of distinct plausible live roles is reached.",
+            (
+                "If fewer roles are found after bounded live-job routes are exhausted, return the "
+                "valid candidates found; do not expand into non-job research to fill the quota."
+            ),
         ],
         "candidate_context": pack.to_dict(),
         "output_contract": {
