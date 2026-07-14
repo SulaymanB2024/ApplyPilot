@@ -456,7 +456,7 @@ def test_context_pack_fails_closed_when_confirmed_profile_exceeds_budget():
         )
 
 
-def test_discovery_prompt_includes_full_evidence_and_deep_reasoning_contract():
+def test_discovery_prompt_includes_full_evidence_and_live_job_search_contract():
     pack = CompactContextPack(
         version="test-context",
         profile={"target_role": "Product analyst"},
@@ -471,7 +471,13 @@ def test_discovery_prompt_includes_full_evidence_and_deep_reasoning_contract():
     payload = json.loads(build_discovery_prompt(pack, query="early career roles", limit=5))
 
     assert payload["candidate_context"] == pack.to_dict()
-    assert any("as much internal analysis" in rule for rule in payload["reasoning_guidance"])
+    assert any("live job postings" in rule for rule in payload["reasoning_guidance"])
+    assert any("do not invoke long-running deep research" in rule for rule in payload["source_rules"])
+    assert any("Do not search scholarly literature" in rule for rule in payload["source_rules"])
+    assert any("Follow route_order" in rule for rule in payload["search_strategy"])
+    assert any("Greenhouse, Lever, Ashby, Workday, and Avature" in rule for rule in payload["route_order"])
+    assert any("Time-box each route" in rule for rule in payload["search_strategy"])
+    assert any("non-job research" in rule for rule in payload["completion_rules"])
     assert any("not an exact-title allowlist" in rule for rule in payload["search_strategy"])
     assert any("ranking signals" in rule for rule in payload["search_strategy"])
     assert any("discovery hints" in rule for rule in payload["source_rules"])

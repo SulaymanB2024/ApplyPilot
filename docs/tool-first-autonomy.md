@@ -278,8 +278,10 @@ The browser form artifact is also bound to the verified role site and cannot rep
 when CAPTCHA, login, or account creation is required. Unknown JSON fields and all field-value
 aliases are rejected.
 
-Material prompt schema v4 separates applicant assertions from job evidence and binds the
-high-recall discovery instructions. Every prose
+Prompt schema v5 keeps the material-claim protections introduced in v4 and binds discovery to
+bounded live-job search. Discovery must use employer career pages, ATS postings, university
+recruiting pages, or job indexes as hints; it must not drift into scholarly literature, news,
+candidate-background research, or an indefinite search on one domain. Every prose
 sentence that asserts something about the applicant through `I`, `me`, or `my` must be copied
 verbatim into a structured `applicant_claims` entry. Those entries may cite confirmed `F` facts
 only—never `JOB`—and their terms, named entities, and numbers are validated against exactly
@@ -307,7 +309,7 @@ needed. The fallback has no default model-process deadline, receives only confir
 and requires an approved fact ledger even during a dry-run. All unresolved required fields still
 fail closed.
 
-Context pack v2 and prompt schema v4 intentionally require a fresh `autonomy plan`. Do not try to
+Context pack v2 and prompt schema v5 intentionally require a fresh `autonomy plan`. Do not try to
 advance a run packet created with context v1 or an older prompt schema after upgrading.
 
 ## Remaining live gate
