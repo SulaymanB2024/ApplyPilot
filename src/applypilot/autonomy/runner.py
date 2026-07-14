@@ -877,7 +877,14 @@ def _require_autonomy_ready_facts(fact_ledger: Any) -> None:
 def _restore_artifact_usage(ledger: UsageLedger, run_dir: Path) -> None:
     """Restore unique accepted/rejected tool-call counts across resumptions."""
     handoff_dir = run_dir / "handoff"
+    recovered_rejection_hashes: set[str] = set()
     for path in sorted(handoff_dir.glob("*.receipt.json")):
+        receipt = _read_json(path)
+        recovery = receipt.get("recovered_rejection")
+        if isinstance(recovery, dict):
+            response_hash = str(recovery.get("response_sha256") or "")
+            if response_hash:
+                recovered_rejection_hashes.add(response_hash)
         ledger.reserve("browser_navigations")
         ledger.reserve("external_calls")
         surface = "browser_tool"
@@ -892,6 +899,28 @@ def _restore_artifact_usage(ledger: UsageLedger, run_dir: Path) -> None:
         )
     for path in sorted(handoff_dir.glob("*.rejected.*.json")):
         ledger.reserve("retries")
+        rejected_text = path.read_text(encoding="utf-8")
+        rejected_response_hash = hashlib.sha256(rejected_text.encode("utf-8")).hexdigest()
+        try:
+            rejected_record = json.loads(rejected_text)
+        except json.JSONDecodeError:
+            rejected_record = None
+        if (
+            isinstance(rejected_record, dict)
+            and rejected_record.get("status") == "rejected_import"
+        ):
+            rejected_response_hash = str(
+                rejected_record.get("response_sha256") or rejected_response_hash
+            )
+        if rejected_response_hash in recovered_rejection_hashes:
+            ledger.record_event(
+                stage="handoff",
+                operation="restore_reused_rejected_artifact",
+                surface="local_artifact_recovery",
+                status="error",
+                error_class="rejected_response_reused",
+            )
+            continue
         ledger.reserve("browser_navigations")
         ledger.reserve("external_calls")
         surface = "browser_tool"

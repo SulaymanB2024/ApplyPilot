@@ -912,6 +912,143 @@ def test_material_packet_rejects_oversized_final_output():
         )
 
 
+def test_material_packet_derives_omitted_applicant_claim_bindings():
+    candidate = role()
+    pack = CompactContextPack(
+        version="test-context",
+        profile={"target_role": "Product analyst"},
+        evidence=(
+            {
+                "id": "F01",
+                "fact": "Built Python and SQL product analytics tooling.",
+            },
+        ),
+        digest="context-digest",
+        serialized_chars=100,
+    )
+    applicant_sentence = "I built Python and SQL product analytics tooling."
+    payload = {
+        "candidate_id": candidate.candidate_id,
+        "paragraphs": [
+            {
+                "text": applicant_sentence,
+                "evidence_ids": ["F01", "JOB"],
+            }
+        ],
+        "verification_gaps": [],
+    }
+
+    packet = material_packet_from_payload(
+        payload,
+        pack=pack,
+        candidate=candidate,
+        verified_job_text=candidate.description,
+    )
+
+    assert packet.derived_applicant_claim_count == 1
+    assert packet.paragraphs[0].applicant_claims == (
+        ApplicantClaim(applicant_sentence, ("F01",)),
+    )
+
+
+def test_material_packet_does_not_derive_claims_from_job_evidence():
+    candidate = role()
+    pack = CompactContextPack(
+        version="test-context",
+        profile={"target_role": "Product analyst"},
+        evidence=(),
+        digest="context-digest",
+        serialized_chars=100,
+    )
+    payload = {
+        "candidate_id": candidate.candidate_id,
+        "paragraphs": [
+            {
+                "text": "I have Python product analytics experience.",
+                "evidence_ids": ["JOB"],
+                "applicant_claims": [],
+            }
+        ],
+        "verification_gaps": [],
+    }
+
+    with pytest.raises(ChatGPTContractError, match="no applicant evidence"):
+        material_packet_from_payload(
+            payload,
+            pack=pack,
+            candidate=candidate,
+            verified_job_text="Python product analytics experience.",
+        )
+
+
+def test_derived_claim_bindings_do_not_relax_provenance_validation():
+    candidate = role()
+    pack = CompactContextPack(
+        version="test-context",
+        profile={"target_role": "Product analyst"},
+        evidence=(
+            {
+                "id": "F01",
+                "fact": "Built Python and SQL product analytics tooling.",
+            },
+        ),
+        digest="context-digest",
+        serialized_chars=100,
+    )
+    payload = {
+        "candidate_id": candidate.candidate_id,
+        "paragraphs": [
+            {
+                "text": "I built Python and SQL product analytics tooling at NASA.",
+                "evidence_ids": ["F01", "JOB"],
+                "applicant_claims": [],
+            }
+        ],
+        "verification_gaps": [],
+    }
+
+    with pytest.raises(ChatGPTContractError, match="unsupported factual terms"):
+        material_packet_from_payload(
+            payload,
+            pack=pack,
+            candidate=candidate,
+            verified_job_text=candidate.description,
+        )
+
+
+def test_restore_artifact_usage_deduplicates_reused_rejection(tmp_path):
+    handoff_dir = tmp_path / "handoff"
+    handoff_dir.mkdir()
+    response = '{"kind":"material_packet"}\n'
+    response_digest = hashlib.sha256(response.encode("utf-8")).hexdigest()
+    (handoff_dir / f"materials.fixture.rejected.{response_digest[:16]}.json").write_text(
+        response,
+        encoding="utf-8",
+    )
+    (handoff_dir / "materials.fixture.receipt.json").write_text(
+        json.dumps(
+            {
+                "response_sha256": response_digest,
+                "recovered_rejection": {
+                    "artifact": (
+                        f"materials.fixture.rejected.{response_digest[:16]}.json"
+                    ),
+                    "response_sha256": response_digest,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    ledger = UsageLedger(run_id="reused-rejection", budget=FunnelBudget())
+
+    autonomy_runner._restore_artifact_usage(ledger, tmp_path)
+
+    assert ledger.counts["model_calls"] == 1
+    assert ledger.counts["browser_navigations"] == 1
+    assert ledger.counts["external_calls"] == 1
+    assert ledger.counts["retries"] == 1
+
+
 def test_chatgpt_discovery_rejects_aggregator_urls():
     class StubClient(ChatGPTWebClient):
         def ask_json(self, *_args, **_kwargs):
@@ -2595,9 +2732,8 @@ def test_artifact_handoff_advances_to_review_ready_without_browser(monkeypatch, 
                 "candidate_id": candidate.candidate_id,
                 "paragraphs": [
                     {
-                        "text": evidence["fact"],
+                        "text": f"My experience is {evidence['fact']}.",
                         "evidence_ids": [evidence["id"]],
-                        "applicant_claims": [],
                     }
                 ],
                 "verification_gaps": [],
@@ -2617,6 +2753,18 @@ def test_artifact_handoff_advances_to_review_ready_without_browser(monkeypatch, 
     )
     assert awaiting_form["status"] == "awaiting_browser_tool"
     assert awaiting_form["pending_requests"][0]["kind"] == "form_review"
+    material_receipt_path = Path(material_request["response_path"])
+    if not material_receipt_path.is_absolute():
+        material_receipt_path = run_dir / material_receipt_path
+    material_receipt_path = material_receipt_path.with_name(
+        material_receipt_path.name.replace(".response.json", ".receipt.json")
+    )
+    material_receipt = json.loads(material_receipt_path.read_text(encoding="utf-8"))
+    assert material_receipt["material_claim_binding"] == {
+        "mode": "deterministic_paragraph_evidence",
+        "derived_claim_count": 1,
+    }
+    assert awaiting_form["materials"][0]["derived_applicant_claim_count"] == 1
     form_request_path = Path(awaiting_form["pending_requests"][0]["request_path"])
     form_request = json.loads(form_request_path.read_text(encoding="utf-8"))
     form_input = tmp_path / "form.input.json"
@@ -2904,6 +3052,103 @@ def test_artifact_handoff_binds_dynamic_inputs_and_allows_corrected_material(tmp
             candidate=candidate,
             verified_job_text=candidate.description + " changed",
         )
+
+
+def test_artifact_handoff_revalidates_same_rejected_response_without_new_call(tmp_path):
+    run_dir = tmp_path / "run"
+    pack = CompactContextPack(
+        version="test-context",
+        profile={"target_role": "Product analyst"},
+        evidence=(
+            {
+                "id": "F01",
+                "fact": "Built Python and SQL product analytics tooling.",
+            },
+        ),
+        digest="context-digest",
+        serialized_chars=100,
+    )
+    candidate = role()
+    bindings = RunBindings(
+        run_id="revalidate-response",
+        fact_digest="facts",
+        context_digest=pack.digest,
+        policy_digest="policy",
+    )
+    client = ArtifactChatGPTClient(
+        run_dir=run_dir,
+        bindings=bindings,
+        ledger=UsageLedger(run_id=bindings.run_id, budget=FunnelBudget()),
+    )
+    with pytest.raises(ChatGPTArtifactPending) as pending:
+        client.draft_material(
+            pack=pack,
+            candidate=candidate,
+            verified_job_text=candidate.description,
+        )
+    request_path = pending.value.request_path
+    request = json.loads(request_path.read_text(encoding="utf-8"))
+    response_input = tmp_path / "material.json"
+    response_input.write_text(
+        json.dumps(
+            {
+                "schema_version": "applypilot.chatgpt_web.v1",
+                "kind": "material_packet",
+                "request_id": request["request_id"],
+                "candidate_id": candidate.candidate_id,
+                "paragraphs": [
+                    {
+                        "text": "I built Python and SQL product analytics tooling.",
+                        "evidence_ids": ["F01", "JOB"],
+                        "applicant_claims": [],
+                    }
+                ],
+                "verification_gaps": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    imported = import_response_artifact(
+        request_path=request_path,
+        input_path=response_input,
+    )
+    response_path = Path(imported["response_path"])
+    response_text = response_path.read_text(encoding="utf-8")
+    response_digest = hashlib.sha256(response_text.encode("utf-8")).hexdigest()
+    rejected_path = response_path.with_name(
+        response_path.name.replace(
+            ".response.json",
+            f".rejected.{response_digest[:16]}.json",
+        )
+    )
+    response_path.replace(rejected_path)
+    import_response_artifact(request_path=request_path, input_path=rejected_path)
+
+    restored = UsageLedger(run_id=bindings.run_id, budget=FunnelBudget())
+    autonomy_runner._restore_artifact_usage(restored, run_dir)
+    resumed = ArtifactChatGPTClient(
+        run_dir=run_dir,
+        bindings=bindings,
+        ledger=restored,
+    )
+    packet = resumed.draft_material(
+        pack=pack,
+        candidate=candidate,
+        verified_job_text=candidate.description,
+    )
+
+    assert packet.derived_applicant_claim_count == 1
+    assert restored.counts["model_calls"] == 1
+    assert restored.counts["browser_navigations"] == 1
+    assert restored.counts["external_calls"] == 1
+    receipt_path = response_path.with_name(
+        response_path.name.replace(".response.json", ".receipt.json")
+    )
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["recovered_rejection"] == {
+        "artifact": rejected_path.name,
+        "response_sha256": response_digest,
+    }
 
 
 def test_artifact_client_does_not_create_a_second_active_exchange(tmp_path):

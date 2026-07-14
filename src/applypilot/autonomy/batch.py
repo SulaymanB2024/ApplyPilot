@@ -282,6 +282,9 @@ class AutonomousBatch:
                         candidate_id=packet.candidate_id,
                         paragraphs=packet.paragraphs,
                         verification_gaps=packet.verification_gaps,
+                        derived_applicant_claim_count=(
+                            packet.derived_applicant_claim_count
+                        ),
                         artifact_paths=artifact_paths,
                     )
                 packets.append((candidate, packet))
@@ -290,6 +293,9 @@ class AutonomousBatch:
                         "candidate_id": candidate.candidate_id,
                         "fit_score": score,
                         "verification_gaps": list(packet.verification_gaps),
+                        "derived_applicant_claim_count": (
+                            packet.derived_applicant_claim_count
+                        ),
                         "human_review_required": sorted(
                             review_required.get(candidate.candidate_id, set())
                         ),
@@ -518,6 +524,9 @@ class AutonomousBatch:
                     "fit_score": score,
                     "paragraphs": [asdict(paragraph) for paragraph in packet.paragraphs],
                     "verification_gaps": list(packet.verification_gaps),
+                    "derived_applicant_claim_count": (
+                        packet.derived_applicant_claim_count
+                    ),
                     "external_action": "none",
                 },
                 indent=2,
