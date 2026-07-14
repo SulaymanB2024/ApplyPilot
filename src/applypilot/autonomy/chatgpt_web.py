@@ -299,6 +299,7 @@ def material_packet_from_payload(
     allowed_ids = {item["id"] for item in pack.evidence} | {"JOB"}
     paragraphs: list[MaterialParagraph] = []
     claim_count = 0
+    derived_claim_count = 0
     for raw in raw_paragraphs:
         if not isinstance(raw, dict):
             raise ChatGPTContractError("material paragraph entries must be objects")
@@ -313,11 +314,10 @@ def material_packet_from_payload(
         if not set(evidence_ids).issubset(allowed_ids):
             raise ChatGPTContractError("material paragraph cites an unknown evidence id")
         raw_claims = raw.get("applicant_claims")
-        if not isinstance(raw_claims, list):
+        if raw_claims is None:
+            raw_claims = []
+        elif not isinstance(raw_claims, list):
             raise ChatGPTContractError("material applicant_claims must be a list")
-        claim_count += len(raw_claims)
-        if claim_count > MAX_MATERIAL_CLAIMS:
-            raise ChatGPTContractError("material packet exceeds applicant claim limit")
         applicant_claims: list[ApplicantClaim] = []
         for raw_claim in raw_claims:
             if not isinstance(raw_claim, dict):
@@ -345,6 +345,31 @@ def material_packet_from_payload(
             applicant_claims.append(
                 ApplicantClaim(text=claim_text, evidence_ids=claim_ids)
             )
+        explicit_claim_keys = {
+            _normalized_sentence(claim.text) for claim in applicant_claims
+        }
+        paragraph_applicant_ids = tuple(
+            evidence_id for evidence_id in evidence_ids if evidence_id != "JOB"
+        )
+        for sentence in _material_sentences(text):
+            sentence_key = _normalized_sentence(sentence)
+            if (
+                not _requires_applicant_claim(sentence)
+                or sentence_key in explicit_claim_keys
+                or not paragraph_applicant_ids
+            ):
+                continue
+            applicant_claims.append(
+                ApplicantClaim(
+                    text=sentence,
+                    evidence_ids=paragraph_applicant_ids,
+                )
+            )
+            explicit_claim_keys.add(sentence_key)
+            derived_claim_count += 1
+        claim_count += len(applicant_claims)
+        if claim_count > MAX_MATERIAL_CLAIMS:
+            raise ChatGPTContractError("material packet exceeds applicant claim limit")
         paragraphs.append(
             MaterialParagraph(
                 text=text,
@@ -362,6 +387,7 @@ def material_packet_from_payload(
         verification_gaps=tuple(
             str(item)[:400] for item in raw_gaps[:10]
         ),
+        derived_applicant_claim_count=derived_claim_count,
     )
     validate_material_provenance(packet, pack=pack, candidate=candidate, job_text=verified_job_text)
     return packet
@@ -445,11 +471,7 @@ def validate_material_provenance(
                 "material contains unsupported factual terms: "
                 f"{sorted(unsupported_paragraph_facts)}"
             )
-        sentences = [
-            sentence.strip()
-            for sentence in re.split(r"(?<=[.!?])\s+|\n+", paragraph.text)
-            if sentence.strip()
-        ]
+        sentences = _material_sentences(paragraph.text)
         sentence_keys = {_normalized_sentence(sentence) for sentence in sentences}
         claim_keys: set[str] = set()
         applicant_claim_gaps: set[str] = set()
@@ -663,6 +685,14 @@ def _claim_stem(token: str) -> str:
 
 def _normalized_sentence(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip()
+
+
+def _material_sentences(value: str) -> list[str]:
+    return [
+        sentence.strip()
+        for sentence in re.split(r"(?<=[.!?])\s+|\n+", value)
+        if sentence.strip()
+    ]
 
 
 def _requires_applicant_claim(sentence: str) -> bool:

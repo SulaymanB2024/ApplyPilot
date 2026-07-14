@@ -689,7 +689,8 @@ class ArtifactChatGPTClient:
             response_path.name.replace(".response.json", ".receipt.json")
         )
         had_receipt = receipt_path.exists()
-        if not had_receipt:
+        recovered_rejection = _matching_rejected_response(response_path, response)
+        if not had_receipt and recovered_rejection is None:
             self.ledger.reserve("model_calls")
             self.ledger.reserve("browser_navigations")
             self.ledger.reserve("external_calls")
@@ -700,17 +701,58 @@ class ArtifactChatGPTClient:
             if payload.get("request_id") != request_id:
                 raise ChatGPTContractError("ChatGPT response request_id mismatch")
             validated = semantic_validator(payload)
-            _write_immutable_json(
-                receipt_path,
-                {
-                    "schema_version": HANDOFF_SCHEMA_VERSION,
-                    "prompt_schema_version": PROMPT_SCHEMA_VERSION,
-                    "request_id": request_id,
-                    "input_digest": input_digest,
-                    "response_sha256": _sha256_text(response),
-                },
+            receipt = {
+                "schema_version": HANDOFF_SCHEMA_VERSION,
+                "prompt_schema_version": PROMPT_SCHEMA_VERSION,
+                "request_id": request_id,
+                "input_digest": input_digest,
+                "response_sha256": _sha256_text(response),
+            }
+            derived_claim_count = int(
+                getattr(validated, "derived_applicant_claim_count", 0)
             )
+            if derived_claim_count:
+                receipt["material_claim_binding"] = {
+                    "mode": "deterministic_paragraph_evidence",
+                    "derived_claim_count": derived_claim_count,
+                }
+            if recovered_rejection is not None:
+                receipt["recovered_rejection"] = {
+                    "artifact": recovered_rejection.name,
+                    "response_sha256": _sha256_text(response),
+                }
+            _write_immutable_json(receipt_path, receipt)
         except Exception as exc:
+            if recovered_rejection is not None:
+                self.ledger.record_event(
+                    stage=stage,
+                    operation="revalidate_rejected_artifact",
+                    surface="local_artifact_recovery",
+                    status="error",
+                    error_class=type(exc).__name__,
+                )
+            else:
+                self.ledger.record_model_exchange(
+                    stage=stage,
+                    operation=operation,
+                    surface="chatgpt_web_artifact",
+                    request=bound_prompt,
+                    response=response,
+                    duration_ms=0,
+                    status="error",
+                    error_class=type(exc).__name__,
+                )
+            if not had_receipt and response_path.exists():
+                _quarantine_rejected_response(response_path, response)
+            raise
+        if recovered_rejection is not None:
+            self.ledger.record_event(
+                stage=stage,
+                operation="revalidate_rejected_artifact",
+                surface="local_artifact_recovery",
+                status="ok",
+            )
+        else:
             self.ledger.record_model_exchange(
                 stage=stage,
                 operation=operation,
@@ -718,20 +760,7 @@ class ArtifactChatGPTClient:
                 request=bound_prompt,
                 response=response,
                 duration_ms=0,
-                status="error",
-                error_class=type(exc).__name__,
             )
-            if not had_receipt and response_path.exists():
-                _quarantine_rejected_response(response_path, response)
-            raise
-        self.ledger.record_model_exchange(
-            stage=stage,
-            operation=operation,
-            surface="chatgpt_web_artifact",
-            request=bound_prompt,
-            response=response,
-            duration_ms=0,
-        )
         return validated
 
 
@@ -878,6 +907,28 @@ def _record_rejected_import(path: Path, text: str, *, kind: str) -> Path:
         },
     )
     return rejected
+
+
+def _matching_rejected_response(response_path: Path, response: str) -> Path | None:
+    response_digest = _sha256_text(response)
+    prefix = response_path.name.removesuffix(".response.json")
+    for rejected_path in sorted(response_path.parent.glob(f"{prefix}.rejected.*.json")):
+        rejected_text = rejected_path.read_text(encoding="utf-8")
+        rejected_digest = _sha256_text(rejected_text)
+        try:
+            rejected_record = json.loads(rejected_text)
+        except json.JSONDecodeError:
+            rejected_record = None
+        if (
+            isinstance(rejected_record, dict)
+            and rejected_record.get("status") == "rejected_import"
+        ):
+            rejected_digest = str(
+                rejected_record.get("response_sha256") or rejected_digest
+            )
+        if rejected_digest == response_digest:
+            return rejected_path
+    return None
 
 
 def _read_json_object(path: Path) -> dict[str, Any]:

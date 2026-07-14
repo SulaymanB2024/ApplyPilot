@@ -159,6 +159,7 @@ class MaterialPacket:
     paragraphs: tuple[MaterialParagraph, ...]
     verification_gaps: tuple[str, ...] = ()
     artifact_paths: dict[str, str] = field(default_factory=dict, compare=False)
+    derived_applicant_claim_count: int = 0
 
     @property
     def cover_letter(self) -> str:
@@ -171,6 +172,8 @@ class MaterialPacket:
             "paragraphs": [asdict(paragraph) for paragraph in self.paragraphs],
             "verification_gaps": list(self.verification_gaps),
         }
+        if self.derived_applicant_claim_count:
+            payload["derived_applicant_claim_count"] = self.derived_applicant_claim_count
         return hashlib.sha256(
             json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
         ).hexdigest()
