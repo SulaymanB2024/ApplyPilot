@@ -129,6 +129,18 @@ def _keyword_terms(search_cfg: dict) -> list[str]:
     return ["intern", "internship", "new grad", "graduate", "early career", "analyst"]
 
 
+def _keyword_matches_title(keyword: str, title_tokens: list[str]) -> bool:
+    """Match one configured keyword as whole adjacent title tokens."""
+    keyword_tokens = re.findall(r"[a-z0-9]+", keyword.lower())
+    if not keyword_tokens or len(keyword_tokens) > len(title_tokens):
+        return False
+    width = len(keyword_tokens)
+    return any(
+        title_tokens[index : index + width] == keyword_tokens
+        for index in range(len(title_tokens) - width + 1)
+    )
+
+
 def _location_ok(location: str | None, accept: list[str], reject: list[str]) -> bool:
     if not location:
         return True
@@ -161,11 +173,11 @@ def _title_ok(title: str | None, search_cfg: dict) -> bool:
     if any(exclude in normalized for exclude in excludes):
         return False
 
-    keywords = _keyword_terms(search_cfg)
-    if any(keyword in normalized for keyword in keywords):
+    title_token_list = re.findall(r"[a-z0-9]+", normalized)
+    if any(_keyword_matches_title(keyword, title_token_list) for keyword in _keyword_terms(search_cfg)):
         return True
 
-    title_tokens = set(re.findall(r"[a-z0-9]+", normalized))
+    title_tokens = set(title_token_list)
     return any(tokens.issubset(title_tokens) for tokens in _search_terms(search_cfg))
 
 

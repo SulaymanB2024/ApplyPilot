@@ -15,6 +15,16 @@ def test_workday_title_filter_respects_keywords_queries_and_exclusions():
     assert _workday_title_ok("Warehouse Associate", cfg) is False
 
 
+def test_workday_title_keyword_does_not_match_inside_another_word():
+    cfg = normalize_search_config({
+        "queries": [{"query": "intern", "tier": 1}],
+        "direct_ats_title_keywords": ["intern"],
+    })
+
+    assert _workday_title_ok("Software Engineering Intern", cfg) is True
+    assert _workday_title_ok("Internal Mobility Analyst", cfg) is False
+
+
 def test_workday_location_filter_rejects_disallowed_remote_regions():
     assert _location_ok(
         "United Kingdom (Remote)",
