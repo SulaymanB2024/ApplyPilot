@@ -779,6 +779,39 @@ def autonomy_advance(
         raise typer.Exit(code=1)
 
 
+@autonomy_app.command("reconcile-handoffs")
+def autonomy_reconcile_handoffs(
+    run_dir: Path = typer.Option(..., "--run-dir", help="Reviewed autonomy run directory."),
+    approved_fact_digest: str = typer.Option(
+        ...,
+        "--approved-fact-digest",
+        help="Exact digest from this run's reviewed fact_ledger.json.",
+    ),
+    retain_request_id: str = typer.Option(
+        ...,
+        "--retain-request-id",
+        help="Exact unanswered request id to retain after queue forensics.",
+    ),
+) -> None:
+    """Archive duplicate unanswered handoffs with an immutable reconciliation record."""
+    _bootstrap_config_only()
+    from applypilot.autonomy.runner import reconcile_artifact_handoffs
+
+    try:
+        result = reconcile_artifact_handoffs(
+            run_dir=run_dir,
+            approved_fact_digest=approved_fact_digest,
+            retain_request_id=retain_request_id,
+        )
+    except Exception as exc:
+        console.print(
+            f"[red]Handoff reconciliation failed:[/red] "
+            f"{type(exc).__name__}: {str(exc)[:160]}"
+        )
+        raise typer.Exit(code=1) from exc
+    console.print_json(data=result)
+
+
 @autonomy_app.command("import-fact-approval")
 def autonomy_import_fact_approval(
     run_dir: Path = typer.Option(..., "--run-dir", help="Reviewed autonomy run directory."),

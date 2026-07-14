@@ -13,7 +13,11 @@ from applypilot.autonomy.handoff import (
     BrowserArtifactPending,
     HANDOFF_SCHEMA_VERSION,
     RunBindings,
+    _active_candidate_id_for_kind,
+    _active_handoffs_unlocked,
     _canonical_json,
+    _handoff_queue_lock,
+    _pending_for_active,
     _sha256_text,
     _write_immutable_json,
 )
@@ -66,6 +70,16 @@ class ArtifactFormReviewer:
         self.run_dir = run_dir.resolve()
         self.bindings = bindings
         self.ledger = ledger
+
+    def active_candidate_id(self, *, kind: str) -> str | None:
+        """Return the candidate bound to the active form-review exchange."""
+        if kind != "form_review":
+            raise ValueError("form artifact client only resumes form reviews by candidate")
+        return _active_candidate_id_for_kind(
+            run_dir=self.run_dir,
+            bindings=self.bindings,
+            kind=kind,
+        )
 
     def dry_run(self, *, candidate: RoleCandidate, packet: MaterialPacket) -> dict[str, Any]:
         request_id = self._request_id(candidate=candidate, packet=packet)
@@ -120,7 +134,17 @@ class ArtifactFormReviewer:
                 "reason": "string",
             },
         }
-        _write_immutable_json(request_path, envelope)
+        with _handoff_queue_lock(self.run_dir):
+            if not request_path.exists():
+                current = _active_handoffs_unlocked(
+                    run_dir=self.run_dir,
+                    bindings=self.bindings,
+                )
+                if len(current) > 1:
+                    raise ValueError("autonomy run has more than one active handoff exchange")
+                if current:
+                    raise _pending_for_active(current[0])
+            _write_immutable_json(request_path, envelope)
         if not response_path.exists():
             raise BrowserArtifactPending(
                 kind="form_review",

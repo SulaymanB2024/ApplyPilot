@@ -12,7 +12,12 @@ import pytest
 from typer.testing import CliRunner
 
 from applypilot import config
-from applypilot.autonomy.batch import AutonomousBatch, BatchDependencies, _mapping_digest
+from applypilot.autonomy.batch import (
+    AutonomousBatch,
+    BatchDependencies,
+    _mapping_digest,
+    factual_fit_score,
+)
 from applypilot.autonomy.chatgpt_web import (
     ChatGPTWebClient,
     ChatGPTWebConfig,
@@ -41,7 +46,7 @@ from applypilot.autonomy.facts import (
     validate_artifact_against_ledger,
 )
 from applypilot.autonomy.form_review import ReadOnlyFormReviewer
-from applypilot.autonomy.form_handoff import validate_form_review_response
+from applypilot.autonomy.form_handoff import ArtifactFormReviewer, validate_form_review_response
 from applypilot.autonomy.first_party import (
     FetchResponse,
     FirstPartyVerifier,
@@ -52,9 +57,11 @@ from applypilot.autonomy import handoff as autonomy_handoff
 from applypilot.autonomy import runner as autonomy_runner
 from applypilot.autonomy.handoff import (
     ArtifactChatGPTClient,
+    BrowserArtifactPending,
     ChatGPTArtifactPending,
     RunBindings,
     import_response_artifact,
+    reconcile_unanswered_handoffs,
 )
 from applypilot.autonomy.models import (
     ApplicantClaim,
@@ -2896,4 +2903,258 @@ def test_artifact_handoff_binds_dynamic_inputs_and_allows_corrected_material(tmp
             pack=pack,
             candidate=candidate,
             verified_job_text=candidate.description + " changed",
+        )
+
+
+def test_artifact_client_does_not_create_a_second_active_exchange(tmp_path):
+    run_dir = tmp_path / "run"
+    pack = build_context_pack(PROFILE, job_text="Python product analytics")
+    bindings = RunBindings(
+        run_id="single-active",
+        fact_digest="facts",
+        context_digest=pack.digest,
+        policy_digest="policy",
+    )
+    client = ArtifactChatGPTClient(
+        run_dir=run_dir,
+        bindings=bindings,
+        ledger=UsageLedger(run_id=bindings.run_id, budget=FunnelBudget()),
+    )
+    original = role(
+        company="Original",
+        official_url="https://jobs.ashbyhq.com/original/1",
+    )
+    alternate = role(
+        company="Alternate",
+        official_url="https://jobs.ashbyhq.com/alternate/2",
+    )
+
+    with pytest.raises(ChatGPTArtifactPending) as first_pending:
+        client.draft_material(
+            pack=pack,
+            candidate=original,
+            verified_job_text=original.description,
+        )
+    with pytest.raises(ChatGPTArtifactPending) as resumed_pending:
+        client.draft_material(
+            pack=pack,
+            candidate=alternate,
+            verified_job_text=alternate.description,
+        )
+
+    assert resumed_pending.value.request_id == first_pending.value.request_id
+    assert resumed_pending.value.request_path == first_pending.value.request_path
+    assert list((run_dir / "handoff").glob("materials.*.request.json")) == [
+        first_pending.value.request_path
+    ]
+
+
+def test_batch_prioritizes_the_candidate_with_an_active_material_exchange(tmp_path):
+    run_dir = tmp_path / "run"
+    high_fit = role(
+        company="High Fit",
+        title="Python Product Analytics Intern",
+        official_url="https://jobs.ashbyhq.com/highfit/1",
+        description="Python SQL product analytics internship for an entry-level candidate.",
+    )
+    active = role(
+        company="Active",
+        title="Operations Coordination Intern",
+        official_url="https://jobs.ashbyhq.com/active/2",
+        description="Entry-level document coordination internship with 0-2 years accepted.",
+    )
+    pack = build_context_pack(PROFILE, job_text=high_fit.description)
+    high_evidence = fresh(high_fit)
+    active_evidence = fresh(active)
+    assert factual_fit_score(high_fit, high_evidence, pack) > factual_fit_score(
+        active,
+        active_evidence,
+        pack,
+    )
+    bindings = RunBindings(
+        run_id="resume-material",
+        fact_digest="facts",
+        context_digest=pack.digest,
+        policy_digest="policy",
+    )
+    ledger = UsageLedger(run_id=bindings.run_id, budget=FunnelBudget())
+    client = ArtifactChatGPTClient(run_dir=run_dir, bindings=bindings, ledger=ledger)
+    with pytest.raises(ChatGPTArtifactPending) as original_pending:
+        client.draft_material(
+            pack=pack,
+            candidate=active,
+            verified_job_text=active.description,
+        )
+
+    result = AutonomousBatch(
+        run_id=bindings.run_id,
+        profile=CandidateProfile(),
+        context_pack=pack,
+        dependencies=BatchDependencies(
+            discovery=FakeDiscovery([high_fit, active]),
+            verifier=FakeVerifier(
+                {
+                    high_fit.candidate_id: high_evidence,
+                    active.candidate_id: active_evidence,
+                }
+            ),
+            materials=client,
+        ),
+        ledger=ledger,
+    ).run(query="entry-level internships")
+
+    assert result.status == "awaiting_chatgpt_web"
+    assert result.pending_requests[0]["request_id"] == original_pending.value.request_id
+    assert len(list((run_dir / "handoff").glob("materials.*.request.json"))) == 1
+
+
+def test_batch_resumes_active_form_before_creating_new_material_work(tmp_path):
+    run_dir = tmp_path / "run"
+    first = role(
+        company="First",
+        official_url="https://jobs.ashbyhq.com/first/1",
+    )
+    active = role(
+        company="Active",
+        official_url="https://jobs.ashbyhq.com/active/2",
+    )
+    pack = build_context_pack(PROFILE, job_text=first.description)
+    bindings = RunBindings(
+        run_id="resume-form",
+        fact_digest="facts",
+        context_digest=pack.digest,
+        policy_digest="policy",
+    )
+    ledger = UsageLedger(run_id=bindings.run_id, budget=FunnelBudget())
+    materials = FakeMaterials(pack)
+    packet = materials.draft_material(candidate=active)
+    materials.calls.clear()
+    form = ArtifactFormReviewer(run_dir=run_dir, bindings=bindings, ledger=ledger)
+    with pytest.raises(BrowserArtifactPending) as original_pending:
+        form.dry_run(candidate=active, packet=packet)
+
+    result = AutonomousBatch(
+        run_id=bindings.run_id,
+        profile=CandidateProfile(),
+        context_pack=pack,
+        dependencies=BatchDependencies(
+            discovery=FakeDiscovery([first, active]),
+            verifier=FakeVerifier(
+                {
+                    first.candidate_id: fresh(first),
+                    active.candidate_id: fresh(active),
+                }
+            ),
+            materials=materials,
+            form_review=form,
+        ),
+        ledger=ledger,
+    ).run(query="entry-level internships")
+
+    assert result.status == "awaiting_browser_tool"
+    assert result.pending_requests[0]["request_id"] == original_pending.value.request_id
+    assert materials.calls == [active.candidate_id]
+    assert len(list((run_dir / "handoff").glob("form_review.*.request.json"))) == 1
+
+
+def test_duplicate_unanswered_handoffs_require_explicit_audited_reconciliation(tmp_path):
+    run_dir = tmp_path / "run"
+    pack = build_context_pack(PROFILE, job_text="Python product analytics")
+    bindings = RunBindings(
+        run_id="reconcile-duplicates",
+        fact_digest="facts",
+        context_digest=pack.digest,
+        policy_digest="policy",
+    )
+    client = ArtifactChatGPTClient(
+        run_dir=run_dir,
+        bindings=bindings,
+        ledger=UsageLedger(run_id=bindings.run_id, budget=FunnelBudget()),
+    )
+    retained_candidate = role(
+        company="Retained",
+        official_url="https://jobs.ashbyhq.com/retained/1",
+    )
+    duplicate_candidate = role(
+        company="Duplicate",
+        official_url="https://jobs.ashbyhq.com/duplicate/2",
+    )
+    with pytest.raises(ChatGPTArtifactPending) as retained_pending:
+        client.draft_material(
+            pack=pack,
+            candidate=retained_candidate,
+            verified_job_text=retained_candidate.description,
+        )
+    retained_payload = json.loads(
+        retained_pending.value.request_path.read_text(encoding="utf-8")
+    )
+    duplicate_input_digest = client._input_digest(
+        stage="materials",
+        inputs={
+            "candidate": {
+                "candidate_id": duplicate_candidate.candidate_id,
+                "company": duplicate_candidate.company,
+                "title": duplicate_candidate.title,
+                "official_url": duplicate_candidate.official_url,
+            },
+            "verified_job_sha256": hashlib.sha256(
+                duplicate_candidate.description.encode("utf-8")
+            ).hexdigest(),
+        },
+    )
+    duplicate_request_id = client._request_id(
+        stage="materials",
+        candidate_id=duplicate_candidate.candidate_id,
+        input_digest=duplicate_input_digest,
+    )
+    duplicate_prompt = build_material_prompt(
+        pack,
+        duplicate_candidate,
+        verified_job_text=duplicate_candidate.description,
+        request_id=duplicate_request_id,
+    )
+    duplicate_request_path, duplicate_response_path = client._paths(
+        stage="materials",
+        candidate_id=duplicate_candidate.candidate_id,
+    )
+    duplicate_payload = {
+        **retained_payload,
+        "request_id": duplicate_request_id,
+        "input_digest": duplicate_input_digest,
+        "candidate_id": duplicate_candidate.candidate_id,
+        "prompt": duplicate_prompt,
+        "prompt_sha256": hashlib.sha256(duplicate_prompt.encode("utf-8")).hexdigest(),
+        "response_path": str(duplicate_response_path.relative_to(run_dir)),
+    }
+    duplicate_request_path.write_text(
+        json.dumps(duplicate_payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    duplicate_response_path.write_text("{}\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="already has a response"):
+        reconcile_unanswered_handoffs(
+            run_dir=run_dir,
+            bindings=bindings,
+            retain_request_id=retained_pending.value.request_id,
+        )
+    duplicate_response_path.unlink()
+
+    reconciled = reconcile_unanswered_handoffs(
+        run_dir=run_dir,
+        bindings=bindings,
+        retain_request_id=retained_pending.value.request_id,
+    )
+    assert reconciled["superseded_request_count"] == 1
+    assert client.active_candidate_id(kind="material_packet") == retained_candidate.candidate_id
+    assert list((run_dir / "handoff").glob("materials.*.request.json")) == [
+        retained_pending.value.request_path
+    ]
+    archived = list((run_dir / "handoff").glob("*.superseded.*.json"))
+    assert len(archived) == 1
+    assert Path(reconciled["reconciliation_path"]).is_file()
+    with pytest.raises(ValueError, match="path is not active"):
+        import_response_artifact(
+            request_path=archived[0],
+            input_path=tmp_path / "not-read.json",
         )

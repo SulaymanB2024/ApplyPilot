@@ -11,9 +11,12 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import fcntl
+from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from applypilot.autonomy.chatgpt_web import (
     ChatGPTContractError,
@@ -30,8 +33,10 @@ from applypilot.autonomy.models import MaterialPacket, RoleCandidate
 from applypilot.autonomy.telemetry import BudgetExceeded, UsageLedger
 
 HANDOFF_SCHEMA_VERSION = "applypilot.handoff.v1"
+HANDOFF_RECONCILIATION_SCHEMA_VERSION = "applypilot.handoff-reconciliation.v1"
 RUN_SCHEMA_VERSION = "applypilot.autonomy-run.v1"
 PROMPT_SCHEMA_VERSION = "applypilot.chatgpt-prompt.v6"
+HANDOFF_QUEUE_LOCK_NAME = ".queue.lock"
 
 
 class ArtifactPending(RuntimeError):
@@ -125,6 +130,222 @@ class RunBindings:
         return cls(**values)
 
 
+@dataclass(frozen=True)
+class ActiveHandoff:
+    """One unanswered or responded-but-unconsumed portable exchange."""
+
+    surface: str
+    stage: str
+    kind: str
+    request_id: str
+    candidate_id: str
+    request_path: Path
+    response_path: Path
+    receipt_path: Path
+    state: str
+
+
+@contextmanager
+def _handoff_queue_lock(run_dir: Path) -> Iterator[None]:
+    """Serialize queue mutations without relying on a removable lock sentinel."""
+    handoff_dir = run_dir.resolve() / "handoff"
+    handoff_dir.mkdir(parents=True, exist_ok=True)
+    flags = os.O_CREAT | os.O_RDWR
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(handoff_dir / HANDOFF_QUEUE_LOCK_NAME, flags, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
+def _active_handoffs_unlocked(
+    *,
+    run_dir: Path,
+    bindings: RunBindings,
+) -> list[ActiveHandoff]:
+    """Validate the durable queue and return exchanges that still need work."""
+    handoff_dir = run_dir.resolve() / "handoff"
+    active: list[ActiveHandoff] = []
+    seen_response_paths: set[Path] = set()
+    stage_kinds = {
+        ("discovery", "role_candidates"): "chatgpt_web",
+        ("materials", "material_packet"): "chatgpt_web",
+        ("form_review", "form_review"): "browser_tool",
+    }
+    for request_path in sorted(handoff_dir.glob("*.request.json")):
+        if request_path.is_symlink() or not request_path.is_file():
+            raise ValueError("handoff request must be a regular non-symlink file")
+        request = _read_json_object(request_path)
+        if (
+            request.get("schema_version") != HANDOFF_SCHEMA_VERSION
+            or request.get("run_id") != bindings.run_id
+            or request.get("fact_digest") != bindings.fact_digest
+            or request.get("context_digest") != bindings.context_digest
+            or request.get("policy_digest") != bindings.policy_digest
+        ):
+            raise ValueError("handoff request bindings differ from run manifest")
+        stage = str(request.get("stage") or "")
+        kind = str(request.get("kind") or "")
+        surface = stage_kinds.get((stage, kind))
+        if surface is None:
+            raise ValueError("handoff request stage or kind is invalid")
+        request_id = str(request.get("request_id") or "")
+        if len(request_id) != 64 or any(character not in "0123456789abcdef" for character in request_id):
+            raise ValueError("handoff request id is invalid")
+        candidate_id = str(request.get("candidate_id") or "")
+        if kind == "role_candidates" and candidate_id:
+            raise ValueError("discovery handoff cannot bind a candidate")
+        if kind != "role_candidates" and not candidate_id:
+            raise ValueError("candidate handoff is missing its candidate binding")
+        raw_response_path = run_dir / str(request.get("response_path") or "")
+        if raw_response_path.is_symlink():
+            raise ValueError("handoff response must not be a symbolic link")
+        response_path = raw_response_path.resolve()
+        if (
+            response_path.parent != handoff_dir.resolve()
+            or not response_path.name.endswith(".response.json")
+            or response_path in seen_response_paths
+        ):
+            raise ValueError("handoff response path is invalid or duplicated")
+        seen_response_paths.add(response_path)
+        raw_receipt_path = raw_response_path.with_name(
+            raw_response_path.name.replace(".response.json", ".receipt.json")
+        )
+        if raw_receipt_path.is_symlink():
+            raise ValueError("handoff receipt must not be a symbolic link")
+        receipt_path = response_path.with_name(
+            response_path.name.replace(".response.json", ".receipt.json")
+        )
+        response_exists = response_path.is_file()
+        receipt_exists = receipt_path.is_file()
+        if receipt_exists and not response_exists:
+            raise ValueError("consumed handoff response is missing")
+        if response_exists and receipt_exists:
+            continue
+        active.append(
+            ActiveHandoff(
+                surface=surface,
+                stage=stage,
+                kind=kind,
+                request_id=request_id,
+                candidate_id=candidate_id,
+                request_path=request_path.resolve(),
+                response_path=response_path,
+                receipt_path=receipt_path,
+                state="response_ready" if response_exists else "awaiting_response",
+            )
+        )
+    return active
+
+
+def active_handoffs(*, run_dir: Path, bindings: RunBindings) -> tuple[ActiveHandoff, ...]:
+    """Return the validated single-exchange queue under its mutation lock."""
+    with _handoff_queue_lock(run_dir):
+        return tuple(_active_handoffs_unlocked(run_dir=run_dir, bindings=bindings))
+
+
+def _active_candidate_id_for_kind(
+    *,
+    run_dir: Path,
+    bindings: RunBindings,
+    kind: str,
+) -> str | None:
+    current = active_handoffs(run_dir=run_dir, bindings=bindings)
+    if len(current) > 1:
+        raise ValueError("autonomy run has more than one active handoff exchange")
+    if not current or current[0].kind != kind:
+        return None
+    if not current[0].candidate_id:
+        raise ValueError("active candidate handoff is missing its candidate binding")
+    return current[0].candidate_id
+
+
+def _pending_for_active(active: ActiveHandoff) -> ArtifactPending:
+    pending_type = (
+        ChatGPTArtifactPending if active.surface == "chatgpt_web" else BrowserArtifactPending
+    )
+    return pending_type(
+        kind=active.kind,
+        request_id=active.request_id,
+        request_path=active.request_path,
+        response_path=active.response_path,
+    )
+
+
+def reconcile_unanswered_handoffs(
+    *,
+    run_dir: Path,
+    bindings: RunBindings,
+    retain_request_id: str,
+) -> dict[str, Any]:
+    """Archive duplicate unanswered requests while preserving an immutable audit record."""
+    run_dir = run_dir.resolve()
+    with _handoff_queue_lock(run_dir):
+        current = _active_handoffs_unlocked(run_dir=run_dir, bindings=bindings)
+        if len(current) < 2:
+            raise ValueError("autonomy run does not have multiple active handoff exchanges")
+        if any(item.state != "awaiting_response" for item in current):
+            raise ValueError("cannot reconcile a handoff that already has a response")
+        if len({(item.surface, item.stage, item.kind) for item in current}) != 1:
+            raise ValueError("active handoffs differ in stage or surface")
+        retained = [item for item in current if item.request_id == retain_request_id]
+        if len(retained) != 1:
+            raise ValueError("retained handoff request id is not uniquely active")
+
+        superseded: list[dict[str, str]] = []
+        rename_plan: list[tuple[Path, Path]] = []
+        for item in current:
+            if item.request_id == retain_request_id:
+                continue
+            request_sha256 = _sha256_text(item.request_path.read_text(encoding="utf-8"))
+            stem = item.request_path.name.removesuffix(".request.json")
+            archived_path = item.request_path.with_name(
+                f"{stem}.superseded.{request_sha256[:16]}.json"
+            )
+            if archived_path.exists():
+                raise FileExistsError("superseded handoff archive already exists")
+            rename_plan.append((item.request_path, archived_path))
+            superseded.append(
+                {
+                    "request_id": item.request_id,
+                    "request_sha256": request_sha256,
+                    "archived_path": str(archived_path.relative_to(run_dir)),
+                }
+            )
+
+        for request_path, archived_path in rename_plan:
+            request_path.rename(archived_path)
+
+        record = {
+            "schema_version": HANDOFF_RECONCILIATION_SCHEMA_VERSION,
+            "run_id": bindings.run_id,
+            "fact_digest": bindings.fact_digest,
+            "context_digest": bindings.context_digest,
+            "policy_digest": bindings.policy_digest,
+            "reconciled_at": datetime.now(timezone.utc).isoformat(),
+            "reason": "duplicate_unanswered_exchange",
+            "retained_request_id": retain_request_id,
+            "surface": retained[0].surface,
+            "stage": retained[0].stage,
+            "kind": retained[0].kind,
+            "superseded_requests": superseded,
+        }
+        record_digest = _sha256_text(_canonical_json(record))
+        record_path = run_dir / "handoff" / f"reconciliation.{record_digest[:16]}.json"
+        _write_immutable_json(record_path, record)
+        return {
+            "run_id": bindings.run_id,
+            "retained_request_id": retain_request_id,
+            "retained_request_path": str(retained[0].request_path),
+            "superseded_request_count": len(superseded),
+            "reconciliation_path": str(record_path),
+        }
+
+
 class ArtifactChatGPTClient:
     """Read strict ChatGPT responses from a portable, resumable file queue."""
 
@@ -138,6 +359,16 @@ class ArtifactChatGPTClient:
         self.run_dir = run_dir.resolve()
         self.bindings = bindings
         self.ledger = ledger
+
+    def active_candidate_id(self, *, kind: str) -> str | None:
+        """Return the candidate bound to the one active exchange of ``kind``."""
+        if kind != "material_packet":
+            raise ValueError("ChatGPT artifact client only resumes material packets by candidate")
+        return _active_candidate_id_for_kind(
+            run_dir=self.run_dir,
+            bindings=self.bindings,
+            kind=kind,
+        )
 
     def prepare_discovery_request(
         self,
@@ -303,30 +534,6 @@ class ArtifactChatGPTClient:
         receipt_path = response_path.with_name(
             response_path.name.replace(".response.json", ".receipt.json")
         )
-        if request_path.exists():
-            self._validate_request_bindings(
-                request_path=request_path,
-                response_path=response_path,
-                stage=stage,
-                kind=kind,
-                request_id=request_id,
-                input_digest=input_digest,
-                candidate_id=candidate_id,
-            )
-            if receipt_path.exists():
-                if not response_path.exists():
-                    raise ValueError("consumed ChatGPT response is missing")
-                self._validate_consumed_exchange(
-                    request_path=request_path,
-                    response_path=response_path,
-                    receipt_path=receipt_path,
-                    stage=stage,
-                    kind=kind,
-                    request_id=request_id,
-                    input_digest=input_digest,
-                    candidate_id=candidate_id,
-                )
-            return request_path, response_path
         envelope = {
             "schema_version": HANDOFF_SCHEMA_VERSION,
             "prompt_schema_version": PROMPT_SCHEMA_VERSION,
@@ -346,7 +553,40 @@ class ArtifactChatGPTClient:
             "response_extraction": "assistant_dom_text_content",
             "raw_transcript_required": False,
         }
-        _write_immutable_json(request_path, envelope)
+        with _handoff_queue_lock(self.run_dir):
+            if request_path.exists():
+                self._validate_request_bindings(
+                    request_path=request_path,
+                    response_path=response_path,
+                    stage=stage,
+                    kind=kind,
+                    request_id=request_id,
+                    input_digest=input_digest,
+                    candidate_id=candidate_id,
+                )
+                if receipt_path.exists():
+                    if not response_path.exists():
+                        raise ValueError("consumed ChatGPT response is missing")
+                    self._validate_consumed_exchange(
+                        request_path=request_path,
+                        response_path=response_path,
+                        receipt_path=receipt_path,
+                        stage=stage,
+                        kind=kind,
+                        request_id=request_id,
+                        input_digest=input_digest,
+                        candidate_id=candidate_id,
+                    )
+                return request_path, response_path
+            current = _active_handoffs_unlocked(
+                run_dir=self.run_dir,
+                bindings=self.bindings,
+            )
+            if len(current) > 1:
+                raise ValueError("autonomy run has more than one active handoff exchange")
+            if current:
+                raise _pending_for_active(current[0])
+            _write_immutable_json(request_path, envelope)
         return request_path, response_path
 
     def _validate_request_bindings(
@@ -497,67 +737,96 @@ class ArtifactChatGPTClient:
 
 def import_response_artifact(*, request_path: Path, input_path: Path) -> dict[str, str]:
     """Validate and atomically import one browser-produced JSON response."""
-    request_path = request_path.resolve()
-    request = _read_json_object(request_path)
-    if request.get("schema_version") != HANDOFF_SCHEMA_VERSION:
-        raise ValueError("unsupported ChatGPT handoff request")
-    expected_kind = str(request.get("kind") or "")
-    request_id = str(request.get("request_id") or "")
-    prompt = str(request.get("prompt") or "")
-    if not expected_kind or not request_id:
-        raise ValueError("handoff request is incomplete")
-    if expected_kind in {"role_candidates", "material_packet"}:
-        if not prompt or request.get("prompt_sha256") != _sha256_text(prompt):
-            raise ValueError("ChatGPT handoff prompt digest mismatch")
-
+    if request_path.is_symlink():
+        raise ValueError("handoff request must not be a symbolic link")
+    request_path = request_path.resolve(strict=True)
+    if request_path.parent.name != "handoff" or not request_path.name.endswith(
+        ".request.json"
+    ):
+        raise ValueError("handoff request path is not active")
     run_dir = request_path.parent.parent.resolve()
-    target = (run_dir / str(request.get("response_path") or "")).resolve()
-    if target.parent != request_path.parent or not target.name.endswith(".response.json"):
-        raise ValueError("ChatGPT response path escaped the handoff directory")
-    run_id = str(request.get("run_id") or "")
-    if not run_id:
-        raise ValueError("handoff request is missing its run binding")
     text = input_path.read_text(encoding="utf-8")
-    max_chars = int(request.get("max_response_chars") or 0)
-    try:
-        if max_chars <= 0 or len(text) > max_chars:
-            raise ValueError("ChatGPT response exceeded the request limit")
+
+    with _handoff_queue_lock(run_dir):
+        request = _read_json_object(request_path)
+        if request.get("schema_version") != HANDOFF_SCHEMA_VERSION:
+            raise ValueError("unsupported ChatGPT handoff request")
+        expected_kind = str(request.get("kind") or "")
+        request_id = str(request.get("request_id") or "")
+        prompt = str(request.get("prompt") or "")
+        if not expected_kind or not request_id:
+            raise ValueError("handoff request is incomplete")
         if expected_kind in {"role_candidates", "material_packet"}:
-            payload = parse_chatgpt_json(text, expected_kind=expected_kind)
-            if payload.get("request_id") != request_id:
-                raise ChatGPTContractError("ChatGPT response request_id mismatch")
-        elif expected_kind == "form_review":
-            from applypilot.autonomy.form_handoff import validate_form_review_response
+            if not prompt or request.get("prompt_sha256") != _sha256_text(prompt):
+                raise ValueError("ChatGPT handoff prompt digest mismatch")
 
-            payload = validate_form_review_response(json.loads(text), request=request)
-        else:
-            raise ValueError(f"unsupported handoff response kind: {expected_kind}")
-        if expected_kind == "role_candidates":
-            role_candidates_from_payload(
-                payload,
-                limit=max(1, len(payload.get("items") or [])),
+        raw_target = run_dir / str(request.get("response_path") or "")
+        if raw_target.is_symlink():
+            raise ValueError("handoff response must not be a symbolic link")
+        target = raw_target.resolve()
+        if target.parent != request_path.parent or not target.name.endswith(".response.json"):
+            raise ValueError("ChatGPT response path escaped the handoff directory")
+        bindings = RunBindings(
+            run_id=str(request.get("run_id") or ""),
+            fact_digest=str(request.get("fact_digest") or ""),
+            context_digest=str(request.get("context_digest") or ""),
+            policy_digest=str(request.get("policy_digest") or ""),
+        )
+        if any(
+            not value
+            for value in (
+                bindings.run_id,
+                bindings.fact_digest,
+                bindings.context_digest,
+                bindings.policy_digest,
             )
-        elif expected_kind == "material_packet":
-            candidate_id = str(request.get("candidate_id") or "")
-            if not candidate_id or payload.get("candidate_id") != candidate_id:
-                raise ChatGPTContractError("material response candidate_id mismatch")
-    except Exception:
-        _record_rejected_import(target, text, kind=expected_kind)
-        raise
+        ):
+            raise ValueError("handoff request is missing its run bindings")
+        if not target.exists():
+            current = _active_handoffs_unlocked(run_dir=run_dir, bindings=bindings)
+            if len(current) != 1 or current[0].request_path != request_path:
+                raise ValueError("handoff response does not target the single active exchange")
 
-    canonical = json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True) + "\n"
-    if target.exists():
-        existing = _read_json_object(target)
-        if _canonical_json(existing) != _canonical_json(payload):
-            raise FileExistsError("a different response is already bound to this request")
-    else:
-        _atomic_write_text(target, canonical)
-    return {
-        "request_id": request_id,
-        "request_path": str(request_path),
-        "response_path": str(target),
-        "response_sha256": _sha256_text(canonical),
-    }
+        max_chars = int(request.get("max_response_chars") or 0)
+        try:
+            if max_chars <= 0 or len(text) > max_chars:
+                raise ValueError("ChatGPT response exceeded the request limit")
+            if expected_kind in {"role_candidates", "material_packet"}:
+                payload = parse_chatgpt_json(text, expected_kind=expected_kind)
+                if payload.get("request_id") != request_id:
+                    raise ChatGPTContractError("ChatGPT response request_id mismatch")
+            elif expected_kind == "form_review":
+                from applypilot.autonomy.form_handoff import validate_form_review_response
+
+                payload = validate_form_review_response(json.loads(text), request=request)
+            else:
+                raise ValueError(f"unsupported handoff response kind: {expected_kind}")
+            if expected_kind == "role_candidates":
+                role_candidates_from_payload(
+                    payload,
+                    limit=max(1, len(payload.get("items") or [])),
+                )
+            elif expected_kind == "material_packet":
+                candidate_id = str(request.get("candidate_id") or "")
+                if not candidate_id or payload.get("candidate_id") != candidate_id:
+                    raise ChatGPTContractError("material response candidate_id mismatch")
+        except Exception:
+            _record_rejected_import(target, text, kind=expected_kind)
+            raise
+
+        canonical = json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True) + "\n"
+        if target.exists():
+            existing = _read_json_object(target)
+            if _canonical_json(existing) != _canonical_json(payload):
+                raise FileExistsError("a different response is already bound to this request")
+        else:
+            _atomic_write_text(target, canonical)
+        return {
+            "request_id": request_id,
+            "request_path": str(request_path),
+            "response_path": str(target),
+            "response_sha256": _sha256_text(canonical),
+        }
 
 
 def _write_immutable_json(path: Path, payload: dict[str, Any]) -> None:
