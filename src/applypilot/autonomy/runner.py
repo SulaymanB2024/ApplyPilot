@@ -32,7 +32,11 @@ from applypilot.autonomy.facts import (
     load_corrections,
     require_confirmed_facts,
 )
-from applypilot.autonomy.first_party import FirstPartyVerifier, configured_trusted_sources
+from applypilot.autonomy.first_party import (
+    CachedFirstPartyVerifier,
+    FirstPartyVerifier,
+    configured_trusted_sources,
+)
 from applypilot.autonomy.form_review import ReadOnlyFormReviewer
 from applypilot.autonomy.form_handoff import ArtifactFormReviewer
 from applypilot.autonomy.handoff import (
@@ -75,6 +79,7 @@ RUN_RESULT_LIST_FIELDS = frozenset(
         "discoveries",
         "eligibility",
         "freshness",
+        "rankings",
         "materials",
         "form_reviews",
         "final_actions",
@@ -695,13 +700,21 @@ def advance_artifact_run(
         bindings=bindings,
         ledger=ledger,
     )
-    active_verifier = verifier or FirstPartyVerifier(
-        ledger=ledger,
-        trusted_sources=configured_trusted_sources(),
+    active_verifier = verifier or CachedFirstPartyVerifier(
+        FirstPartyVerifier(
+            ledger=ledger,
+            trusted_sources=configured_trusted_sources(),
+        ),
+        cache_dir=run_dir / "verification",
     )
+    query = str(manifest.get("query") or "")
     result = AutonomousBatch(
         run_id=bindings.run_id,
-        profile=candidate_profile_from_data(profile),
+        profile=candidate_profile_from_data(
+            profile,
+            search_config=config.load_search_config(),
+            query=query,
+        ),
         context_pack=context_pack,
         dependencies=BatchDependencies(
             discovery=web,
@@ -717,7 +730,7 @@ def advance_artifact_run(
         output_dir=run_dir.parent,
         ledger=ledger,
         fact_ledger=fact_ledger,
-    ).run(query=str(manifest.get("query") or ""))
+    ).run(query=query)
     return result.to_dict()
 
 
@@ -814,7 +827,11 @@ def run_with_cdp(
             )
             result = AutonomousBatch(
                 run_id=run_id,
-                profile=candidate_profile_from_data(profile),
+                profile=candidate_profile_from_data(
+                    profile,
+                    search_config=config.load_search_config(),
+                    query=query,
+                ),
                 context_pack=context_pack,
                 dependencies=dependencies,
                 policy=active_policy,

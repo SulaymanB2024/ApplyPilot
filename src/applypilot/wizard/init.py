@@ -121,6 +121,9 @@ def _setup_profile() -> dict:
         "require_sponsorship": Confirm.ask("Will you now or in the future need sponsorship?"),
         "work_permit_type": Prompt.ask("Work permit type (e.g. Citizen, PR, Open Work Permit — leave blank if N/A)", default=""),
     }
+    profile["eligibility"] = {
+        "is_at_least_18": Confirm.ask("Are you currently at least 18 years old?"),
+    }
 
     # -- Compensation --
     console.print("\n[bold cyan]Compensation[/bold cyan]")
@@ -180,8 +183,15 @@ def _setup_profile() -> dict:
     }
 
     # -- Availability --
+    preferred_locations = Prompt.ask(
+        "Locations you are currently willing to work in (comma-separated)",
+        default="",
+    )
     profile["availability"] = {
-        "earliest_start_date": Prompt.ask("Earliest start date", default="Immediately"),
+        "earliest_start_date": Prompt.ask("Earliest start date", default=""),
+        "preferred_locations": [
+            item.strip() for item in preferred_locations.split(",") if item.strip()
+        ],
     }
 
     # Save

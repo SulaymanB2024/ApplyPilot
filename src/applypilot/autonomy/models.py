@@ -59,7 +59,20 @@ class CandidateProfile:
         "head of",
     )
     preferred_locations: tuple[str, ...] = ("remote", "united states", "austin", "texas")
+    target_families: tuple[str, ...] = (
+        "ai_product",
+        "data_analytics",
+        "growth_analytics",
+        "technical_business",
+        "venture",
+        "seo_analytics",
+    )
+    skills: tuple[str, ...] = ()
+    education_evidence: tuple[str, ...] = ()
     commitments: tuple[DateWindow, ...] = ()
+    legally_authorized_to_work: bool | None = None
+    require_sponsorship: bool | None = None
+    is_at_least_18: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -234,6 +247,7 @@ class BatchResult:
     discoveries: list[dict[str, Any]] = field(default_factory=list)
     eligibility: list[dict[str, Any]] = field(default_factory=list)
     freshness: list[dict[str, Any]] = field(default_factory=list)
+    rankings: list[dict[str, Any]] = field(default_factory=list)
     materials: list[dict[str, Any]] = field(default_factory=list)
     form_reviews: list[dict[str, Any]] = field(default_factory=list)
     final_actions: list[dict[str, Any]] = field(default_factory=list)

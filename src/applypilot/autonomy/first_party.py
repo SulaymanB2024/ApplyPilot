@@ -12,11 +12,12 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
+from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import urlparse
 
 from applypilot import config
-from applypilot.autonomy.models import FreshnessEvidence, RoleCandidate
+from applypilot.autonomy.models import DateWindow, FreshnessEvidence, RoleCandidate
 from applypilot.autonomy.telemetry import UsageLedger
 
 ATS_HOSTS = {
@@ -34,7 +35,10 @@ DISALLOWED_HOST_MARKERS = (
 )
 HOSTED_ATS_SUFFIXES = (
     "avature.net",
+    "csod.com",
+    "icims.com",
     "myworkdayjobs.com",
+    "recsolu.com",
 )
 COMMON_COUNTRY_SECOND_LEVEL_SUFFIXES = {
     "ac",
@@ -77,6 +81,99 @@ class TrustedFirstPartySource:
     host: str
     path_prefix: str
     source_kind: str
+
+
+class CachedFirstPartyVerifier:
+    """Persist immutable verification evidence so resumptions do not refetch roles."""
+
+    SCHEMA_VERSION = "applypilot-first-party-cache-v3"
+    CACHE_NAMESPACE = "v3"
+
+    def __init__(self, delegate: Any, *, cache_dir: Path) -> None:
+        self.delegate = delegate
+        self.cache_dir = cache_dir.resolve()
+
+    def verify(self, candidate: RoleCandidate) -> FreshnessEvidence:
+        path = self.cache_dir / f"{candidate.candidate_id}.{self.CACHE_NAMESPACE}.json"
+        if path.is_file():
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if (
+                payload.get("schema_version") != self.SCHEMA_VERSION
+                or payload.get("candidate_id") != candidate.candidate_id
+                or payload.get("requested_url") != candidate.official_url
+            ):
+                raise ValueError("first-party cache binding mismatch")
+            return _freshness_from_cache(payload.get("evidence"))
+
+        evidence = self.delegate.verify(candidate)
+        self.cache_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        payload = {
+            "schema_version": self.SCHEMA_VERSION,
+            "candidate_id": candidate.candidate_id,
+            "requested_url": candidate.official_url,
+            "evidence": _freshness_to_cache(evidence),
+        }
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        temporary.chmod(0o600)
+        temporary.replace(path)
+        return evidence
+
+
+def _freshness_to_cache(evidence: FreshnessEvidence) -> dict[str, Any]:
+    start_window = None
+    if evidence.start_window is not None:
+        start_window = {
+            "start": evidence.start_window.start.isoformat(),
+            "end": evidence.start_window.end.isoformat(),
+            "label": evidence.start_window.label,
+        }
+    return {
+        "official_url": evidence.official_url,
+        "fetched_at": evidence.fetched_at.isoformat(),
+        "first_party": evidence.first_party,
+        "resolved": evidence.resolved,
+        "open_state": evidence.open_state,
+        "posted_date": evidence.posted_date.isoformat() if evidence.posted_date else None,
+        "updated_date": evidence.updated_date.isoformat() if evidence.updated_date else None,
+        "start_window": start_window,
+        "status_code": evidence.status_code,
+        "title": evidence.title,
+        "description": evidence.description,
+        "evidence": list(evidence.evidence),
+        "provider_error": evidence.provider_error,
+    }
+
+
+def _freshness_from_cache(raw: Any) -> FreshnessEvidence:
+    if not isinstance(raw, dict):
+        raise ValueError("first-party cache evidence is invalid")
+    start_raw = raw.get("start_window")
+    start_window = None
+    if isinstance(start_raw, dict):
+        start_window = DateWindow(
+            start=date.fromisoformat(str(start_raw.get("start"))),
+            end=date.fromisoformat(str(start_raw.get("end"))),
+            label=str(start_raw.get("label") or ""),
+        )
+    fetched_at = datetime.fromisoformat(str(raw.get("fetched_at") or ""))
+    if fetched_at.tzinfo is None:
+        raise ValueError("first-party cache timestamp must be timezone aware")
+    return FreshnessEvidence(
+        official_url=str(raw.get("official_url") or ""),
+        fetched_at=fetched_at,
+        first_party=bool(raw.get("first_party")),
+        resolved=bool(raw.get("resolved")),
+        open_state=raw.get("open_state") if raw.get("open_state") in {True, False, None} else None,
+        posted_date=date.fromisoformat(str(raw["posted_date"])) if raw.get("posted_date") else None,
+        updated_date=date.fromisoformat(str(raw["updated_date"])) if raw.get("updated_date") else None,
+        start_window=start_window,
+        status_code=int(raw["status_code"]) if raw.get("status_code") is not None else None,
+        title=str(raw.get("title") or ""),
+        description=str(raw.get("description") or ""),
+        evidence=tuple(str(item) for item in (raw.get("evidence") or [])),
+        provider_error=str(raw.get("provider_error") or ""),
+    )
 
 
 class Transport(Protocol):
@@ -161,6 +258,8 @@ class FirstPartyVerifier:
                 result = self._verify_greenhouse(candidate)
             elif host == "jobs.lever.co":
                 result = self._verify_lever(candidate)
+            elif host.endswith(".myworkdayjobs.com"):
+                result = self._verify_workday(candidate)
             elif host == "jobs.ashbyhq.com":
                 result = self._verify_html(candidate, first_party=True)
             else:
@@ -274,6 +373,86 @@ class FirstPartyVerifier:
             evidence=(f"lever_job_id={payload.get('id')}",),
         )
 
+    def _verify_workday(self, candidate: RoleCandidate) -> FreshnessEvidence:
+        """Resolve a Workday role through its public CXS JSON endpoint.
+
+        The shell page often contains only the title. Treating that shell as the
+        complete posting can hide hard qualifications, so Workday verification
+        fails closed unless the job-specific JSON payload is available.
+        """
+        parsed = urlparse(candidate.official_url)
+        host = (parsed.hostname or "").lower()
+        parts = [part for part in parsed.path.split("/") if part]
+        try:
+            job_index = parts.index("job")
+        except ValueError:
+            job_index = -1
+        if job_index < 1 or job_index == len(parts) - 1:
+            return FreshnessEvidence.now(
+                official_url=candidate.official_url,
+                first_party=True,
+                resolved=False,
+                open_state=None,
+                provider_error="workday_job_path_unrecognized",
+                evidence=(f"host={host}",),
+            )
+
+        tenant = host.split(".", 1)[0]
+        site = parts[job_index - 1]
+        job_path = "/".join(parts[job_index + 1 :])
+        api_url = f"https://{host}/wday/cxs/{tenant}/{site}/job/{job_path}"
+        response = self.transport.get(api_url, expect_json=True)
+        payload = response.payload if isinstance(response.payload, dict) else {}
+        posting = payload.get("jobPostingInfo")
+        posting = posting if isinstance(posting, dict) else {}
+        title = str(posting.get("title") or "")
+        job_id = posting.get("id")
+        if response.status_code >= 400 or not job_id or not title:
+            return FreshnessEvidence.now(
+                official_url=candidate.official_url,
+                first_party=True,
+                resolved=False,
+                open_state=False if response.status_code in {404, 410} else None,
+                status_code=response.status_code,
+                provider_error="workday_api_job_missing",
+                evidence=(f"workday_api_status={response.status_code}",),
+            )
+        if not _page_matches_title(title, candidate.title):
+            return FreshnessEvidence.now(
+                official_url=candidate.official_url,
+                first_party=True,
+                resolved=False,
+                open_state=None,
+                status_code=response.status_code,
+                title=title,
+                provider_error="workday_title_mismatch",
+                evidence=(f"workday_job_id={job_id}",),
+            )
+
+        description = _clean_text(str(posting.get("jobDescription") or ""))
+        if not description:
+            return FreshnessEvidence.now(
+                official_url=candidate.official_url,
+                first_party=True,
+                resolved=False,
+                open_state=None,
+                status_code=response.status_code,
+                title=title,
+                provider_error="workday_description_missing",
+                evidence=(f"workday_job_id={job_id}",),
+            )
+        return FreshnessEvidence.now(
+            official_url=candidate.official_url,
+            first_party=True,
+            resolved=True,
+            open_state=True,
+            start_window=candidate.start_window,
+            status_code=response.status_code,
+            title=title,
+            description=description[:20_000],
+            evidence=(f"workday_job_id={job_id}",),
+        )
+
     def _verify_html(self, candidate: RoleCandidate, *, first_party: bool) -> FreshnessEvidence:
         path = urlparse(candidate.official_url).path.strip("/")
         if not path:
@@ -382,7 +561,12 @@ def _tenant_matches_company(company: str, tenant: str) -> bool:
     if not company_tokens:
         return False
     compact_company = "".join(company_tokens)
-    comparison_label = re.sub(r"[^a-z0-9]+", "", tenant.lower())
+    tenant_tokens = [
+        token
+        for token in re.findall(r"[a-z0-9]+", tenant.lower())
+        if token not in {"career", "careers", "job", "jobs", "recruiting"}
+    ]
+    comparison_label = "".join(tenant_tokens)
     if not comparison_label:
         return False
     return len(compact_company) >= 4 and compact_company == comparison_label

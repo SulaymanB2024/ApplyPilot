@@ -269,6 +269,52 @@ def require_confirmed_facts(ledger: FactLedger, fact_ids: Iterable[str]) -> list
     return blockers
 
 
+def build_monotonic_fact_snapshot(
+    base: FactLedger,
+    profile: dict[str, Any],
+    *,
+    resume_text: str,
+) -> FactLedger:
+    """Extend unknown run facts while rejecting drift in already reviewed evidence."""
+    preserved_rejections = tuple(
+        FactCorrection(
+            match=record.value,
+            state=FactState.REJECTED,
+            reason=record.reason or "preserved from reviewed run fact ledger",
+            fact_id=record.fact_id,
+        )
+        for record in base.rejected()
+    )
+    current = build_fact_ledger(
+        profile,
+        resume_text=resume_text,
+        corrections=preserved_rejections,
+    )
+    validate_monotonic_fact_extension(base, current)
+    return current
+
+
+def validate_monotonic_fact_extension(base: FactLedger, current: FactLedger) -> None:
+    """Reject changes to resume content or any already reviewed non-unknown fact."""
+    if current.resume_sha256 != base.resume_sha256:
+        raise ValueError("resume changed after material preparation; create a new workflow run")
+
+    current_by_id = {record.fact_id: record for record in current.records}
+    for reviewed in base.records:
+        if reviewed.state is FactState.UNKNOWN:
+            continue
+        active = current_by_id.get(reviewed.fact_id)
+        if (
+            active is None
+            or active.value != reviewed.value
+            or active.state is not reviewed.state
+        ):
+            raise ValueError(
+                f"reviewed fact changed after material preparation: {reviewed.fact_id}; "
+                "create a new workflow run"
+            )
+
+
 def confirmed_preferred_location_fact_ids(ledger: FactLedger) -> tuple[str, ...]:
     """Return exact confirmed location fact IDs accepted by live approval."""
     return tuple(

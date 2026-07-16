@@ -28,6 +28,8 @@ def _build_profile_summary(profile: dict) -> str:
     exp = p.get("experience", {})
     avail = p.get("availability", {})
     eeo = p.get("eeo_voluntary", {})
+    screening = p.get("screening", {})
+    eligibility = p.get("eligibility", {})
 
     lines = [
         f"Name: {personal['full_name']}",
@@ -55,14 +57,15 @@ def _build_profile_summary(profile: dict) -> str:
         lines.append(f"Website: {personal['website_url']}")
 
     # Work authorization
-    lines.append(f"Work Auth: {work_auth.get('legally_authorized_to_work', 'See profile')}")
-    lines.append(f"Sponsorship Needed: {work_auth.get('require_sponsorship', 'See profile')}")
+    lines.append(f"Work Auth: {_supplied(work_auth.get('legally_authorized_to_work'))}")
+    lines.append(f"Sponsorship Needed: {_supplied(work_auth.get('require_sponsorship'))}")
     if work_auth.get("work_permit_type"):
         lines.append(f"Work Permit: {work_auth['work_permit_type']}")
 
     # Compensation
     currency = comp.get("salary_currency", "USD")
-    lines.append(f"Salary Expectation: ${comp['salary_expectation']} {currency}")
+    salary = _supplied(comp.get("salary_expectation"))
+    lines.append(f"Salary Expectation: {salary} {currency}")
 
     # Experience
     if exp.get("years_of_experience_total"):
@@ -71,24 +74,32 @@ def _build_profile_summary(profile: dict) -> str:
         lines.append(f"Education: {exp['education_level']}")
 
     # Availability
-    lines.append(f"Available: {avail.get('earliest_start_date', 'Immediately')}")
+    lines.append(f"Available: {_supplied(avail.get('earliest_start_date'))}")
 
-    # Standard responses
-    lines.extend([
-        "Age 18+: Yes",
-        "Background Check: Yes",
-        "Felony: No",
-        "Previously Worked Here: No",
-        "How Heard: Online Job Board",
-    ])
+    # Screening answers must come from the profile. Missing answers remain explicit abstentions.
+    lines.extend(
+        [
+            f"Age 18+: {_supplied(eligibility.get('is_at_least_18'))}",
+            f"Background Check: {_supplied(screening.get('consent_background_check'))}",
+            f"Felony: {_supplied(screening.get('felony_conviction'))}",
+            f"Previously Worked Here: {_supplied(screening.get('previously_worked_here'))}",
+            f"How Heard: {_supplied(screening.get('how_heard'))}",
+        ]
+    )
 
     # EEO
     lines.append(f"Gender: {eeo.get('gender', 'Decline to self-identify')}")
     lines.append(f"Race: {eeo.get('race_ethnicity', 'Decline to self-identify')}")
-    lines.append(f"Veteran: {eeo.get('veteran_status', 'I am not a protected veteran')}")
+    lines.append(f"Veteran: {eeo.get('veteran_status', 'Decline to self-identify')}")
     lines.append(f"Disability: {eeo.get('disability_status', 'I do not wish to answer')}")
 
     return "\n".join(lines)
+
+
+def _supplied(value: object) -> object:
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return "UNCONFIRMED — do not infer"
+    return value
 
 
 def _build_location_check(profile: dict, search_config: dict) -> str:
@@ -165,21 +176,23 @@ def _build_screening_section(profile: dict) -> str:
     """Build the screening questions guidance section."""
     personal = profile["personal"]
     exp = profile.get("experience", {})
-    city = personal.get("city", "their city")
-    years = exp.get("years_of_experience_total", "multiple")
-    target_role = exp.get("target_role", personal.get("current_job_title", "software engineer"))
+    city = _supplied(personal.get("city"))
+    years = _supplied(exp.get("years_of_experience_total"))
+    target_role = _supplied(exp.get("target_role") or personal.get("current_job_title"))
     work_auth = profile["work_authorization"]
+    screening = profile.get("screening", {})
 
-    return f"""== SCREENING QUESTIONS (be strategic) ==
+    return f"""== SCREENING QUESTIONS (be factual) ==
 Hard facts -> answer truthfully from the profile. No guessing. This includes:
-  - Location/relocation: lives in {city}, cannot relocate
-  - Work authorization: {work_auth.get('legally_authorized_to_work', 'see profile')}
+  - Location: {city}
+  - Relocation: {_supplied(screening.get('willing_to_relocate'))}
+  - Work authorization: {_supplied(work_auth.get('legally_authorized_to_work'))}
   - Citizenship, clearance, licenses, certifications: answer from profile only
   - Criminal/background: answer from profile only
 
-Skills and tools -> be confident. This candidate is a {target_role} with {years} years experience. If the question asks "Do you have experience with [tool]?" and it's in the same domain (DevOps, backend, ML, cloud, automation), answer YES. Software engineers learn tools fast. Don't sell short.
+Skills and tools -> use only skills or experience explicitly supported by the profile or resume. Target role: {target_role}. Confirmed experience years: {years}. Similar-domain experience is not proof of a named tool; abstain when the exact answer is missing.
 
-Open-ended questions ("Why do you want this role?", "Tell us about yourself", "What interests you?") -> Write 2-3 sentences. Be specific to THIS job. Reference something from the job description. Connect it to a real achievement from the resume. No generic fluff. No "I am passionate about..." -- sound like a real person.
+Open-ended questions ("Why do you want this role?", "Tell us about yourself", "What interests you?") -> use only claims copied or faithfully paraphrased from the reviewed resume and materials. If a truthful supported answer is unavailable, stop as an unresolved required field.
 
 EEO/demographics -> "Decline to self-identify" or "Prefer not to say" for everything."""
 
@@ -200,7 +213,9 @@ def _build_hard_rules(profile: dict) -> str:
 
     work_auth_rule = "Work auth: Answer truthfully from profile."
     if permit_type:
-        work_auth_rule = f"Work auth: {permit_type}. Sponsorship needed: {sponsorship}."
+        work_auth_rule = (
+            f"Work auth: {permit_type}. Sponsorship needed: {_supplied(sponsorship)}."
+        )
 
     name_rule = f'Name: Legal name = {full_name}.'
     if preferred_name and preferred_name != full_name.split()[0]:
@@ -650,12 +665,10 @@ def build_prompt(job: dict, tailored_resume: str,
     captcha_section = _build_captcha_section()
 
     # Cover letter fallback text
-    city = personal.get("city", "the area")
     if not cover_letter_text:
         cl_display = (
-            f"None available. Skip if optional. If required, write 2 factual "
-            f"sentences: (1) relevant experience from the resume that matches "
-            f"this role, (2) available immediately and based in {city}."
+            "None available. Skip if optional. If required, do not draft or infer one "
+            "inside the form; stop with RESULT:FAILED:required_cover_letter_missing."
         )
     else:
         cl_display = cover_letter_text

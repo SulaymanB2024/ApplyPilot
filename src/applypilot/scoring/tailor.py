@@ -76,13 +76,14 @@ Take the base resume and job description. Return a tailored resume as a JSON obj
 ## SKILLS BOUNDARY (real skills only):
 {skills_block}
 
-You MAY add 2-3 closely related tools (Kubernetes if Docker, Terraform if AWS, Redis if PostgreSQL). No unrelated languages/frameworks.
+You MUST NOT add any tool, language, framework, employer, metric, credential, or
+experience that is not explicit in the source resume and profile boundary.
 
 ## TAILORING RULES:
 
 TITLE: Match the target role. Keep seniority (Senior/Lead/Staff). Drop company suffixes and team names.
 
-SUMMARY: Rewrite from scratch. Lead with the 1-2 skills that matter most for THIS role. Sound like someone who's done this job.
+SUMMARY: Use only source-supported facts. Lead with the 1-2 confirmed skills that matter most for THIS role.
 
 SKILLS: Reorder each category so the job's must-haves appear first.
 
@@ -158,14 +159,11 @@ ISSUES: (list any problems, or "none")
 - Reordering anything
 - Changing the title or summary completely
 
-## TOLERANCE RULE:
-The goal is to get interviews, not to be a perfect fact-checker. Allow up to 3 minor stretches per resume:
-- Adding a closely related tool the candidate could realistically know is a MINOR STRETCH, not fabrication.
-- Reframing a metric with slightly different wording is a MINOR STRETCH.
-- Adding any LEARNABLE skill given their existing stack is a MINOR STRETCH.
-- Only FAIL if there are MAJOR lies: completely invented projects, fake companies, fake degrees, wildly inflated numbers, or skills from a completely different domain.
-
-Be strict about major lies. Be lenient about minor stretches and learnable skills. Do not fail for style, tone, or restructuring."""
+## FACTUALITY RULE:
+There is no tolerance for stretches. FAIL any unsupported tool, skill, employer,
+metric, credential, date, responsibility, or achievement, even if it seems
+closely related or easy to learn. Do not fail for style, tone, or claim-preserving
+reordering."""
 
 
 # ── JSON Extraction ───────────────────────────────────────────────────────
@@ -436,8 +434,7 @@ def tailor_resume(
                 # In normal mode, only retry on judge failure if there are retries left
                 if validation_mode != "lenient":
                     continue
-            # Accept best attempt on last retry (all modes) or if lenient
-            report["status"] = "approved_with_judge_warning"
+            report["status"] = "failed_judge"
             return tailored, report
 
         # Both passed
@@ -511,9 +508,8 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
             report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
 
             # Generate PDF for approved resumes (best-effort)
-            # "approved_with_judge_warning" is also a success — resume was generated.
             pdf_path = None
-            if report["status"] in ("approved", "approved_with_judge_warning"):
+            if report["status"] == "approved":
                 try:
                     from applypilot.scoring.pdf import convert_to_pdf
                     pdf_path = str(convert_to_pdf(txt_path))
@@ -552,7 +548,7 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
 
     # Persist to DB: increment attempt counter for ALL, save path only for approved
     now = datetime.now(timezone.utc).isoformat()
-    _success_statuses = {"approved", "approved_with_judge_warning"}
+    _success_statuses = {"approved"}
     for r in results:
         if r["status"] in _success_statuses:
             conn.execute(

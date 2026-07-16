@@ -35,6 +35,7 @@ PROFILE = {
     },
     "compensation": {"salary_expectation": "120000"},
     "availability": {"earliest_start_date": "Immediately"},
+    "screening": {"accept_application_terms": True},
     "eeo_voluntary": {},
 }
 

@@ -54,7 +54,7 @@ class FunnelBudget:
     """
 
     discoveries: int = 30
-    first_party_verifications: int = 15
+    first_party_verifications: int = 24
     material_packets: int = 5
     form_dry_runs: int = 3
     model_calls: int = 8
@@ -65,7 +65,7 @@ class FunnelBudget:
     prompt_chars: int = 60_000
     response_chars: int = 160_000
     elapsed_seconds: int = 0
-    no_progress_cycles: int = 3
+    no_progress_cycles: int = 2
 
     def validate(self) -> None:
         for name, value in asdict(self).items():
@@ -136,12 +136,23 @@ def authorize_source(
 
 def eligibility_gate(candidate: RoleCandidate, profile: CandidateProfile) -> GateDecision:
     """Reject clearly ineligible roles before browser or material work."""
+    from applypilot.autonomy.matching import (
+        classify_role,
+        early_career_signal,
+        education_requirement_match,
+        explicit_applicant_requirement_decision,
+        location_preference_match,
+        out_of_scope_title_signal,
+        senior_title_signal,
+    )
+
     title = _normalize(candidate.title)
     body = _normalize(f"{candidate.title} {candidate.description}")
     reasons: list[str] = []
     evidence: list[str] = []
 
-    if any(_phrase(title, marker) for marker in profile.excluded_levels):
+    senior_marker = senior_title_signal(candidate)
+    if senior_marker or any(_phrase(title, marker) for marker in profile.excluded_levels):
         reasons.append("senior_title")
         evidence.append(candidate.title)
 
@@ -166,22 +177,79 @@ def eligibility_gate(candidate: RoleCandidate, profile: CandidateProfile) -> Gat
     if reasons:
         return GateDecision(Decision.REJECT, tuple(reasons), tuple(evidence))
 
-    target_level = any(_phrase(body, marker) for marker in profile.target_levels)
-    if not target_level and required_min is None:
+    requirement_rejects, requirement_reviews, requirement_evidence = (
+        explicit_applicant_requirement_decision(candidate, profile)
+    )
+    if requirement_rejects:
         return GateDecision(
-            Decision.REVIEW,
-            ("level_or_experience_ambiguous",),
+            Decision.REJECT,
+            requirement_rejects,
+            requirement_evidence,
+        )
+
+    out_of_scope = out_of_scope_title_signal(candidate)
+    if out_of_scope:
+        return GateDecision(
+            Decision.REJECT,
+            ("out_of_scope_function",),
+            (out_of_scope, candidate.title),
+        )
+
+    role_families = classify_role(candidate)
+    matched_families = tuple(
+        family for family in role_families if family in profile.target_families
+    )
+    if not matched_families:
+        return GateDecision(
+            Decision.REJECT,
+            ("role_family_mismatch",),
             (candidate.title,),
         )
 
-    location = _normalize_location(candidate.location)
-    if location and profile.preferred_locations and not any(
-        _phrase(location, _normalize_location(preferred))
-        for preferred in profile.preferred_locations
-    ):
-        return GateDecision(Decision.REVIEW, ("location_outside_preferences",), (candidate.location,))
+    if not early_career_signal(candidate):
+        return GateDecision(
+            Decision.REVIEW,
+            ("early_career_signal_missing",),
+            (candidate.title,),
+        )
 
-    return GateDecision(Decision.ACCEPT, ("eligible_entry_level",), (candidate.title,))
+    location_match, _ = location_preference_match(
+        candidate.location,
+        profile.preferred_locations,
+    )
+    if location_match is False:
+        return GateDecision(Decision.REJECT, ("location_outside_preferences",), (candidate.location,))
+    review_reasons = list(requirement_reviews)
+    review_evidence = list(requirement_evidence)
+    if location_match is None:
+        review_reasons.append("location_unverified")
+        review_evidence.append(candidate.location)
+
+    education_match, required_degree_families = education_requirement_match(
+        candidate,
+        profile,
+    )
+    if education_match is not True:
+        review_reasons.append("education_requirement_unverified")
+        review_evidence.extend(
+            (
+                "required=" + ",".join(required_degree_families),
+                "candidate=" + " | ".join(profile.education_evidence),
+            )
+        )
+
+    if review_reasons:
+        return GateDecision(
+            Decision.REVIEW,
+            tuple(review_reasons),
+            tuple(review_evidence),
+        )
+
+    return GateDecision(
+        Decision.ACCEPT,
+        ("eligible_entry_level", "target_role_family", "preferred_location"),
+        (candidate.title, ",".join(matched_families), candidate.location),
+    )
 
 
 def freshness_gate(
@@ -218,6 +286,16 @@ def freshness_gate(
                 (observed_date.isoformat(),),
             )
     if not observed_date and not evidence.start_window:
+        future_cycle_years = [
+            int(value)
+            for value in re.findall(r"\b20\d{2}\b", f"{evidence.title} {evidence.description}")
+        ]
+        if future_cycle_years and current.year <= max(future_cycle_years) <= current.year + 2:
+            return GateDecision(
+                Decision.ACCEPT,
+                ("first_party_open_current_cycle",),
+                evidence.evidence,
+            )
         return GateDecision(Decision.REVIEW, ("freshness_dates_missing",), evidence.evidence)
     return GateDecision(Decision.ACCEPT, ("first_party_open_and_plausible",), evidence.evidence)
 
@@ -286,9 +364,9 @@ def _deep_merge(target: dict[str, Any], incoming: dict[str, Any]) -> None:
 def _inferred_required_experience_min(text: str) -> int | None:
     """Extract only explicit experience-floor phrases; false negatives are safer than guesses."""
     patterns = (
-        r"\b(\d{1,2})\s*\+\s*years?\b",
-        r"\b(?:at least|minimum(?: of)?|over)\s+(\d{1,2})\s+years?\b",
-        r"\b(\d{1,2})\s+(?:or more)\s+years?\b",
+        r"\b(\d{1,2})\s*\+\s*years?\s+(?:of\s+)?(?:professional\s+|relevant\s+)?experience\b",
+        r"\b(?:at least|minimum(?: of)?|over)\s+(\d{1,2})\s+years?\s+(?:of\s+)?(?:professional\s+|relevant\s+)?experience\b",
+        r"\b(\d{1,2})\s+(?:or more)\s+years?\s+(?:of\s+)?(?:professional\s+|relevant\s+)?experience\b",
         r"\b(\d{1,2})\s+years?\s+of\s+(?:professional\s+|relevant\s+)?experience\b",
     )
     values = [

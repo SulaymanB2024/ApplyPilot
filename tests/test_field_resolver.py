@@ -106,6 +106,29 @@ def test_unconfirmed_work_authorization_abstains():
     assert field_value_for(auth, profile=profile, job={"title": "Software Engineer"}) is None
 
 
+def test_missing_start_date_and_terms_consent_abstain():
+    profile = {
+        **PROFILE,
+        "availability": {},
+        "screening": {},
+    }
+    start = FieldSpec(
+        selector="#start",
+        tag="input",
+        type="text",
+        label="Earliest start date",
+    )
+    consent = FieldSpec(
+        selector="#terms",
+        tag="input",
+        type="checkbox",
+        label="I accept the application terms",
+    )
+
+    assert field_value_for(start, profile=profile, job={"title": "Engineer"}) is None
+    assert field_value_for(consent, profile=profile, job={"title": "Engineer"}) is None
+
+
 def test_select_options_must_match_real_options():
     spec = FieldSpec(
         selector="#country",

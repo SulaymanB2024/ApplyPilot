@@ -1,5 +1,4 @@
 import json
-from datetime import datetime, timezone
 
 import pytest
 
@@ -344,7 +343,7 @@ def test_doctor_strict_json_exits_nonzero_for_required_missing_files(
     assert '"resume.txt"' in result.output
 
 
-def test_doctor_strict_requires_chatgpt_web_probe(monkeypatch, tmp_path):
+def test_doctor_uses_portable_chatgpt_transport_without_cdp_probe(monkeypatch, tmp_path):
     from applypilot import config
 
     profile_path = tmp_path / "profile.json"
@@ -363,15 +362,14 @@ def test_doctor_strict_requires_chatgpt_web_probe(monkeypatch, tmp_path):
     result = runner.invoke(app, ["doctor", "--strict", "--json"])
 
     assert result.exit_code == 1
-    assert '"ChatGPT Web"' in result.output
-    assert "configured but unprobed" in result.output
+    assert '"ChatGPT Web artifact transport"' in result.output
+    assert "configured but unprobed" not in result.output
+    assert '"Submission facts"' in result.output
 
 
 def test_doctor_autonomy_checks_facts_without_requiring_model_api_key(monkeypatch, tmp_path):
     from applypilot import config
     from applypilot.autonomy import approval
-    from applypilot.autonomy import runner as autonomy_runner
-    from applypilot.autonomy.supervisor import record_runtime_observation
 
     profile_path = tmp_path / "profile.json"
     resume_path = tmp_path / "resume.txt"
@@ -410,49 +408,23 @@ def test_doctor_autonomy_checks_facts_without_requiring_model_api_key(monkeypatc
         lambda: tmp_path / "allowed_signers",
     )
 
-    missing_runtime = runner.invoke(
+    result = runner.invoke(
         app,
         ["doctor", "--autonomy", "--strict", "--json"],
     )
-    assert missing_runtime.exit_code == 1, missing_runtime.output
-    assert '"ready": false' in missing_runtime.output
-    assert '"static_ready": true' in missing_runtime.output
-    assert '"runtime_ready": false' in missing_runtime.output
-    assert '"Autonomy runtime observation"' in missing_runtime.output
-
-    runtime_dir = tmp_path / "run-1"
-    runtime_dir.mkdir()
-    observed_at = datetime.now(timezone.utc)
-    record_runtime_observation(
-        root=runtime_dir,
-        scope_kind="run",
-        scope_id=runtime_dir.name,
-        chronicle_state="capturing",
-        chronicle_evidence_code="fresh_frame_observed",
-        latest_frame_at=observed_at,
-        browser_surface="codex_chrome_connector",
-        browser_readiness="ready",
-        now=observed_at,
-    )
-    monkeypatch.setattr(
-        autonomy_runner,
-        "latest_autonomy_run_dir",
-        lambda: runtime_dir,
-    )
-    result = runner.invoke(app, ["doctor", "--autonomy", "--strict", "--json"])
-
     assert result.exit_code == 0, result.output
     assert '"ready": true' in result.output
     assert '"static_ready": true' in result.output
-    assert '"runtime_ready": true' in result.output
+    assert '"runtime_ready": null' in result.output
     assert '"ChatGPT Web artifact transport"' in result.output
-    assert '"Autonomy facts"' in result.output
-    assert '"Autonomy preferred locations"' in result.output
-    assert '"System approval trust store"' in result.output
+    assert '"Submission facts"' in result.output
+    assert '"Search preferences"' in result.output
+    assert '"System approval trust store"' not in result.output
+    assert '"Autonomy runtime observation"' not in result.output
     assert '"LLM API key"' not in result.output
 
 
-def test_doctor_autonomy_strict_requires_system_approval_trust_store(monkeypatch, tmp_path):
+def test_doctor_canonical_workflow_does_not_require_system_trust_store(monkeypatch, tmp_path):
     from applypilot import config
     from applypilot.autonomy import approval
 
@@ -491,9 +463,9 @@ def test_doctor_autonomy_strict_requires_system_approval_trust_store(monkeypatch
 
     result = runner.invoke(app, ["doctor", "--autonomy", "--strict", "--json"])
 
-    assert result.exit_code == 1, result.output
-    assert '"ready": false' in result.output
-    assert '"System approval trust store"' in result.output
+    assert result.exit_code == 0, result.output
+    assert '"ready": true' in result.output
+    assert '"System approval trust store"' not in result.output
 
 
 def test_doctor_autonomy_strict_requires_preferred_location(monkeypatch, tmp_path):
@@ -534,7 +506,7 @@ def test_doctor_autonomy_strict_requires_preferred_location(monkeypatch, tmp_pat
 
     assert result.exit_code == 1, result.output
     assert '"ready": false' in result.output
-    assert '"Autonomy preferred locations"' in result.output
+    assert '"Search preferences"' in result.output
 
 
 def test_harness_contract_references_training_manifest(tmp_path):
@@ -619,6 +591,14 @@ def test_build_prompt_injects_training_scenarios(monkeypatch, tmp_path):
     assert "Runway fresh-role discovery" in prompt
     assert "Aggregator to employer ATS" in prompt
     assert "never-include-this-password" not in prompt
+    assert "Age 18+: UNCONFIRMED — do not infer" in prompt
+    assert "Background Check: UNCONFIRMED — do not infer" in prompt
+    assert "Felony: No" not in prompt
+    assert "Previously Worked Here: No" not in prompt
+    assert "I am not a protected veteran" not in prompt
+    assert "answer YES. Software engineers learn tools fast" not in prompt
+    assert "available immediately and based in" not in prompt
+    assert "required_cover_letter_missing" in prompt
 
 
 def test_legacy_agent_controller_is_disabled_before_prompt_construction(monkeypatch):

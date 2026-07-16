@@ -168,14 +168,54 @@ def build_context_pack(
     )
 
 
-def candidate_profile_from_data(profile: dict[str, Any]) -> CandidateProfile:
+def candidate_profile_from_data(
+    profile: dict[str, Any],
+    *,
+    search_config: dict[str, Any] | None = None,
+    query: str = "",
+) -> CandidateProfile:
     """Derive the pre-model eligibility profile from factual profile data."""
+    from applypilot.autonomy.matching import infer_target_families
+
     experience = profile.get("experience") or {}
     education = str(experience.get("education_level") or profile.get("education") or "")
     month, year = _graduation_date(education)
     locations = _string_tuple(
         (profile.get("preferences") or {}).get("locations")
         or (profile.get("availability") or {}).get("preferred_locations")
+    )
+    search_config = search_config or {}
+    target_text = " ".join(
+        str(part or "")
+        for part in (
+            experience.get("target_role"),
+            query,
+            search_config.get("keywords"),
+        )
+    )
+    target_families = infer_target_families(target_text)
+    skills_boundary = profile.get("skills_boundary") or {}
+    skills = tuple(
+        dict.fromkeys(
+            str(item).strip().lower()
+            for values in skills_boundary.values()
+            if isinstance(values, list)
+            for item in values
+            if str(item).strip()
+        )
+    )
+    resume_facts = profile.get("resume_facts") or {}
+    work_authorization = profile.get("work_authorization") or {}
+    eligibility = profile.get("eligibility") or {}
+    education_evidence = tuple(
+        dict.fromkeys(
+            value
+            for value in (
+                education.strip(),
+                str(resume_facts.get("preserved_school") or "").strip(),
+            )
+            if value
+        )
     )
     return CandidateProfile(
         graduation_month=month,
@@ -184,7 +224,17 @@ def candidate_profile_from_data(profile: dict[str, Any]) -> CandidateProfile:
             experience.get("max_required_experience_years"),
             default=2,
         ),
-        preferred_locations=locations or CandidateProfile.preferred_locations,
+        preferred_locations=locations,
+        target_families=target_families or CandidateProfile.target_families,
+        skills=skills,
+        education_evidence=education_evidence,
+        legally_authorized_to_work=_safe_bool(
+            work_authorization.get("legally_authorized_to_work")
+        ),
+        require_sponsorship=_safe_bool(work_authorization.get("require_sponsorship")),
+        is_at_least_18=_safe_bool(
+            eligibility.get("is_at_least_18", profile.get("is_at_least_18"))
+        ),
     )
 
 
@@ -238,15 +288,15 @@ def build_discovery_prompt(
         ],
         "search_strategy": [
             (
-                "Treat the query as a campaign objective, not an exact-title allowlist. Expand it "
-                "into adjacent role families supported by the candidate's experience, projects, "
-                "skills, education, and preferences."
+                "Treat the query as a campaign objective with hard role-family, early-career, and "
+                "location boundaries. Expand title variants only within families supported by the "
+                "candidate's experience, projects, skills, education, and stated objective."
             ),
             (
-                "Search across internships, co-ops, apprenticeships, fellowships, new-grad, "
-                "entry-level, analyst, associate, coordinator, operations, program, product, "
-                "strategy, research, finance, growth, and technical-business variants when the "
-                "candidate evidence supports them."
+                "Search across internships, co-ops, apprenticeships, fellowships, new-grad, and "
+                "explicit early-career variants in the supported product, data/analytics, growth, "
+                "technical-business, venture, and SEO families. Generic analyst or associate "
+                "titles do not qualify without a supported family phrase."
             ),
             (
                 "Start with concrete hiring queries that combine a supported role family, an "
@@ -261,9 +311,9 @@ def build_discovery_prompt(
                 "first-party verification."
             ),
             (
-                "Treat preferred locations as ranking signals rather than discovery exclusions. "
-                "Include remote and broader domestic roles plus exceptional out-of-preference "
-                "roles, unless the supplied facts state a hard geographic restriction."
+                "Treat the locations named in the query as hard discovery boundaries. Return a "
+                "multi-location role only when at least one listed location matches. Do not spend "
+                "the result quota on clearly out-of-preference locations."
             ),
             (
                 "Favor credible paid roles and a diverse result set: multiple role families and "
@@ -271,9 +321,9 @@ def build_discovery_prompt(
                 "justifies it."
             ),
             (
-                "At discovery time reject only clear mismatches such as senior leadership, a hard "
-                "graduation or work-authorization conflict, unpaid work when paid work is required, "
-                "or an explicitly closed posting. Preserve ambiguous candidates for local review."
+                "Reject senior or manager roles, generic finance/banking/credit/sales/audit roles, "
+                "roles outside the supported families, hard graduation or work-authorization "
+                "conflicts, unpaid work when paid work is required, and explicitly closed postings."
             ),
             (
                 "Time-box each route. After a blocked page or two irrelevant results, switch to "
@@ -863,6 +913,20 @@ def _safe_int(value: Any, *, default: int) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def _safe_bool(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in {0, 1}:
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "yes", "y", "1"}:
+            return True
+        if normalized in {"false", "no", "n", "0"}:
+            return False
+    return None
 
 
 def _string_tuple(value: Any) -> tuple[str, ...]:

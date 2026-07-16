@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import typer
 from rich.console import Console
 from rich.table import Table
 
 from applypilot import __version__
+
+if TYPE_CHECKING:
+    from applypilot.workflow import WorkflowStore
 
 logging.basicConfig(
     level=logging.INFO,
@@ -160,6 +164,344 @@ def init() -> None:
     from applypilot.wizard.init import run_wizard
 
     run_wizard()
+
+
+@app.command("prepare")
+def prepare_workflow(
+    query: Optional[str] = typer.Option(
+        None,
+        "--query",
+        "-q",
+        help="Exact role-family, level, and location objective for a new run.",
+    ),
+    run_dir: Optional[Path] = typer.Option(
+        None,
+        "--run-dir",
+        help="Resume an existing canonical workflow run.",
+    ),
+    response: Optional[Path] = typer.Option(
+        None,
+        "--response",
+        help="Browser/model response for the run's one active handoff request.",
+    ),
+    out: Optional[Path] = typer.Option(None, "--out", help="Autonomy transport directory."),
+) -> None:
+    """Discover, verify, rank, and prepare one resumable reviewed shortlist."""
+    _bootstrap_config_only()
+    from applypilot import config
+    from applypilot.autonomy.handoff import import_response_artifact
+    from applypilot.autonomy.runner import advance_artifact_run, prepare_run
+    from applypilot.workflow import WorkflowStore
+
+    workflow_path = config.APP_DIR / "workflow.sqlite3"
+    try:
+        if run_dir is None:
+            if not query:
+                raise ValueError("--query is required when creating a workflow run")
+            if response is not None:
+                raise ValueError("--response requires --run-dir")
+            paths = prepare_run(
+                query=query,
+                output_dir=out or config.APP_DIR / "autonomy-runs",
+            )
+            run_dir = Path(paths["run_dir"])
+            with WorkflowStore(workflow_path) as store:
+                run_id = store.register_run(run_dir)
+                status = store.status(run_id)
+            console.print_json(
+                data={
+                    "run_id": run_id,
+                    "run_dir": str(run_dir),
+                    "status": status["status"],
+                    "next_action": "service_browser_handoff",
+                    "request_path": str(paths["request"]),
+                }
+            )
+            return
+
+        run_dir = run_dir.resolve()
+        if response is not None:
+            request_path = _one_active_handoff_request(run_dir)
+            import_response_artifact(request_path=request_path, input_path=response)
+
+        fact_ledger = json.loads(
+            (run_dir / "fact_ledger.json").read_text(encoding="utf-8")
+        )
+        result = advance_artifact_run(
+            run_dir=run_dir,
+            approved_fact_digest=str(fact_ledger["digest"]),
+        )
+        with WorkflowStore(workflow_path) as store:
+            status = store.sync_batch_result(run_dir=run_dir, result=result)
+            fact_digest, profile = _workflow_fact_snapshot(
+                store,
+                status["run_id"],
+                require_submission_facts=False,
+            )
+            status = store.reconcile_candidate_eligibility(
+                run_id=status["run_id"],
+                profile=profile,
+                fact_digest=fact_digest,
+            )
+        console.print_json(
+            data={
+                "run_id": status["run_id"],
+                "status": status["status"],
+                "candidate_counts": status["candidate_counts"],
+                "shortlist": status["shortlist"],
+                "pending_requests": result.get("pending_requests") or [],
+            }
+        )
+    except Exception as exc:
+        console.print(f"[red]Prepare failed:[/red] {type(exc).__name__}: {str(exc)[:240]}")
+        raise typer.Exit(code=1) from exc
+
+
+@app.command("workflow-status")
+def workflow_status(
+    run_id: str = typer.Option(..., "--run-id", help="Canonical workflow run id."),
+) -> None:
+    """Show the canonical shortlist and candidate-state counts."""
+    _bootstrap_config_only()
+    from applypilot import config
+    from applypilot.workflow import WorkflowStore
+
+    try:
+        with WorkflowStore(config.APP_DIR / "workflow.sqlite3") as store:
+            console.print_json(data=store.status(run_id))
+    except Exception as exc:
+        console.print(f"[red]Workflow status failed:[/red] {type(exc).__name__}: {str(exc)[:240]}")
+        raise typer.Exit(code=1) from exc
+
+
+@app.command("dry-run")
+def dry_run_workflow(
+    run_id: str = typer.Option(..., "--run-id", help="Canonical workflow run id."),
+    candidate: Optional[list[str]] = typer.Option(
+        None,
+        "--candidate",
+        help="Exact candidate id to fill and review. Repeat for up to five.",
+    ),
+    request: Optional[Path] = typer.Option(
+        None,
+        "--request",
+        help="Existing browser dry-run request to import.",
+    ),
+    response: Optional[Path] = typer.Option(
+        None,
+        "--response",
+        help="Browser dry-run response to validate and import.",
+    ),
+) -> None:
+    """Create or import visible-Chrome form dry-runs; never submit."""
+    _bootstrap_config_only()
+    from applypilot import config
+    from applypilot.workflow import WorkflowStore
+
+    try:
+        with WorkflowStore(config.APP_DIR / "workflow.sqlite3") as store:
+            if request is not None or response is not None:
+                if request is None or response is None:
+                    raise ValueError("--request and --response must be supplied together")
+                result = store.import_browser_response(
+                    request_path=request,
+                    input_path=response,
+                )
+                console.print_json(data=result)
+                return
+            form_fact_digest, profile = _confirmed_form_fact_snapshot(store, run_id)
+            store.reconcile_candidate_eligibility(
+                run_id=run_id,
+                profile=profile,
+                fact_digest=form_fact_digest,
+            )
+            candidate_ids = list(candidate or [])
+            if not candidate_ids:
+                candidate_ids = [
+                    item["candidate_id"]
+                    for item in store.shortlist(run_id, limit=5)
+                    if item["state"] == "materials_ready"
+                ][:3]
+            if not candidate_ids:
+                raise ValueError("no material-ready candidates are available for dry-run")
+            paths = store.create_dry_run_requests(
+                run_id=run_id,
+                candidate_ids=candidate_ids,
+                form_fact_digest=form_fact_digest,
+            )
+            console.print_json(
+                data={
+                    "run_id": run_id,
+                    "status": "awaiting_visible_chrome_dry_run",
+                    "request_paths": [str(path) for path in paths],
+                }
+            )
+    except Exception as exc:
+        console.print(f"[red]Dry-run failed:[/red] {type(exc).__name__}: {str(exc)[:240]}")
+        raise typer.Exit(code=1) from exc
+
+
+@app.command("approve")
+def approve_workflow_batch(
+    run_id: str = typer.Option(..., "--run-id", help="Canonical workflow run id."),
+    candidate: list[str] = typer.Option(
+        ...,
+        "--candidate",
+        help="Exact dry-run-reviewed candidate id. Repeat for the approved batch.",
+    ),
+    max_submissions: int = typer.Option(
+        3,
+        "--max-submissions",
+        min=1,
+        max=3,
+        help="Maximum final submissions permitted by this one approval.",
+    ),
+    valid_hours: int = typer.Option(24, "--valid-hours", min=1, max=72),
+) -> None:
+    """Authorize one exact, evidence-bound batch after candidate review."""
+    _bootstrap_config_only()
+    from applypilot import config
+    from applypilot.workflow import WorkflowStore
+
+    try:
+        with WorkflowStore(config.APP_DIR / "workflow.sqlite3") as store:
+            form_fact_digest, _profile = _confirmed_form_fact_snapshot(store, run_id)
+            approval = store.create_approval(
+                run_id=run_id,
+                candidate_ids=candidate,
+                form_fact_digest=form_fact_digest,
+                max_submissions=max_submissions,
+                valid_hours=valid_hours,
+            )
+            approval["candidates"] = [
+                item
+                for item in store.shortlist(run_id, limit=20)
+                if item["candidate_id"] in set(candidate)
+            ]
+            console.print_json(data=approval)
+    except Exception as exc:
+        console.print(f"[red]Approval failed:[/red] {type(exc).__name__}: {str(exc)[:240]}")
+        raise typer.Exit(code=1) from exc
+
+
+@app.command("execute")
+def execute_workflow_batch(
+    approval_id: str = typer.Option(..., "--approval-id", help="Exact active batch approval id."),
+    request: Optional[Path] = typer.Option(
+        None,
+        "--request",
+        help="Existing submission request whose browser response is being imported.",
+    ),
+    response: Optional[Path] = typer.Option(
+        None,
+        "--response",
+        help="Visible-Chrome submission result to validate and import.",
+    ),
+) -> None:
+    """Resume an approved batch one candidate at a time with duplicate prevention."""
+    _bootstrap_config_only()
+    from applypilot import config
+    from applypilot.workflow import WorkflowStore
+
+    try:
+        with WorkflowStore(config.APP_DIR / "workflow.sqlite3") as store:
+            imported = None
+            if request is not None or response is not None:
+                if request is None or response is None:
+                    raise ValueError("--request and --response must be supplied together")
+                imported = store.import_browser_response(
+                    request_path=request,
+                    input_path=response,
+                )
+            approval = store.approval_status(approval_id)
+            form_fact_digest, _profile = _confirmed_form_fact_snapshot(
+                store,
+                approval["run_id"],
+            )
+            next_request = store.create_submission_request(
+                approval_id=approval_id,
+                form_fact_digest=form_fact_digest,
+            )
+            console.print_json(
+                data={
+                    "approval_id": approval_id,
+                    "imported": imported,
+                    "status": "awaiting_visible_chrome_submission" if next_request else "batch_stopped",
+                    "request_path": str(next_request) if next_request else None,
+                }
+            )
+    except Exception as exc:
+        console.print(f"[red]Execute failed:[/red] {type(exc).__name__}: {str(exc)[:240]}")
+        raise typer.Exit(code=1) from exc
+
+
+def _one_active_handoff_request(run_dir: Path) -> Path:
+    """Resolve exactly one unanswered autonomy transport request."""
+    handoff_dir = run_dir / "handoff"
+    active: list[Path] = []
+    for request_path in sorted(handoff_dir.glob("*.request.json")):
+        payload = json.loads(request_path.read_text(encoding="utf-8"))
+        response_path = (run_dir / str(payload.get("response_path") or "")).resolve()
+        receipt_path = response_path.with_name(
+            response_path.name.replace(".response.json", ".receipt.json")
+        )
+        if not response_path.exists() and not receipt_path.exists():
+            active.append(request_path)
+    if len(active) != 1:
+        raise ValueError(f"expected one active handoff request, found {len(active)}")
+    return active[0]
+
+
+def _confirmed_form_fact_snapshot(
+    store: WorkflowStore,
+    run_id: str,
+) -> tuple[str, dict[str, Any]]:
+    """Bind form work to a monotonic extension of the reviewed run facts."""
+    return _workflow_fact_snapshot(
+        store,
+        run_id,
+        require_submission_facts=True,
+    )
+
+
+def _workflow_fact_snapshot(
+    store: WorkflowStore,
+    run_id: str,
+    *,
+    require_submission_facts: bool,
+) -> tuple[str, dict[str, Any]]:
+    """Persist the current monotonic fact view, optionally requiring form facts."""
+    from applypilot import config
+    from applypilot.autonomy.facts import (
+        REQUIRED_AUTONOMY_FACT_IDS,
+        build_monotonic_fact_snapshot,
+        fact_ledger_from_dict,
+        require_confirmed_facts,
+    )
+
+    profile = config.load_profile()
+    resume_text = config.RESUME_PATH.read_text(encoding="utf-8")
+    run_dir = store.source_run_dir(run_id)
+    base = fact_ledger_from_dict(
+        json.loads((run_dir / "fact_ledger.json").read_text(encoding="utf-8"))
+    )
+    ledger = build_monotonic_fact_snapshot(
+        base,
+        profile,
+        resume_text=resume_text,
+    )
+    blockers = (
+        require_confirmed_facts(ledger, REQUIRED_AUTONOMY_FACT_IDS)
+        if require_submission_facts
+        else []
+    )
+    if blockers:
+        raise ValueError(
+            "dry-run and approval require confirmed phone, work authorization, sponsorship, "
+            "and earliest start date: " + ",".join(blockers)
+        )
+    store.persist_fact_snapshot(run_id, ledger.to_dict())
+    return ledger.digest, profile
 
 
 @app.command()
@@ -1355,7 +1697,12 @@ def doctor(
     autonomy: bool = typer.Option(
         False,
         "--autonomy",
-        help="Check the portable ChatGPT Web autonomy path instead of legacy API-key scoring.",
+        help="Compatibility alias for the canonical ChatGPT Web workflow check.",
+    ),
+    legacy: bool = typer.Option(
+        False,
+        "--legacy",
+        help="Check the old API-key pipeline instead of the canonical workflow.",
     ),
     autonomy_corrections: Optional[Path] = typer.Option(
         None,
@@ -1383,7 +1730,7 @@ def doctor(
     warn_mark = "[yellow]WARN[/yellow]"
 
     results: list[tuple[str, str, str]] = []  # (check, status, note)
-    autonomy_runtime_ready: bool | None = None
+    canonical_workflow = autonomy or not legacy
 
     # --- Tier 1 checks ---
     # Profile
@@ -1435,11 +1782,11 @@ def doctor(
     has_openai = bool(get_secret("OPENAI_API_KEY"))
     has_local = bool(os.environ.get("LLM_URL"))
     configured_provider = os.environ.get("APPLYPILOT_LLM_PROVIDER", "").strip().lower()
-    if autonomy:
+    if canonical_workflow:
         results.append((
             "ChatGPT Web artifact transport",
             ok_mark,
-            "portable request/response queue; no model API key or CDP ownership required",
+            "portable request/response queue; no model API key, cloned profile, or CDP ownership required",
         ))
         if PROFILE_PATH.exists() and RESUME_PATH.exists():
             try:
@@ -1448,7 +1795,6 @@ def doctor(
                 from applypilot.autonomy.facts import (
                     REQUIRED_AUTONOMY_FACT_IDS,
                     build_fact_ledger,
-                    confirmed_preferred_location_fact_ids,
                     load_corrections,
                     require_confirmed_facts,
                 )
@@ -1468,7 +1814,12 @@ def doctor(
                     fact_ledger,
                     REQUIRED_AUTONOMY_FACT_IDS,
                 )
-                location_fact_ids = confirmed_preferred_location_fact_ids(fact_ledger)
+                from applypilot.autonomy.context import candidate_profile_from_data
+
+                candidate_profile = candidate_profile_from_data(
+                    profile_data,
+                    search_config=search_cfg,
+                )
             except Exception as exc:
                 results.append((
                     "Autonomy facts",
@@ -1477,65 +1828,32 @@ def doctor(
                 ))
             else:
                 results.append((
-                    "Autonomy facts",
+                    "Submission facts",
                     fail_mark if fact_blockers else ok_mark,
                     ", ".join(fact_blockers)
                     if fact_blockers
                     else "required contact, work authorization, sponsorship, and availability confirmed",
                 ))
                 results.append((
-                    "Autonomy preferred locations",
-                    ok_mark if location_fact_ids else fail_mark,
-                    f"{len(location_fact_ids)} confirmed location fact(s)"
-                    if location_fact_ids
-                    else "add at least one confirmed preferred location before live approval",
+                    "Search preferences",
+                    ok_mark if candidate_profile.preferred_locations else fail_mark,
+                    ", ".join(candidate_profile.preferred_locations)
+                    if candidate_profile.preferred_locations
+                    else "add at least one preferred location",
                 ))
-        try:
-            from applypilot.autonomy.approval import (
-                FactApprovalError,
-                require_system_approval_trust_store,
-            )
+        from applypilot import config as applypilot_config
 
-            trust_store = require_system_approval_trust_store()
-        except FactApprovalError as exc:
-            results.append(("System approval trust store", fail_mark, str(exc)))
-        else:
-            results.append(("System approval trust store", ok_mark, str(trust_store)))
-        try:
-            from applypilot.autonomy.runner import latest_autonomy_run_dir
-            from applypilot.autonomy.supervisor import runtime_observation_snapshot
-
-            latest_run_dir = latest_autonomy_run_dir()
-            runtime_status = runtime_observation_snapshot(
-                root=latest_run_dir,
-                scope_kind="run",
-                scope_id=latest_run_dir.name,
-            )
-        except Exception as exc:
-            autonomy_runtime_ready = False
-            results.append(
-                (
-                    "Autonomy runtime observation",
-                    fail_mark,
-                    f"latest-run runtime check failed: {type(exc).__name__}",
-                )
-            )
-        else:
-            autonomy_runtime_ready = bool(runtime_status["runtime_ready"])
-            results.append(
-                (
-                    "Autonomy runtime observation",
-                    ok_mark if autonomy_runtime_ready else fail_mark,
-                    "; ".join(
-                        (
-                            f"observation={runtime_status['observation_state']}",
-                            f"chronicle={runtime_status['chronicle_state']}",
-                            f"browser={runtime_status['browser_surface']}",
-                            f"readiness={runtime_status['browser_readiness']}",
-                        )
-                    ),
-                )
-            )
+        workflow_path = applypilot_config.APP_DIR / "workflow.sqlite3"
+        results.append((
+            "Canonical workflow state",
+            ok_mark,
+            str(workflow_path) if workflow_path.exists() else "created automatically by applypilot prepare",
+        ))
+        results.append((
+            "Visible Chrome boundary",
+            ok_mark,
+            "browser handoffs require the authenticated Codex Chrome connector and fail closed",
+        ))
         if chatgpt_cdp_port is not None:
             try:
                 from applypilot.autonomy.runner import probe_chatgpt_cdp
@@ -1741,13 +2059,9 @@ def doctor(
         for check, status, note in results
     ]
     missing_checks = [item["check"] for item in serialized_results if item["status"] == "missing"]
-    runtime_check_name = "Autonomy runtime observation"
-    static_missing_checks = [
-        check for check in missing_checks if check != runtime_check_name
-    ]
-    static_ready = not static_missing_checks
-    runtime_ready = autonomy_runtime_ready if autonomy else None
-    ready = static_ready and bool(runtime_ready) if autonomy else not missing_checks
+    static_ready = not missing_checks
+    runtime_ready = None
+    ready = not missing_checks
 
     if json_output:
         console.print_json(
@@ -1775,10 +2089,14 @@ def doctor(
     # Tier summary
     from applypilot.config import get_tier, TIER_LABELS
     tier = get_tier()
-    if not json_output:
+    if not json_output and legacy:
         console.print(f"[bold]Current tier: Tier {tier} — {TIER_LABELS[tier]}[/bold]")
 
-    if not json_output and tier == 1:
+    if not json_output and canonical_workflow:
+        console.print(
+            "[dim]  → Canonical path: prepare → dry-run → approve → execute (visible Chrome)[/dim]"
+        )
+    elif not json_output and tier == 1:
         console.print("[dim]  → Tier 2 unlocks: scoring, tailoring, cover letters (needs LLM API key)[/dim]")
         console.print("[dim]  → Tier 3 unlocks: auto-apply (needs agent CLI + Chrome + Node.js)[/dim]")
     elif not json_output and tier == 2:

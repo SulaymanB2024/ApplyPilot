@@ -489,6 +489,7 @@ def _value_for_intent(
     availability = profile.get("availability", {})
     eeo = profile.get("eeo_voluntary", {})
     experience = profile.get("experience", {})
+    screening = profile.get("screening", {})
     first, last = split_name(str(personal.get("full_name", "")))
 
     values: dict[str, Any] = {
@@ -509,7 +510,7 @@ def _value_for_intent(
         "website_url": personal.get("website_url", ""),
         "current_company": experience.get("current_company", ""),
         "salary_expectation": compensation.get("salary_expectation", ""),
-        "earliest_start_date": availability.get("earliest_start_date", "Immediately"),
+        "earliest_start_date": availability.get("earliest_start_date"),
         "authorized_to_work": _profile_yes_no(work_auth.get("legally_authorized_to_work")),
         "requires_sponsorship": _profile_yes_no(work_auth.get("require_sponsorship")),
         "gender": eeo.get("gender", "Decline to self-identify"),
@@ -517,7 +518,7 @@ def _value_for_intent(
         "veteran_status": eeo.get("veteran_status", "Decline to self-identify"),
         "disability_status": eeo.get("disability_status", "Decline to self-identify"),
         "job_title": job.get("title", ""),
-        "terms_consent": True,
+        "terms_consent": screening.get("accept_application_terms"),
     }
     value = values.get(intent)
     if value in ("", None):

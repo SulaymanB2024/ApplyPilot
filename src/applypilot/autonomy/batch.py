@@ -10,6 +10,8 @@ from typing import Any, Protocol
 from applypilot.autonomy.context import CompactContextPack
 from applypilot.autonomy.facts import FactLedger, validate_artifact_against_ledger
 from applypilot.autonomy.handoff import ArtifactPending
+from applypilot.autonomy.matching import FitAssessment, assess_fit, preliminary_fit_score
+from applypilot.autonomy.materials import write_evidence_bound_resume
 from applypilot.autonomy.models import (
     AuthorizationGrant,
     BatchResult,
@@ -128,12 +130,8 @@ class AutonomousBatch:
                         "evidence": list(decision.evidence),
                     }
                 )
-                if decision.decision is not Decision.REJECT:
+                if decision.decision is Decision.ACCEPT:
                     accepted.append(candidate)
-                    if decision.decision is Decision.REVIEW:
-                        review_required.setdefault(candidate.candidate_id, set()).update(
-                            decision.reason_codes
-                        )
                 if decision.decision is not Decision.ACCEPT:
                     result.blockers.append(
                         {
@@ -144,7 +142,13 @@ class AutonomousBatch:
                         }
                     )
 
-            verified: list[tuple[RoleCandidate, FreshnessEvidence, float]] = []
+            accepted.sort(
+                key=lambda candidate: (
+                    -preliminary_fit_score(candidate, self.profile),
+                    candidate.candidate_id,
+                )
+            )
+            verified: list[tuple[RoleCandidate, FreshnessEvidence, FitAssessment]] = []
             for candidate in accepted[: self.ledger.remaining("first_party_verifications")]:
                 self.ledger.reserve("first_party_verifications")
                 evidence = self.dependencies.verifier.verify(candidate)
@@ -162,33 +166,20 @@ class AutonomousBatch:
                         "open_state": evidence.open_state,
                         "status_code": evidence.status_code,
                         "provider_error": evidence.provider_error,
+                        "resolved_official_url": evidence.official_url,
+                        "official_url": evidence.official_url,
+                        "title": evidence.title,
+                        "description": evidence.description,
                     }
                 )
-                reviewable_freshness = (
-                    decision.decision is Decision.REVIEW
-                    and set(decision.reason_codes) == {"freshness_dates_missing"}
-                    and evidence.first_party
-                    and evidence.resolved
-                    and evidence.open_state is True
-                )
-                if decision.decision is Decision.ACCEPT or reviewable_freshness:
-                    if reviewable_freshness:
-                        review_required.setdefault(candidate.candidate_id, set()).update(
-                            decision.reason_codes
-                        )
+                if decision.decision is Decision.ACCEPT:
                     verified_candidate = replace(
                         candidate,
-                        official_url=evidence.official_url,
                         title=evidence.title or candidate.title,
                         description=evidence.description or candidate.description,
                         posted_date=evidence.posted_date or candidate.posted_date,
                         start_window=evidence.start_window or candidate.start_window,
                     )
-                    if verified_candidate.candidate_id != candidate.candidate_id:
-                        review_required.setdefault(
-                            verified_candidate.candidate_id,
-                            set(),
-                        ).update(review_required.get(candidate.candidate_id, set()))
                     verified_eligibility = eligibility_gate(verified_candidate, self.profile)
                     result.eligibility.append(
                         {
@@ -200,19 +191,38 @@ class AutonomousBatch:
                             "evidence": list(verified_eligibility.evidence),
                         }
                     )
-                    if verified_eligibility.decision is not Decision.REJECT:
-                        if verified_eligibility.decision is Decision.REVIEW:
-                            review_required.setdefault(
-                                verified_candidate.candidate_id,
-                                set(),
-                            ).update(verified_eligibility.reason_codes)
-                        verified.append(
-                            (
-                                verified_candidate,
-                                evidence,
-                                factual_fit_score(verified_candidate, evidence, self.context_pack),
-                            )
+                    if verified_eligibility.decision is Decision.ACCEPT:
+                        fit = assess_fit(verified_candidate, evidence, self.profile)
+                        result.rankings.append(
+                            {
+                                "candidate_id": verified_candidate.candidate_id,
+                                "company": verified_candidate.company,
+                                "title": verified_candidate.title,
+                                "official_url": verified_candidate.official_url,
+                                "location": verified_candidate.location,
+                                "description": verified_candidate.description,
+                                "source": verified_candidate.source,
+                                "fit_score": fit.score,
+                                "qualifies": fit.qualifies,
+                                "matched_families": list(fit.matched_families),
+                                "matched_skills": list(fit.matched_skills),
+                                "inclusion_reasons": list(fit.inclusion_reasons),
+                                "exclusion_reasons": list(fit.exclusion_reasons),
+                            }
                         )
+                        if fit.qualifies:
+                            verified.append((verified_candidate, evidence, fit))
+                        else:
+                            result.blockers.append(
+                                {
+                                    "candidate_id": verified_candidate.candidate_id,
+                                    "stage": "ranking",
+                                    "decision": "reject",
+                                    "reason_codes": ["fit_below_threshold"],
+                                    "fit_score": fit.score,
+                                    "exclusion_reasons": list(fit.exclusion_reasons),
+                                }
+                            )
                     else:
                         result.blockers.append(
                             {
@@ -234,7 +244,7 @@ class AutonomousBatch:
                     )
 
             self.ledger.record_cycle(material_progress=bool(verified))
-            verified.sort(key=lambda item: (-item[2], item[0].candidate_id))
+            verified.sort(key=lambda item: (-item[2].score, item[0].candidate_id))
             active_material_candidate_id = _active_candidate_id(
                 self.dependencies.materials,
                 kind="material_packet",
@@ -260,12 +270,12 @@ class AutonomousBatch:
                     verified.sort(
                         key=lambda item: (
                             item[0].candidate_id != active_material_candidate_id,
-                            -item[2],
+                            -item[2].score,
                             item[0].candidate_id,
                         )
                     )
             packets: list[tuple[RoleCandidate, MaterialPacket]] = []
-            for candidate, evidence, score in verified[: self.ledger.remaining("material_packets")]:
+            for candidate, evidence, fit in verified[: self.ledger.remaining("material_packets")]:
                 self.ledger.reserve("material_packets")
                 packet = self.dependencies.materials.draft_material(
                     pack=self.context_pack,
@@ -276,7 +286,12 @@ class AutonomousBatch:
                     blockers = validate_artifact_against_ledger(packet.cover_letter, self.fact_ledger)
                     if blockers:
                         raise RuntimeError("material_fact_validation_failed:" + ",".join(blockers))
-                artifact_paths = self._write_packet(candidate, packet, score=score)
+                artifact_paths = self._write_packet(
+                    candidate,
+                    packet,
+                    score=fit.score,
+                    verified_job_text=evidence.description or candidate.description,
+                )
                 if artifact_paths:
                     packet = MaterialPacket(
                         candidate_id=packet.candidate_id,
@@ -291,7 +306,11 @@ class AutonomousBatch:
                 result.materials.append(
                     {
                         "candidate_id": candidate.candidate_id,
-                        "fit_score": score,
+                        "fit_score": fit.score,
+                        "matched_families": list(fit.matched_families),
+                        "matched_skills": list(fit.matched_skills),
+                        "inclusion_reasons": list(fit.inclusion_reasons),
+                        "exclusion_reasons": list(fit.exclusion_reasons),
                         "verification_gaps": list(packet.verification_gaps),
                         "derived_applicant_claim_count": (
                             packet.derived_applicant_claim_count
@@ -493,6 +512,9 @@ class AutonomousBatch:
                 "company": candidate.company,
                 "title": candidate.title,
                 "official_url": candidate.official_url,
+                "location": candidate.location,
+                "description": candidate.description,
+                "posted_date": candidate.posted_date.isoformat() if candidate.posted_date else None,
                 "source": candidate.source,
             }
             for candidate in candidates
@@ -505,11 +527,13 @@ class AutonomousBatch:
         packet: MaterialPacket,
         *,
         score: float,
+        verified_job_text: str,
     ) -> dict[str, str]:
         if self.output_dir is None:
             return {}
         run_dir = self.output_dir / self.run_id / candidate.candidate_id
-        run_dir.mkdir(parents=True, exist_ok=True)
+        run_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        run_dir.chmod(0o700)
         cover_path = run_dir / "cover_letter_review_only.md"
         metadata_path = run_dir / "material_packet.json"
         self.ledger.reserve("artifacts", 2)
@@ -533,17 +557,33 @@ class AutonomousBatch:
             ),
             encoding="utf-8",
         )
-        return {"cover_letter": str(cover_path), "packet": str(metadata_path)}
+        cover_path.chmod(0o600)
+        metadata_path.chmod(0o600)
+        from applypilot import config
+
+        resume_paths = write_evidence_bound_resume(
+            base_path=config.RESUME_PATH,
+            output_dir=run_dir,
+            verified_job_text=verified_job_text,
+        )
+        return {
+            "cover_letter": str(cover_path),
+            "packet": str(metadata_path),
+            **resume_paths,
+        }
 
     def _write_result(self, result: BatchResult) -> None:
         if self.output_dir is None:
             return
         run_dir = self.output_dir / self.run_id
-        run_dir.mkdir(parents=True, exist_ok=True)
-        (run_dir / "result_ledger.json").write_text(
+        run_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        run_dir.chmod(0o700)
+        result_path = run_dir / "result_ledger.json"
+        result_path.write_text(
             json.dumps(result.to_dict(), indent=2, default=str),
             encoding="utf-8",
         )
+        result_path.chmod(0o600)
 
 
 def factual_fit_score(

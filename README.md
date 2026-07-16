@@ -4,7 +4,7 @@
 
 # ApplyPilot
 
-**Applied to 1,000 jobs in 2 days. Fully autonomous. Open source.**
+**Evidence-bound job discovery and application execution. Open source.**
 
 [![PyPI version](https://img.shields.io/pypi/v/applypilot?color=blue)](https://pypi.org/project/applypilot/)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
@@ -22,87 +22,65 @@ https://github.com/user-attachments/assets/7ee3417f-43d4-4245-9952-35df1e77f2df
 
 ## What It Does
 
-ApplyPilot is a 6-stage autonomous job application pipeline. It discovers jobs across 5+ boards plus Runway, scores them against your resume with AI, tailors your resume per job, writes cover letters, and **submits applications for you**. It navigates forms, uploads documents, answers screening questions, all hands-free.
+ApplyPilot discovers current first-party roles, rejects ineligible or irrelevant
+postings, prepares truthful materials, dry-runs visible application forms, and
+executes only an exact user-approved batch. Submission is never inferred from a
+click: confirmed outcomes require durable ATS evidence.
 
-Three commands. That's it.
+The supported workflow is:
 
 ```bash
 pip install 'applypilot[discovery]'
-applypilot init          # one-time setup: resume, profile, preferences, API keys
-applypilot doctor        # verify your setup — shows what's installed and what's missing
-applypilot run           # discover > enrich > score > tailor > cover letters
-applypilot run -w 4      # same but parallel (4 threads for discovery/enrichment)
-applypilot training-audit  # verify Workday, email draft, Runway, and board coverage
-applypilot improve plan --scope apply --out .applypilot-dev/exp-001  # bounded self-improvement packet
-applypilot autonomy plan --query "entry-level product and data roles"  # compact local run packet
-applypilot autonomy status --run-dir RUN_DIR  # redacted immutable-run-checked pre-campaign status
-applypilot autonomy heartbeat --run-dir RUN_DIR  # fixed-name five-minute pre-campaign heartbeat
-applypilot autonomy status --latest  # resolve the newest canonical app-data run without a path
-applypilot autonomy heartbeat --latest
-applypilot autonomy heartbeat --latest --compact  # bounded 5-minute decision/liveness output
-applypilot autonomy observe-runtime --latest ...  # optional coarse connector/Chronicle diagnostic
-applypilot autonomy advance --run-dir RUN_DIR --approved-fact-digest DIGEST  # emit next ChatGPT Web handoff
-applypilot autonomy import-response --request REQUEST --input RESPONSE  # bind strict JSON response
-# Repeat advance -> browser handoff -> import until review_ready (default cap: 8 model calls)
-applypilot autonomy prepare-fact-approval --run-dir RUN_DIR --approved-fact-digest DIGEST ... --out approval.json
-# Review, then sign approval.json on a user-controlled machine with OpenSSH namespace applypilot-fact-approval
-applypilot autonomy import-fact-approval --run-dir RUN_DIR --approved-fact-digest DIGEST \
-  --attestation approval.json --signature approval.json.sig
-applypilot campaign create --run-dir RUN_DIR --approved-fact-digest DIGEST \
-  --campaign-id campaign-100 --submit
-applypilot campaign heartbeat --campaign-dir CAMPAIGN_DIR  # bounded five-minute progress artifact
-applypilot campaign heartbeat --campaign-dir CAMPAIGN_DIR --compact
-applypilot campaign observe-runtime --campaign-dir CAMPAIGN_DIR ...
-applypilot doctor --autonomy --strict --json  # separate static and fresh runtime readiness
-applypilot autonomy probe-chatgpt --cdp-port 9222 --allow-legacy-cdp  # explicit legacy diagnostic only
-applypilot apply --url URL --approved-fact-digest DIGEST  # dry-run; writes one-time submit manifest
-applypilot apply --url URL --submit --approved-fact-digest DIGEST --authorization-manifest PATH
-applypilot apply --allow-account-creation  # separate per-run account-change permission
-applypilot apply -w 3    # parallel apply (3 Chrome instances)
-applypilot apply --dry-run  # explicit spelling of the safe default
+applypilot init
+applypilot doctor --strict
+applypilot prepare --query "paid Summer 2027 product and analytics internships in Austin or Remote US"
+applypilot dry-run --run-id RUN_ID --candidate CANDIDATE_ID
+applypilot approve --run-id RUN_ID --candidate CANDIDATE_ID --max-submissions 1
+applypilot execute --approval-id APPROVAL_ID
 ```
 
 > **Discovery extra:** `applypilot[discovery]` installs JobSpy and its runtime scraping dependencies. If your environment hits a JobSpy resolver conflict, `applypilot doctor` will show the fallback install command.
 
-> **Recommended autonomy path:** `applypilot autonomy` uses ChatGPT Web only for bounded
-> role discovery and evidence-cited cover-letter drafting. Eligibility, first-party freshness,
-> budgets, and action gates are deterministic. It may use broad search surfaces as discovery
-> hints but accepts only resolved official employer or ATS URLs as candidates, and
-> never fills or submits during the artifact run. A browser agent can service the portable
-> JSON handoff queue through an already-authenticated ChatGPT tab without giving ApplyPilot
-> cookies, credentials, or chat history. Model calls receive a rich, sanitized evidence pack
-> and may research and deliberate without a time limit; only call count, input/output size, and
-> the final JSON contract are bounded. Unknown live-application facts do not stop reversible
-> discovery, verification, material drafting, or read-only form inspection. A copied ledger
-> digest is enough only for that review-only work. Live campaign creation additionally requires
-> an applicant-controlled OpenSSH signature over the exact run, approved fact-value hashes, and
-> one-time challenge. See
-> [the diagnosis and operating contract](docs/tool-first-autonomy.md).
+See [the canonical workflow contract](docs/CANONICAL_WORKFLOW.md) for exact
+commands, browser handoffs, approval semantics, resumability, and evidence
+requirements. The older `run`, `apply`, `autonomy`, and `campaign` commands remain
+compatibility and diagnostic surfaces; they do not own new workflow state.
 
 ---
 
-## Two Paths
+## Canonical and legacy paths
 
-### Full Pipeline (recommended)
-**Requires:** Python 3.11+ and Chrome. The legacy scoring/tailoring stages require a configured LLM API or local endpoint. The deterministic apply controller does not require Node.js or an agent CLI while its field model-call budget remains zero.
+### Canonical workflow (recommended)
+**Requires:** Python 3.11+, the applicant's authenticated visible Chrome session,
+applicant-confirmed form facts and preferred locations before form work, and an
+explicit exact-batch approval before submission. It does not require an LLM API
+key.
 
-Runs all 6 stages, from job discovery to autonomous application submission. This is the full power of ApplyPilot.
+Runs discovery, verification, deterministic ranking, evidence-bound materials,
+visible form dry-runs, exact approval, and evidence-gated execution through one
+resumable candidate store.
 
-### Discovery + Tailoring Only
-**Requires:** Python 3.11+, Gemini API key (free)
+Search configuration never counts as applicant consent to work in a location.
+Dry-run and submission packets bind one private confirmed-fact snapshot; missing
+screening answers abstain, and fact drift after review stops execution.
 
-Runs stages 1-5: discovers jobs, scores them, tailors your resume, generates cover letters. You submit applications manually with the AI-prepared materials.
+### Legacy six-stage pipeline
+**Requires:** Python 3.11+ and a configured Gemini, OpenAI, or local endpoint for
+legacy scoring and rewriting.
+
+The older `applypilot run` stages remain for compatibility. They are not the
+supported source of truth for new application outcomes.
 
 ---
 
-## The Pipeline
+## Legacy stage reference
 
 | Stage | What Happens |
 |-------|-------------|
 | **1. Discover** | Scrapes direct employer/ATS pages (Workday, Greenhouse, Ashby, SmartRecruiters, company careers pages) plus optional JobSpy boards |
 | **2. Enrich** | Fetches full job descriptions via JSON-LD, CSS selectors, or AI-powered extraction |
 | **3. Score** | AI rates every job 1-10 based on your resume and preferences. Only high-fit jobs proceed |
-| **4. Tailor** | AI rewrites your resume per job: reorganizes, emphasizes relevant experience, adds keywords. Never fabricates |
+| **4. Tailor** | Legacy AI rewrite retained for compatibility; canonical runs use exact-claim bullet reordering with provenance |
 | **5. Cover Letter** | AI generates a targeted cover letter per job |
 | **6. Auto-Apply** | A deterministic controller navigates application forms, fills fields, uploads documents, and reviews them; final submission requires `--submit` |
 
@@ -116,8 +94,8 @@ Each stage is independent. Run them all or pick what you need.
 |---------|-----------|--------|--------|
 | Job discovery | Direct employer/ATS sources + optional boards/Runway | LinkedIn only | One board at a time |
 | AI scoring | 1-10 fit score per job | Basic filtering | Your gut feeling |
-| Resume tailoring | Per-job AI rewrite | Template-based | Hours per application |
-| Auto-apply | Full form navigation + submission | LinkedIn Easy Apply only | Click, type, repeat |
+| Resume tailoring | Evidence-bound role ordering; no invented claims | Template-based | Hours per application |
+| Auto-apply | Visible dry-run, exact batch approval, durable outcome | LinkedIn Easy Apply only | Click, type, repeat |
 | Supported sites | Workday, Greenhouse, Ashby, SmartRecruiters, company career pages, optional Indeed/LinkedIn/Glassdoor/ZipRecruiter/Google Jobs/Runway | LinkedIn | Whatever you open |
 | License | AGPL-3.0 | MIT | N/A |
 
@@ -129,7 +107,7 @@ Each stage is independent. Run them all or pick what you need.
 |-----------|-------------|---------|
 | Python 3.11+ | Everything | Core runtime |
 | Node.js 18+ | Legacy tooling only | Not required by the deterministic Python controller |
-| Gemini API key | Scoring, tailoring, cover letters | Free tier (15 RPM / 1M tokens/day) is enough |
+| Gemini API key | Legacy scoring, tailoring, cover letters | Not required by the canonical workflow |
 | Chrome/Chromium | Auto-apply | Auto-detected on most systems |
 | Codex CLI | Optional field fallback | Not required when `APPLYPILOT_FIELD_MODEL_CALL_BUDGET=0` (the default) |
 | Google Password Manager in Chrome | Codex auto-apply login flows | Uses the selected Chrome profile's browser-managed credentials/autofill |
@@ -179,15 +157,18 @@ Visits each job URL and extracts the full description. 3-tier cascade: JSON-LD s
 AI scores every job 1-10 against your profile. 9-10 = strong match, 7-8 = good, 5-6 = moderate, 1-4 = skip. Only jobs above your threshold proceed to tailoring.
 
 ### Tailor
-Generates a custom resume per job: reorders experience, emphasizes relevant skills, incorporates keywords from the job description. Your `resume_facts` (companies, projects, metrics) are preserved exactly. The AI reorganizes but never fabricates.
+The legacy pipeline asks an API model to reorganize source-supported resume
+content and now fails closed when its factuality judge rejects an output. New
+workflow runs instead use deterministic exact-line reordering with a provenance
+artifact.
 
 ### Cover Letter
 Writes a targeted cover letter per job referencing the specific company, role, and how your experience maps to their requirements.
 
-### Auto-Apply
-ApplyPilot launches Chrome, writes a deterministic per-job harness contract, navigates each application page, detects the form type, fills personal information and work history, and uploads the tailored resume and cover letter. It stops at review by default; `--submit` is required to authorize the final click. If a role only accepts email applications, the harness writes a local `email_application_draft.md` for user review instead of sending email. A live dashboard shows progress in real-time.
+### Legacy Auto-Apply compatibility
+The legacy controller launches Chrome, writes a deterministic per-job harness contract, navigates each application page, detects the form type, fills personal information and work history, and uploads the tailored resume and cover letter. It stops at review by default; `--submit` is required to authorize the final click. If a role only accepts email applications, the harness writes a local `email_application_draft.md` for user review instead of sending email. A live dashboard shows progress in real-time. New canonical runs use the visible-Chrome requests documented in `docs/CANONICAL_WORKFLOW.md` instead.
 
-The supported apply path uses a deterministic Python/Playwright controller for navigation, form detection, uploads, submit gates, screenshots, and result parsing. Its model-call budget defaults to zero. If `APPLYPILOT_FIELD_MODEL_CALL_BUDGET` is explicitly raised, Codex is used once per page as a schema-constrained batch fallback for ambiguous required fields or screening questions that the controller cannot resolve from profile facts. The legacy free-form Claude/Codex controller is disabled. CAPTCHA, MFA, SSO, payment/tax, and identity-verification surfaces fail closed instead of attempting bypass.
+The compatibility apply path uses a deterministic Python/Playwright controller for navigation, form detection, uploads, submit gates, screenshots, and result parsing. Its model-call budget defaults to zero. If `APPLYPILOT_FIELD_MODEL_CALL_BUDGET` is explicitly raised, Codex is used once per page as a schema-constrained batch fallback for ambiguous required fields or screening questions that the controller cannot resolve from profile facts. The legacy free-form Claude/Codex controller is disabled. CAPTCHA, MFA, SSO, payment/tax, and identity-verification surfaces fail closed instead of attempting bypass.
 
 By default, Codex apply runs use Google Password Manager through the selected Chrome profile. ApplyPilot never reads, exports, prints, or persists Google-stored passwords; it allows Chrome autofill to satisfy login fields and fails closed if a required password field is not already satisfied. New account creation is not treated as a credential-write API for Google Password Manager. The legacy 1Password path remains available with `APPLYPILOT_CREDENTIAL_PROVIDER=onepassword`, `op`, and the 1Password Chrome extension. API keys stay in `.env` or the OS keyring.
 
@@ -205,15 +186,26 @@ applypilot apply --reset-failed        # reset all failed jobs for retry
 
 ## CLI Reference
 
+Canonical commands are listed first. Everything below the compatibility marker
+is retained for existing users and diagnostics; it does not own new workflow
+candidate or submission state.
+
 ```
 applypilot init                         # First-time setup wizard
 applypilot doctor                       # Verify setup, diagnose missing requirements
+applypilot prepare --query QUERY        # Discover, verify, rank, and prepare
+applypilot workflow-status --run-id ID  # Inspect canonical state and shortlist
+applypilot dry-run --run-id ID           # Create/import visible form reviews
+applypilot approve --run-id ID --candidate CANDIDATE_ID
+applypilot execute --approval-id ID      # Resume one approved submission at a time
+
+# Legacy compatibility and diagnostic commands
 applypilot run [stages...]              # Run pipeline stages (or 'all')
 applypilot run --workers 4              # Parallel discovery/enrichment
 applypilot run --stream                 # Concurrent stages (streaming mode)
 applypilot run --min-score 8            # Override score threshold
 applypilot run --dry-run                # Preview without executing
-applypilot run --validation lenient     # Relax validation (recommended for Gemini free tier)
+applypilot run --validation lenient     # Legacy compatibility mode; not used by canonical workflow
 applypilot run --validation strict      # Strictest validation (retries on any banned word)
 applypilot training-audit               # Audit apply-agent training coverage
 applypilot autonomy plan --query QUERY  # Write compact facts, policy, and ChatGPT request artifacts

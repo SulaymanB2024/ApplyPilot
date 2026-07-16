@@ -354,16 +354,78 @@ def test_first_party_requires_exact_employer_or_ats_tenant_identity():
         company="M&T Bank",
         official_url="https://mtb.wd5.myworkdayjobs.com/en-US/MTB/job/Analyst-Intern_R123",
     )
+    icims_tenant = role(
+        company="Wipfli",
+        official_url="https://careers-wipfli.icims.com/jobs/7973/data-analytics/job",
+    )
+    csod_tenant = role(
+        company="Simon-Kucher",
+        official_url="https://simon-kucher.csod.com/ux/ats/careersite/6/home/requisition/4261",
+    )
+    wrong_icims_tenant = role(
+        company="Wipfli",
+        official_url="https://careers-othercompany.icims.com/jobs/7973/data-analytics/job",
+    )
 
     assert verifier.verify(matching).first_party is True
     assert verifier.verify(derived_employer).first_party is True
     assert verifier.verify(derived_country_domain).first_party is True
     assert verifier.verify(hosted_ats).first_party is True
     assert verifier.verify(configured_tenant_alias).first_party is True
+    assert verifier.verify(icims_tenant).first_party is True
+    assert verifier.verify(csod_tenant).first_party is True
     assert verifier.verify(deceptive).first_party is False
     assert verifier.verify(typosquat).first_party is False
     assert verifier.verify(wrong_greenhouse_tenant).first_party is False
     assert verifier.verify(misleading_greenhouse_tenant).first_party is False
+    assert verifier.verify(wrong_icims_tenant).first_party is False
+
+
+def test_workday_verification_uses_complete_job_payload() -> None:
+    class WorkdayTransport:
+        requested_url = ""
+
+        def get(self, url, **kwargs):
+            self.requested_url = url
+            assert kwargs.get("expect_json") is True
+            return FetchResponse(
+                200,
+                url,
+                "{}",
+                {
+                    "jobPostingInfo": {
+                        "id": "workday-id-123",
+                        "title": "Associate Product Manager Intern - Summer 2027",
+                        "jobDescription": (
+                            "<p>Pursuing a BS or MS in Computer Science or a similar "
+                            "technical field.</p>"
+                        ),
+                    }
+                },
+            )
+
+    transport = WorkdayTransport()
+    ledger = UsageLedger(run_id="workday-verify", budget=FunnelBudget())
+    verifier = FirstPartyVerifier(ledger=ledger, transport=transport)
+    candidate = role(
+        company="Salesforce",
+        title="Associate Product Manager Intern - Summer 2027",
+        official_url=(
+            "https://salesforce.wd12.myworkdayjobs.com/en-US/"
+            "External_Career_Site/job/Associate-Product-Manager-Intern_REQ-123"
+        ),
+    )
+
+    evidence = verifier.verify(candidate)
+
+    assert transport.requested_url == (
+        "https://salesforce.wd12.myworkdayjobs.com/wday/cxs/salesforce/"
+        "External_Career_Site/job/Associate-Product-Manager-Intern_REQ-123"
+    )
+    assert evidence.resolved is True
+    assert evidence.open_state is True
+    assert "Computer Science" in evidence.description
+    assert evidence.evidence == ("workday_job_id=workday-id-123",)
 
 
 def test_configured_first_party_sources_exclude_account_backed_recruiters():
@@ -520,8 +582,8 @@ def test_discovery_prompt_uses_non_navigable_matching_context_and_live_job_contr
     assert any("Greenhouse, Lever, Ashby, Workday, and Avature" in rule for rule in payload["route_order"])
     assert any("Time-box each route" in rule for rule in payload["search_strategy"])
     assert any("non-job research" in rule for rule in payload["completion_rules"])
-    assert any("not an exact-title allowlist" in rule for rule in payload["search_strategy"])
-    assert any("ranking signals" in rule for rule in payload["search_strategy"])
+    assert any("hard role-family" in rule for rule in payload["search_strategy"])
+    assert any("hard discovery boundaries" in rule for rule in payload["search_strategy"])
     assert any("discovery hints" in rule for rule in payload["source_rules"])
     assert payload["response_rule"].startswith("Return exactly one JSON object")
 
@@ -530,7 +592,7 @@ def test_default_funnel_budget_favors_recall_before_narrowing():
     budget = FunnelBudget()
 
     assert budget.discoveries == 30
-    assert budget.first_party_verifications == 15
+    assert budget.first_party_verifications == 24
     assert budget.material_packets == 5
     assert budget.form_dry_runs == 3
     assert budget.model_calls == 8
@@ -1767,7 +1829,7 @@ def test_batch_rechecks_eligibility_from_first_party_description():
     assert any(item["stage"] == "verified_eligibility" for item in result.blockers)
 
 
-def test_batch_keeps_soft_review_candidates_for_materials_but_marks_them():
+def test_batch_does_not_create_materials_for_location_review_candidates():
     candidate = role(location="London, United Kingdom")
     pack = build_context_pack(PROFILE, job_text=candidate.description)
     result = AutonomousBatch(
@@ -1781,10 +1843,12 @@ def test_batch_keeps_soft_review_candidates_for_materials_but_marks_them():
         ),
     ).run(query="product analyst internships")
 
-    assert result.status == "review_ready"
-    assert result.materials[0]["human_review_required"] == [
-        "location_outside_preferences"
-    ]
+    assert result.status == "no_eligible_verified_roles"
+    assert result.materials == []
+    assert any(
+        item.get("reason_codes") == ["location_outside_preferences"]
+        for item in result.blockers
+    )
     assert result.final_actions == []
 
 
@@ -1864,15 +1928,40 @@ def test_canonical_url_change_cannot_drop_soft_review_before_live_action():
         fact_ledger=fact_ledger,
     ).run(query="product analyst internships")
 
-    assert result.status == "failed_closed"
+    assert result.status == "no_eligible_verified_roles"
     assert FinalAction.calls == 0
-    assert result.materials[0]["human_review_required"] == [
-        "location_outside_preferences"
-    ]
-    assert any("eligibility review" in item.get("detail", "") for item in result.blockers)
+    assert result.materials == []
+    assert any(
+        item.get("reason_codes") == ["location_outside_preferences"]
+        for item in result.blockers
+    )
 
 
-def test_batch_keeps_open_first_party_role_when_only_freshness_date_is_missing():
+def test_verified_redirect_keeps_discovery_candidate_identity() -> None:
+    discovered = role(
+        official_url="https://job-boards.greenhouse.io/example/jobs/123?ref=discovery",
+    )
+    canonical = "https://job-boards.greenhouse.io/example/jobs/123-canonical"
+    pack = build_context_pack(PROFILE, job_text=discovered.description)
+    result = AutonomousBatch(
+        run_id="redirect-identity",
+        profile=CandidateProfile(),
+        context_pack=pack,
+        dependencies=BatchDependencies(
+            discovery=FakeDiscovery([discovered]),
+            verifier=FakeVerifier(
+                {discovered.candidate_id: fresh(discovered, official_url=canonical)}
+            ),
+            materials=FakeMaterials(pack),
+        ),
+    ).run(query="product analyst internships")
+
+    assert result.rankings[0]["candidate_id"] == discovered.candidate_id
+    assert result.rankings[0]["official_url"] == discovered.official_url
+    assert result.freshness[0]["resolved_official_url"] == canonical
+
+
+def test_batch_holds_missing_freshness_dates_before_materials():
     candidate = role()
     pack = build_context_pack(PROFILE, job_text=candidate.description)
     evidence = fresh(candidate, posted_date=None, updated_date=None)
@@ -1887,10 +1976,12 @@ def test_batch_keeps_open_first_party_role_when_only_freshness_date_is_missing()
         ),
     ).run(query="product analyst internships")
 
-    assert result.status == "review_ready"
-    assert result.materials[0]["human_review_required"] == [
-        "freshness_dates_missing"
-    ]
+    assert result.status == "no_eligible_verified_roles"
+    assert result.materials == []
+    assert any(
+        item.get("reason_codes") == ["freshness_dates_missing"]
+        for item in result.blockers
+    )
 
 
 def test_batch_fallback_runs_only_after_primary_failure():
@@ -2391,9 +2482,10 @@ def test_pre_campaign_status_and_heartbeat_are_fixed_name_and_redacted(
         "pending_requests": [],
         "source_attempts": [],
         "discoveries": [],
-        "eligibility": [],
-        "freshness": [],
-        "materials": [],
+            "eligibility": [],
+            "freshness": [],
+            "rankings": [],
+            "materials": [],
         "form_reviews": [],
         "final_actions": [],
         "blockers": [],
@@ -2637,7 +2729,14 @@ def test_artifact_handoff_advances_to_review_ready_without_browser(monkeypatch, 
     app_dir.mkdir()
     profile_path = app_dir / "profile.json"
     resume_path = app_dir / "resume.txt"
-    profile_path.write_text(json.dumps(PROFILE), encoding="utf-8")
+    eligible_profile = {
+        **PROFILE,
+        "availability": {
+            **PROFILE["availability"],
+            "preferred_locations": ["Remote", "Austin"],
+        },
+    }
+    profile_path.write_text(json.dumps(eligible_profile), encoding="utf-8")
     resume_path.write_text(
         "Test Candidate | candidate@example.com | 555-0100\n"
         "Built Python and SQL product analytics tools.\n",
@@ -2715,7 +2814,11 @@ def test_artifact_handoff_advances_to_review_ready_without_browser(monkeypatch, 
         approved_fact_digest=facts["digest"],
         verifier=verifier,
     )
-    assert awaiting_material["status"] == "awaiting_chatgpt_web"
+    assert awaiting_material["status"] == "awaiting_chatgpt_web", {
+        "eligibility": awaiting_material["eligibility"],
+        "freshness": awaiting_material["freshness"],
+        "blockers": awaiting_material["blockers"],
+    }
     assert awaiting_material["pending_requests"][0]["kind"] == "material_packet"
 
     material_request_path = Path(awaiting_material["pending_requests"][0]["request_path"])
