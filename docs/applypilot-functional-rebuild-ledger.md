@@ -425,6 +425,35 @@ baseline; the legacy jobs database remains 112 discovered, 112 enriched, and
 zero scored, tailored, cover-lettered, applied, or errored. All generated
 material and rendered-evidence files are mode `0600`.
 
+### Natural-language semantic discovery harness
+
+The July 30 discovery trace reproduced a prompt-shaping failure rather than a
+source or eligibility failure. Prompt schema v6 serialized a 6,633-character
+JSON request with 26 separate directive items and a full output schema. After
+generation was stopped, ChatGPT returned a contract-valid empty candidate list,
+which the importer previously accepted as useful completion.
+
+Prompt schema v7 now describes the objective and sanitized candidate snapshot in
+ordinary Markdown, asks the model to match the meaning of the work and
+transferable capabilities rather than only title keywords, and requests a
+reader-facing numbered list. On the exact July 30 candidate context, the prompt
+is 3,087 characters, a 53.5% reduction. One response-reference footer preserves
+request binding without turning the answer into a JSON protocol.
+
+The local response normalizer accepts the natural role list, recognizes common
+title/company orderings and labeled fields, prefers an explicitly labeled
+official posting over discovery citations, and writes the existing internal
+candidate schema. Legacy bound JSON remains compatible. An empty candidate list,
+missing or mismatched response reference, unparseable role list, aggregator URL,
+or later first-party/eligibility failure still fails closed. Evidence-bound
+material packets remain strict JSON because their fact IDs are a truth-safety
+boundary.
+
+Focused prompt, normalization, handoff, autonomy, and canonical-workflow
+validation passes 89 tests. Targeted Ruff checks and `git diff --check` also
+pass. The existing July 30 prompt-v6 run was not mutated; a fresh plan is
+required to exercise prompt v7.
+
 ### Fact-bound form hardening and final cached projection
 
 A final objective audit found that canonical form requests carried only a fact

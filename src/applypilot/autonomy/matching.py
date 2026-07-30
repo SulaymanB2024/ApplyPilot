@@ -44,16 +44,26 @@ ROLE_FAMILY_MARKERS: dict[str, tuple[str, ...]] = {
         "growth analyst",
         "marketing analytics",
         "marketing analyst",
+        "marketing leadership development",
         "revenue analytics",
         "lifecycle analytics",
         "go to market analytics",
     ),
     "technical_business": (
         "business analyst",
+        "business analysts",
         "technology analyst",
         "technical business",
+        "commercial strategy",
+        "commercial growth",
+        "turnaround restructuring",
+        "restructuring advisory",
+        "strategy intern",
+        "strategy internship",
         "strategy and operations",
         "strategy operations",
+        "business operations",
+        "operations finance",
         "operations analyst",
         "operations coordination",
         "program analyst",
@@ -66,6 +76,8 @@ ROLE_FAMILY_MARKERS: dict[str, tuple[str, ...]] = {
         "venture intern",
         "portfolio operations",
         "startup analyst",
+        "investor relations",
+        "investment banking analyst internship",
     ),
     "seo_analytics": (
         "seo analytics",
@@ -90,6 +102,24 @@ TARGET_FAMILY_HINTS: dict[str, tuple[str, ...]] = {
     "venture": ("venture", "startup", "portfolio"),
     "seo_analytics": ("seo", "search engine optimization", "organic search"),
 }
+
+MAJOR_US_MARKET_MARKERS = (
+    "atlanta",
+    "austin",
+    "boston",
+    "chicago",
+    "dallas",
+    "denver",
+    "houston",
+    "jersey city",
+    "los angeles",
+    "miami",
+    "new york",
+    "philadelphia",
+    "san francisco",
+    "seattle",
+    "washington dc",
+)
 
 EARLY_CAREER_MARKERS = (
     "intern",
@@ -127,7 +157,6 @@ OUT_OF_SCOPE_TITLE_MARKERS = (
     "corporate credit",
     "equity research",
     "finance",
-    "investor relations",
     "investment banking",
     "lending",
     "real estate investment trust",
@@ -245,6 +274,12 @@ def senior_title_signal(candidate: RoleCandidate) -> str:
 
 def out_of_scope_title_signal(candidate: RoleCandidate) -> str:
     title = normalize(candidate.title)
+    # The exceptions below are narrow, approved internship routes.  Generic
+    # finance and banking analyst titles remain out of scope.
+    if phrase_present(title, "operations finance") or phrase_present(
+        title, "investment banking analyst internship"
+    ):
+        return ""
     return next(
         (marker for marker in OUT_OF_SCOPE_TITLE_MARKERS if phrase_present(title, marker)),
         "",
@@ -268,6 +303,22 @@ def location_preference_match(
         return None, ""
     for normalized_preferred in normalized_preferences:
         if phrase_present(normalized_location, normalized_preferred):
+            return True, normalized_preferred
+        if (
+            phrase_present(normalized_preferred, "elsewhere in texas")
+            and phrase_present(normalized_location, "texas")
+        ):
+            return True, normalized_preferred
+        if (
+            (
+                phrase_present(normalized_preferred, "major united states markets")
+                or phrase_present(normalized_preferred, "major u s markets")
+            )
+            and any(
+                phrase_present(normalized_location, market)
+                for market in MAJOR_US_MARKET_MARKERS
+            )
+        ):
             return True, normalized_preferred
     return False, ""
 

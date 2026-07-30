@@ -54,6 +54,7 @@ TRUSTED_FORM_PROVIDER_HOSTS = {
 TRUSTED_FORM_PROVIDER_SUFFIXES = {
     "myworkday.com",
     "myworkdayjobs.com",
+    "myworkdaysite.com",
 }
 
 
@@ -256,7 +257,17 @@ def validate_form_review_response(
         raise ValueError("successful form review requires observed_url")
     if observed_url and not _url_is_structurally_public(observed_url):
         raise ValueError("form-review observed_url is not public HTTP(S)")
-    if observed_url and not _same_site_or_subdomain(official_url, observed_url):
+    observed_url_is_allowed = _same_site_or_subdomain(official_url, observed_url)
+    if observed_url and not observed_url_is_allowed:
+        # A blocked report can preserve the actual URL reached after a single
+        # visible Apply click when it is a known ATS provider.  It cannot
+        # advance any candidate toward filling or submission, so successful
+        # reviews remain bound to the employer's official site.
+        observed_url_is_allowed = (
+            payload["status"] == "blocked"
+            and _trusted_form_provider_origin(observed_url)
+        )
+    if observed_url and not observed_url_is_allowed:
         raise ValueError("form-review observed_url is unrelated to official_url")
     fields = payload.get("required_fields")
     if not isinstance(fields, list) or len(fields) > 100:

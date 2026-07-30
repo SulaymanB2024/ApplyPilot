@@ -2,8 +2,9 @@
 
 The browser agent is intentionally a tiny transport: it reads one bounded
 request, sends the embedded prompt in a fresh ChatGPT Web conversation, and
-returns one strict JSON object.  All parsing, policy, verification, scoring,
-and persistence remain in ApplyPilot.
+returns the final assistant response. Discovery may be ordinary language;
+ApplyPilot normalizes it into a bound internal artifact. All policy,
+verification, scoring, and persistence remain local.
 """
 
 from __future__ import annotations
@@ -21,7 +22,7 @@ from typing import Any, Iterator
 from applypilot.autonomy.chatgpt_web import (
     ChatGPTContractError,
     material_packet_from_payload,
-    parse_chatgpt_json,
+    parse_chatgpt_response,
     role_candidates_from_payload,
 )
 from applypilot.autonomy.context import (
@@ -35,7 +36,7 @@ from applypilot.autonomy.telemetry import BudgetExceeded, UsageLedger
 HANDOFF_SCHEMA_VERSION = "applypilot.handoff.v1"
 HANDOFF_RECONCILIATION_SCHEMA_VERSION = "applypilot.handoff-reconciliation.v1"
 RUN_SCHEMA_VERSION = "applypilot.autonomy-run.v1"
-PROMPT_SCHEMA_VERSION = "applypilot.chatgpt-prompt.v6"
+PROMPT_SCHEMA_VERSION = "applypilot.chatgpt-prompt.v7"
 HANDOFF_QUEUE_LOCK_NAME = ".queue.lock"
 
 
@@ -551,6 +552,11 @@ class ArtifactChatGPTClient:
             "response_path": str(response_path.relative_to(self.run_dir)),
             "max_response_chars": self.ledger.budget.response_chars,
             "response_extraction": "assistant_dom_text_content",
+            "response_format": (
+                "natural_language_role_list"
+                if kind == "role_candidates"
+                else "strict_json"
+            ),
             "raw_transcript_required": False,
         }
         with _handoff_queue_lock(self.run_dir):
@@ -697,7 +703,11 @@ class ArtifactChatGPTClient:
         try:
             if len(response) > self.ledger.budget.response_chars:
                 raise ChatGPTContractError("ChatGPT response exceeded character budget")
-            payload = parse_chatgpt_json(response, expected_kind=kind)
+            payload = parse_chatgpt_response(
+                response,
+                expected_kind=kind,
+                request_id=request_id,
+            )
             if payload.get("request_id") != request_id:
                 raise ChatGPTContractError("ChatGPT response request_id mismatch")
             validated = semantic_validator(payload)
@@ -765,7 +775,7 @@ class ArtifactChatGPTClient:
 
 
 def import_response_artifact(*, request_path: Path, input_path: Path) -> dict[str, str]:
-    """Validate and atomically import one browser-produced JSON response."""
+    """Normalize and atomically import one browser-produced response."""
     if request_path.is_symlink():
         raise ValueError("handoff request must not be a symbolic link")
     request_path = request_path.resolve(strict=True)
@@ -821,7 +831,11 @@ def import_response_artifact(*, request_path: Path, input_path: Path) -> dict[st
             if max_chars <= 0 or len(text) > max_chars:
                 raise ValueError("ChatGPT response exceeded the request limit")
             if expected_kind in {"role_candidates", "material_packet"}:
-                payload = parse_chatgpt_json(text, expected_kind=expected_kind)
+                payload = parse_chatgpt_response(
+                    text,
+                    expected_kind=expected_kind,
+                    request_id=request_id,
+                )
                 if payload.get("request_id") != request_id:
                     raise ChatGPTContractError("ChatGPT response request_id mismatch")
             elif expected_kind == "form_review":

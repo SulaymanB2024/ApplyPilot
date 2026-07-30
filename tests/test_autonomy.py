@@ -350,6 +350,10 @@ def test_first_party_requires_exact_employer_or_ats_tenant_identity():
         company="Example Labs",
         official_url="https://jobs.examplelabs.co.uk/openings/123",
     )
+    short_direct_employer = role(
+        company="DRW",
+        official_url="https://www.drw.com/work-at-drw/listings/strategy-intern-3467230",
+    )
     configured_tenant_alias = role(
         company="M&T Bank",
         official_url="https://mtb.wd5.myworkdayjobs.com/en-US/MTB/job/Analyst-Intern_R123",
@@ -370,6 +374,7 @@ def test_first_party_requires_exact_employer_or_ats_tenant_identity():
     assert verifier.verify(matching).first_party is True
     assert verifier.verify(derived_employer).first_party is True
     assert verifier.verify(derived_country_domain).first_party is True
+    assert verifier.verify(short_direct_employer).first_party is True
     assert verifier.verify(hosted_ats).first_party is True
     assert verifier.verify(configured_tenant_alias).first_party is True
     assert verifier.verify(icims_tenant).first_party is True
@@ -432,6 +437,44 @@ def test_configured_first_party_sources_exclude_account_backed_recruiters():
     sources = configured_trusted_sources()
 
     assert sources
+    assert any(
+        source.company == "Corient" and source.host == "ci.wd3.myworkdayjobs.com"
+        for source in sources
+    )
+    assert any(
+        source.company == "JPMorganChase" and source.host == "jpmc.fa.oraclecloud.com"
+        for source in sources
+    )
+    assert any(
+        source.company == "BNP Paribas" and source.host == "bwelcome.hr.bnpparibas"
+        for source in sources
+    )
+    assert any(
+        source.company == "Bessemer Venture Partners"
+        and source.host == "job-boards.greenhouse.io"
+        and source.path_prefix == "/bvpanalyst"
+        for source in sources
+    )
+    assert any(
+        source.company == "Walleye Capital"
+        and source.host == "job-boards.greenhouse.io"
+        and source.path_prefix == "/walleyecapital-external-students"
+        for source in sources
+    )
+    assert any(source.company == "Wells Fargo" and source.host == "wellsfargojobs.com" for source in sources)
+    assert any(source.company == "Capital One" and source.host == "capitalonecareers.com" for source in sources)
+    assert any(
+        source.company == "Simon-Kucher"
+        and source.host == "simon-kucher.csod.com"
+        and source.path_prefix == "/ux/ats/careersite/6"
+        for source in sources
+    )
+    assert any(
+        source.company == "FMI Capital Advisors"
+        and source.host == "fmicorp.bamboohr.com"
+        and source.path_prefix == "/careers"
+        for source in sources
+    )
     assert all(source.host != "app.joinrunway.io" for source in sources)
     assert all(source.source_kind != "account_backed_recruiter" for source in sources)
 
@@ -565,27 +608,19 @@ def test_discovery_prompt_uses_non_navigable_matching_context_and_live_job_contr
         serialized_chars=100,
     )
 
-    payload = json.loads(build_discovery_prompt(pack, query="early career roles", limit=5))
+    prompt = build_discovery_prompt(pack, query="early career roles", limit=5)
 
-    assert payload["candidate_context"]["profile"] == {
-        "target_role": "Product analyst",
-        "skills": {"analytics": ["SQL", "Python"]},
-    }
-    assert payload["candidate_context"]["source_context_digest"] == pack.digest
-    assert "Spotify" not in json.dumps(payload["candidate_context"])
-    assert "ConsumerBrand" not in json.dumps(payload["candidate_context"])
-    assert "intentionally omits candidate links" in payload["candidate_context_policy"]
-    assert any("live job postings" in rule for rule in payload["reasoning_guidance"])
-    assert any("do not invoke long-running deep research" in rule for rule in payload["source_rules"])
-    assert any("Do not search scholarly literature" in rule for rule in payload["source_rules"])
-    assert any("Follow route_order" in rule for rule in payload["search_strategy"])
-    assert any("Greenhouse, Lever, Ashby, Workday, and Avature" in rule for rule in payload["route_order"])
-    assert any("Time-box each route" in rule for rule in payload["search_strategy"])
-    assert any("non-job research" in rule for rule in payload["completion_rules"])
-    assert any("hard role-family" in rule for rule in payload["search_strategy"])
-    assert any("hard discovery boundaries" in rule for rule in payload["search_strategy"])
-    assert any("discovery hints" in rule for rule in payload["source_rules"])
-    assert payload["response_rule"].startswith("Return exactly one JSON object")
+    assert prompt.startswith("Find up to 5 distinct, currently open roles")
+    assert "Target direction: Product analyst." in prompt
+    assert "Analytics: SQL, Python." in prompt
+    assert "Use the meaning of the work, not only exact title keywords." in prompt
+    assert "official employer" in prompt
+    assert "ATS posting" in prompt
+    assert "Respond in ordinary language with a concise numbered list, not JSON." in prompt
+    assert "Spotify" not in prompt
+    assert "ConsumerBrand" not in prompt
+    assert pack.digest not in prompt
+    assert len(prompt) < 3_000
 
 
 def test_default_funnel_budget_favors_recall_before_narrowing():
@@ -1595,9 +1630,30 @@ def test_form_handoff_rejects_field_values_and_side_effects():
         validate_form_review_response(leaked, request=request)
     with pytest.raises(ValueError, match="cannot require a challenge"):
         validate_form_review_response({**payload, "captcha_visible": True}, request=request)
+    blocked_trusted_ats = {
+        **payload,
+        "status": "blocked",
+        "observed_url": "https://job-boards.greenhouse.io/example/jobs/123",
+        "captcha_visible": True,
+        "reason": "captcha_visible",
+    }
+    assert validate_form_review_response(blocked_trusted_ats, request=request)["status"] == "blocked"
+    blocked_workday_site = {
+        **payload,
+        "status": "blocked",
+        "observed_url": "https://wd1.myworkdaysite.com/en-US/recruiting/example/job/123/apply",
+        "account_creation_required": True,
+        "reason": "account_creation_required",
+    }
+    assert validate_form_review_response(blocked_workday_site, request=request)["status"] == "blocked"
     with pytest.raises(ValueError, match="unrelated to official_url"):
         validate_form_review_response(
             {**payload, "observed_url": "https://attacker.example/apply"},
+            request=request,
+        )
+    with pytest.raises(ValueError, match="unrelated to official_url"):
+        validate_form_review_response(
+            {**blocked_trusted_ats, "observed_url": "https://attacker.example/apply"},
             request=request,
         )
     with pytest.raises(ValueError, match="unexpected form-review fields"):

@@ -12,12 +12,29 @@ from pathlib import Path
 from typing import Any
 
 from applypilot.autonomy.facts import FactLedger
+from applypilot.profile_cache import custom_question_is_prohibited, match_custom_answer
 
 
 HIDDEN_FIELD_TYPES = {"hidden", "submit", "button", "reset", "image"}
 FALLBACK_MIN_CONFIDENCE = 0.5
 HIGH_CONFIDENCE = 0.78
 CODEX_APP_EXECUTABLE = Path("/Applications/ChatGPT.app/Contents/Resources/codex")
+CODEX_APPROVAL_POLICY = 'approval_policy="never"'
+CODEX_WEB_SEARCH_CONFIG = 'web_search="disabled"'
+MODEL_FIELD_PROFILE_SECTIONS = (
+    "availability",
+    "certifications",
+    "compensation",
+    "education",
+    "eeo_voluntary",
+    "eligibility",
+    "experience",
+    "languages",
+    "personal",
+    "screening",
+    "work_authorization",
+)
+MODEL_FIELD_SECRET_KEY_PARTS = ("api_key", "credential", "password", "secret", "token")
 
 
 def find_codex_executable() -> str | None:
@@ -264,6 +281,33 @@ def resolve_field(
             )
         return None
 
+    if custom_question_is_prohibited(spec.haystack):
+        return None
+
+    ats = spec.ats or detect_ats(str(job.get("application_url") or job.get("url") or ""))
+    custom_answer = match_custom_answer(
+        profile,
+        question_texts=(
+            spec.accessible_name,
+            spec.name,
+            spec.data_automation_id,
+            spec.title,
+        ),
+        ats=ats,
+        url=str(job.get("application_url") or job.get("url") or ""),
+    )
+    if custom_answer is not None:
+        validated = validate_resolved_value(
+            spec,
+            ResolvedField(
+                value=custom_answer.value,
+                source=f"profile_cache:{custom_answer.source_id}",
+                confidence=0.99,
+            ),
+        )
+        if validated is not None:
+            return validated
+
     for candidate in _ordered_candidates(spec, job=job):
         if candidate.confidence < min_confidence:
             continue
@@ -286,6 +330,8 @@ def needs_llm_fallback(spec: FieldSpec) -> bool:
         return False
     if any(token in parse_autocomplete_tokens(spec.autocomplete) for token in AUTOCOMPLETE_STOP_TOKENS):
         return False
+    if custom_question_is_prohibited(spec.haystack):
+        return False
     return True
 
 
@@ -294,11 +340,16 @@ def validate_resolved_value(spec: FieldSpec, resolved: ResolvedField) -> Resolve
     if resolved.value in ("", None):
         return None
     options = spec.meaningful_options
-    constrained = bool(options) or spec.type.lower() == "radio" or spec.role.lower() in {
-        "radiogroup",
-        "listbox",
-        "combobox",
-    }
+    constrained = (
+        bool(options)
+        or spec.type.lower() == "radio"
+        or spec.role.lower()
+        in {
+            "radiogroup",
+            "listbox",
+            "combobox",
+        }
+    )
     if constrained and options:
         matched = match_option(resolved.value, options)
         if matched is None:
@@ -387,6 +438,16 @@ def _candidate_from_text(
         return None
     if _is_salary_history_consent(normalized, spec):
         return None
+    if _has_any(
+        normalized,
+        (
+            "work permit type",
+            "visa status",
+            "immigration status",
+            "citizenship status",
+        ),
+    ):
+        return FieldCandidate("work_permit_type", confidence, source)
     if _has_any(normalized, ("sponsor", "sponsorship", "visa")):
         return FieldCandidate("requires_sponsorship", confidence, source)
     if "authorized" in normalized and "work" in normalized:
@@ -421,6 +482,46 @@ def _candidate_from_text(
         return FieldCandidate("website_url", confidence, source)
     if _has_any(normalized, ("salary expectation", "expected salary", "compensation expectation", "pay expectation")):
         return FieldCandidate("salary_expectation", confidence, source)
+    if _has_any(
+        normalized,
+        ("minimum hourly rate", "minimum pay rate", "lowest hourly rate"),
+    ):
+        return FieldCandidate("hourly_rate_min", confidence, source)
+    if _has_any(normalized, ("current employer", "current company", "most recent employer")):
+        return FieldCandidate("current_company", confidence, source)
+    if _has_any(normalized, ("current job title", "current title", "most recent title")):
+        return FieldCandidate("current_title", confidence, source)
+    if _has_any(normalized, ("graduation date", "expected graduation", "graduate date")):
+        return FieldCandidate("expected_graduation_date", confidence, source)
+    if _has_any(normalized, ("school name", "university name", "college name", "institution name")):
+        return FieldCandidate("school", confidence, source)
+    if _has_any(normalized, ("degree program", "degree type", "primary degree", "field of study")):
+        return FieldCandidate("primary_degree", confidence, source)
+    if _has_any(normalized, ("current student", "currently enrolled", "are you enrolled")):
+        return FieldCandidate("current_student", confidence, source)
+    if "18" in normalized and _has_any(normalized, ("age", "years old", "older")):
+        return FieldCandidate("is_at_least_18", confidence, source)
+    if _has_any(normalized, ("full summer", "entire summer", "internship period", "full internship")):
+        return FieldCandidate("available_for_full_internship_period", confidence, source)
+    if _has_any(
+        normalized,
+        ("available dates", "internship dates", "summer availability dates"),
+    ) or ("dates" in normalized and "available" in normalized):
+        return FieldCandidate("internship_period", confidence, source)
+    if _has_any(
+        normalized,
+        (
+            "preferred work location",
+            "preferred location",
+            "willing work locations",
+            "where are you willing to work",
+        ),
+    ):
+        return FieldCandidate("preferred_locations", confidence, source)
+    if _has_any(normalized, ("relocate", "relocation")):
+        return FieldCandidate("willing_to_relocate", confidence, source)
+    if _has_any(normalized, ("travel", "travel requirement")):
+        return FieldCandidate("willing_to_travel", confidence, source)
     if _has_any(normalized, ("start date", "available", "availability")):
         return FieldCandidate("earliest_start_date", confidence, source)
     if "gender" in normalized:
@@ -488,7 +589,9 @@ def _value_for_intent(
     compensation = profile.get("compensation", {})
     availability = profile.get("availability", {})
     eeo = profile.get("eeo_voluntary", {})
+    eligibility = profile.get("eligibility", {})
     experience = profile.get("experience", {})
+    education = profile.get("education", {})
     screening = profile.get("screening", {})
     first, last = split_name(str(personal.get("full_name", "")))
 
@@ -509,10 +612,25 @@ def _value_for_intent(
         "portfolio_url": personal.get("portfolio_url", ""),
         "website_url": personal.get("website_url", ""),
         "current_company": experience.get("current_company", ""),
+        "current_title": experience.get("current_title", ""),
+        "school": education.get("school", ""),
+        "primary_degree": education.get("primary_degree", ""),
+        "expected_graduation_date": education.get("expected_graduation_date", ""),
+        "current_student": _profile_yes_no(education.get("current_student")),
         "salary_expectation": compensation.get("salary_expectation", ""),
+        "hourly_rate_min": compensation.get("hourly_rate_min", ""),
         "earliest_start_date": availability.get("earliest_start_date"),
         "authorized_to_work": _profile_yes_no(work_auth.get("legally_authorized_to_work")),
         "requires_sponsorship": _profile_yes_no(work_auth.get("require_sponsorship")),
+        "work_permit_type": work_auth.get("work_permit_type", ""),
+        "is_at_least_18": _profile_yes_no(eligibility.get("is_at_least_18")),
+        "available_for_full_internship_period": _profile_yes_no(
+            availability.get("available_for_full_internship_period")
+        ),
+        "internship_period": availability.get("internship_period", ""),
+        "preferred_locations": ", ".join(availability.get("preferred_locations", [])),
+        "willing_to_relocate": _profile_yes_no(availability.get("willing_to_relocate")),
+        "willing_to_travel": _profile_yes_no(availability.get("willing_to_travel")),
         "gender": eeo.get("gender", "Decline to self-identify"),
         "race_ethnicity": eeo.get("race_ethnicity", "Decline to self-identify"),
         "veteran_status": eeo.get("veteran_status", "Decline to self-identify"),
@@ -582,7 +700,9 @@ class CodexResolver:
             "--output-last-message",
             str(output_path),
             "-c",
-            "web_search=false",
+            CODEX_APPROVAL_POLICY,
+            "-c",
+            CODEX_WEB_SEARCH_CONFIG,
             "-",
         ]
         try:
@@ -667,7 +787,9 @@ class CodexResolver:
             "--output-last-message",
             str(output_path),
             "-c",
-            "web_search=false",
+            CODEX_APPROVAL_POLICY,
+            "-c",
+            CODEX_WEB_SEARCH_CONFIG,
             "-",
         ]
         try:
@@ -705,29 +827,7 @@ class CodexResolver:
         return resolved
 
     def _build_prompt(self, *, spec: FieldSpec, profile: dict, job: dict) -> dict:
-        personal = profile.get("personal", {})
-        profile_facts = {
-            "personal": {
-                key: personal.get(key)
-                for key in (
-                    "full_name",
-                    "email",
-                    "phone",
-                    "city",
-                    "province_state",
-                    "postal_code",
-                    "country",
-                    "linkedin_url",
-                    "github_url",
-                    "portfolio_url",
-                    "website_url",
-                )
-            },
-            "work_authorization": profile.get("work_authorization", {}),
-            "compensation": profile.get("compensation", {}),
-            "availability": profile.get("availability", {}),
-            "eeo_voluntary": profile.get("eeo_voluntary", {}),
-        }
+        profile_facts = _model_field_profile(profile)
         return {
             "task": "Resolve exactly one job-application field using only supplied facts.",
             "rules": [
@@ -813,13 +913,7 @@ class CodexResolver:
                 "site": job.get("site"),
                 "url": job.get("application_url") or job.get("url"),
             },
-            "profile": {
-                "personal": profile.get("personal", {}),
-                "work_authorization": profile.get("work_authorization", {}),
-                "compensation": profile.get("compensation", {}),
-                "availability": profile.get("availability", {}),
-                "eeo_voluntary": profile.get("eeo_voluntary", {}),
-            },
+            "profile": _model_field_profile(profile),
         }
         data = json.dumps(relevant, sort_keys=True, default=str)
         return hashlib.sha256(data.encode("utf-8")).hexdigest()
@@ -879,19 +973,12 @@ def _flatten_fact_ids(value: Any, prefix: str = "") -> set[str]:
 
 def model_field_profile_from_ledger(ledger: FactLedger) -> dict[str, Any]:
     """Build the exact confirmed profile subset allowed into field-model calls."""
-    allowed_sections = {
-        "availability",
-        "compensation",
-        "eeo_voluntary",
-        "personal",
-        "work_authorization",
-    }
     result: dict[str, Any] = {}
     for record in ledger.confirmed():
         if not record.fact_id.startswith("profile."):
             continue
         path = record.fact_id.removeprefix("profile.").split(".")
-        if len(path) < 2 or path[0] not in allowed_sections:
+        if len(path) < 2 or path[0] not in MODEL_FIELD_PROFILE_SECTIONS:
             continue
         current = result
         for part in path[:-1]:
@@ -905,30 +992,28 @@ def model_field_profile_from_ledger(ledger: FactLedger) -> dict[str, Any]:
 
 
 def _support_fact_values(profile: dict[str, Any]) -> dict[str, Any]:
-    personal = profile.get("personal", {})
-    selected = {
-        "personal": {
-            key: personal.get(key)
-            for key in (
-                "full_name",
-                "email",
-                "phone",
-                "city",
-                "province_state",
-                "postal_code",
-                "country",
-                "linkedin_url",
-                "github_url",
-                "portfolio_url",
-                "website_url",
-            )
-        },
-        "work_authorization": profile.get("work_authorization", {}),
-        "compensation": profile.get("compensation", {}),
-        "availability": profile.get("availability", {}),
-        "eeo_voluntary": profile.get("eeo_voluntary", {}),
+    return _flatten_fact_values(_model_field_profile(profile))
+
+
+def _model_field_profile(profile: dict[str, Any]) -> dict[str, Any]:
+    """Return the non-secret profile sections allowed into field-model calls."""
+    return {
+        section: _without_model_secrets(profile.get(section, {}))
+        for section in MODEL_FIELD_PROFILE_SECTIONS
+        if profile.get(section) not in (None, "", [], {})
     }
-    return _flatten_fact_values(selected)
+
+
+def _without_model_secrets(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _without_model_secrets(item)
+            for key, item in value.items()
+            if not any(part in str(key).lower() for part in MODEL_FIELD_SECRET_KEY_PARTS)
+        }
+    if isinstance(value, list):
+        return [_without_model_secrets(item) for item in value]
+    return value
 
 
 def _flatten_fact_values(value: Any, prefix: str = "") -> dict[str, Any]:

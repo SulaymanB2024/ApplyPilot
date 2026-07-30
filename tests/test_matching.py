@@ -73,6 +73,22 @@ def test_location_state_names_and_postal_abbreviations_match() -> None:
         "New York, New York; Chicago, Illinois",
         ("New York, NY", "Chicago, IL"),
     )[0] is True
+    assert location_preference_match(
+        "Chicago, IL",
+        ("Major U.S. markets for strong opportunities",),
+    )[0] is True
+    assert location_preference_match(
+        "Jersey City, NJ",
+        ("Major U.S. markets for strong opportunities",),
+    )[0] is True
+    assert location_preference_match(
+        "Dallas, TX",
+        ("Elsewhere in Texas",),
+    )[0] is True
+    assert location_preference_match(
+        "Kalamazoo, MI",
+        ("Major U.S. markets for strong opportunities",),
+    )[0] is False
     assert location_preference_match("Austin, TX", ()) == (None, "")
 
 
@@ -186,6 +202,52 @@ def test_generic_finance_analyst_is_rejected_without_target_family() -> None:
     assert decision.reason_codes == ("out_of_scope_function",)
 
 
+def test_operations_finance_intern_is_supported_technical_business_role() -> None:
+    role = candidate(
+        title="Operations Finance Rotational Program Summer Internship",
+        location="Seattle, WA",
+        description=(
+            "Use data-intensive analysis, capital planning, reporting, and process "
+            "improvement to support finance and operations teams."
+        ),
+    )
+
+    decision = eligibility_gate(
+        role,
+        CandidateProfile(
+            preferred_locations=("seattle",),
+            target_families=("technical_business",),
+        ),
+    )
+
+    assert decision.decision is Decision.ACCEPT
+    assert "target_role_family" in decision.reason_codes
+
+
+def test_investment_banking_analyst_internship_is_supported_venture_role() -> None:
+    role = candidate(
+        title="Investment Banking Analyst Internship | Summer 2027",
+        location="Raleigh, NC",
+        description=(
+            "Full-time summer internship for an undergraduate pursuing a bachelor's "
+            "degree in finance, accounting, or business. Perform company research, "
+            "financial analysis, financial modeling, and transaction marketing materials."
+        ),
+    )
+
+    decision = eligibility_gate(
+        role,
+        CandidateProfile(
+            preferred_locations=("raleigh",),
+            target_families=("venture",),
+            education_evidence=("BBA candidate",),
+        ),
+    )
+
+    assert decision.decision is Decision.ACCEPT
+    assert "target_role_family" in decision.reason_codes
+
+
 def test_manager_title_is_rejected_even_when_product_matches() -> None:
     role = candidate(title="Product Analytics Manager", description="Product analytics leadership role.")
 
@@ -205,6 +267,116 @@ def test_product_manager_intern_is_not_mistaken_for_people_manager() -> None:
 
     assert decision.decision is Decision.ACCEPT
     assert "senior_title" not in decision.reason_codes
+
+
+def test_strategy_intern_is_a_supported_technical_business_role() -> None:
+    role = candidate(
+        title="Strategy Intern - Summer 2027",
+        location="Chicago, IL",
+        description="Evaluate market opportunities and build cost and scenario models.",
+    )
+
+    decision = eligibility_gate(role, CandidateProfile(preferred_locations=("chicago",)))
+
+    assert decision.decision is Decision.ACCEPT
+    assert "target_role_family" in decision.reason_codes
+
+
+def test_commercial_strategy_internship_is_a_supported_technical_business_role() -> None:
+    role = candidate(
+        title="Summer 2027 Intern - Americas Division [UG/Masters]",
+        location="Chicago, IL",
+        description=(
+            "Commercial-growth consulting internship supporting commercial strategy, "
+            "go-to-market analysis, pricing models, and customer segmentation."
+        ),
+    )
+
+    decision = eligibility_gate(role, CandidateProfile(preferred_locations=("chicago",)))
+
+    assert decision.decision is Decision.ACCEPT
+    assert "target_role_family" in decision.reason_codes
+
+
+def test_turnaround_restructuring_internship_is_a_supported_finance_strategy_role() -> None:
+    role = candidate(
+        company="AlixPartners",
+        title="Turnaround & Restructuring Summer Analyst",
+        location="New York, NY",
+        description=(
+            "Summer 2027 restructuring advisory internship supporting financial and "
+            "operational analyses."
+        ),
+    )
+
+    decision = eligibility_gate(role, CandidateProfile(preferred_locations=("new york",)))
+
+    assert decision.decision is Decision.ACCEPT
+    assert "target_role_family" in decision.reason_codes
+
+
+def test_marketing_leadership_development_is_a_supported_growth_role() -> None:
+    role = candidate(
+        title="Marketing Leadership Development Program - Summer Analyst",
+        location="New York, NY",
+        description="Analyze campaign performance, customer trends, and marketing data.",
+    )
+
+    decision = eligibility_gate(role, CandidateProfile(preferred_locations=("new york",)))
+
+    assert decision.decision is Decision.ACCEPT
+    assert "target_role_family" in decision.reason_codes
+
+
+def test_business_operations_intern_is_a_supported_technical_business_role() -> None:
+    role = candidate(
+        title="Business Operations Intern (Summer 2027)",
+        location="New York, NY",
+        description="Analyze operational processes and support cross-functional improvements.",
+    )
+
+    decision = eligibility_gate(role, CandidateProfile(preferred_locations=("new york",)))
+
+    assert decision.decision is Decision.ACCEPT
+    assert "target_role_family" in decision.reason_codes
+
+
+def test_business_analysts_internship_is_a_supported_technical_business_role() -> None:
+    role = candidate(
+        title="2027 Summer Analyst Internship - Corporate Functions, Technology",
+        location="Jersey City, NJ",
+        description=(
+            "All majors accepted. Business Analysts analyze products and workflows "
+            "and convert them into specifications for developers."
+        ),
+    )
+
+    decision = eligibility_gate(role, CandidateProfile(preferred_locations=("jersey city",)))
+
+    assert decision.decision is Decision.ACCEPT
+    assert "target_role_family" in decision.reason_codes
+
+
+def test_investor_relations_intern_is_supported_venture_family() -> None:
+    role = candidate(
+        title="Investor Relations Intern (Summer 2027)",
+        location="New York, NY",
+        description=(
+            "Support investor communications, financial-market reporting, CRM workflows, "
+            "and capital development materials."
+        ),
+    )
+
+    decision = eligibility_gate(
+        role,
+        CandidateProfile(
+            preferred_locations=("new york",),
+            target_families=("venture",),
+        ),
+    )
+
+    assert decision.decision is Decision.ACCEPT
+    assert "target_role_family" in decision.reason_codes
 
 
 def test_risk_technology_intern_is_outside_target_even_with_analyst_language() -> None:

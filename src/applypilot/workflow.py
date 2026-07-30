@@ -23,6 +23,7 @@ WORKFLOW_SCHEMA_VERSION = "applypilot-workflow-v1"
 BROWSER_ACTION_SCHEMA_VERSION = "applypilot-browser-action-v1"
 MAX_EVIDENCE_ARTIFACTS = 5
 MAX_EVIDENCE_BYTES = 25 * 1024 * 1024
+CAMPAIGN_SEASONS = frozenset({"summer_2027", "fall_2026"})
 
 TERMINAL_STATES = {
     "excluded",
@@ -138,6 +139,8 @@ class WorkflowStore:
                 max_submissions INTEGER NOT NULL,
                 consumed_count INTEGER NOT NULL DEFAULT 0,
                 status TEXT NOT NULL,
+                campaign_id TEXT NOT NULL DEFAULT '',
+                season TEXT NOT NULL DEFAULT '',
                 FOREIGN KEY (run_id) REFERENCES workflow_runs(run_id)
             );
 
@@ -148,8 +151,46 @@ class WorkflowStore:
                 outcome TEXT NOT NULL,
                 approval_id TEXT NOT NULL,
                 attempted_at TEXT NOT NULL,
-                evidence_path TEXT NOT NULL DEFAULT ''
+                evidence_path TEXT NOT NULL DEFAULT '',
+                confirmation_kind TEXT NOT NULL DEFAULT '',
+                confirmation_text TEXT NOT NULL DEFAULT ''
             );
+
+            CREATE TABLE IF NOT EXISTS workflow_campaigns (
+                campaign_id TEXT PRIMARY KEY,
+                summer_target INTEGER NOT NULL,
+                fall_target INTEGER NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS workflow_campaign_entries (
+                campaign_id TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                candidate_id TEXT NOT NULL,
+                season TEXT NOT NULL,
+                approval_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (campaign_id, run_id, candidate_id),
+                FOREIGN KEY (campaign_id) REFERENCES workflow_campaigns(campaign_id),
+                FOREIGN KEY (run_id, candidate_id) REFERENCES workflow_candidates(run_id, candidate_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_workflow_campaign_entries_campaign
+                ON workflow_campaign_entries(campaign_id, season);
+
+            CREATE TABLE IF NOT EXISTS workflow_campaign_replacements (
+                campaign_id TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                candidate_id TEXT NOT NULL,
+                season TEXT NOT NULL,
+                category TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (campaign_id, run_id, candidate_id),
+                FOREIGN KEY (campaign_id) REFERENCES workflow_campaigns(campaign_id),
+                FOREIGN KEY (run_id, candidate_id) REFERENCES workflow_candidates(run_id, candidate_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_workflow_campaign_replacements_campaign
+                ON workflow_campaign_replacements(campaign_id, season, category);
 
             CREATE TABLE IF NOT EXISTS workflow_events (
                 sequence INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -175,6 +216,24 @@ class WorkflowStore:
                 "ALTER TABLE workflow_candidates ADD COLUMN "
                 "verified_description_digest TEXT NOT NULL DEFAULT ''"
             )
+        approval_columns = {
+            str(row["name"])
+            for row in self.connection.execute("PRAGMA table_info(workflow_approvals)").fetchall()
+        }
+        for column in ("campaign_id", "season"):
+            if column not in approval_columns:
+                self.connection.execute(
+                    f"ALTER TABLE workflow_approvals ADD COLUMN {column} TEXT NOT NULL DEFAULT ''"
+                )
+        registry_columns = {
+            str(row["name"])
+            for row in self.connection.execute("PRAGMA table_info(workflow_submission_registry)").fetchall()
+        }
+        for column in ("confirmation_kind", "confirmation_text"):
+            if column not in registry_columns:
+                self.connection.execute(
+                    f"ALTER TABLE workflow_submission_registry ADD COLUMN {column} TEXT NOT NULL DEFAULT ''"
+                )
         existing = self.connection.execute(
             "SELECT value FROM workflow_meta WHERE key = 'schema_version'"
         ).fetchone()
@@ -355,7 +414,13 @@ class WorkflowStore:
                 candidate_id = str(item.get("candidate_id") or "")
                 self._ensure_candidate(run_id, candidate_id)
                 status = str(item.get("status") or "")
-                target = "dry_run_ready" if status == "dry_run_verified" else "blocked"
+                target = (
+                    "dry_run_ready"
+                    if status == "dry_run_verified"
+                    else "materials_ready"
+                    if status == "form_surface_reviewed"
+                    else "blocked"
+                )
                 self._record_form_review(run_id, candidate_id, item, target_state=target)
 
             status = str(result.get("status") or "unknown")
@@ -551,6 +616,166 @@ class WorkflowStore:
             for row in rows
         ]
 
+    def create_campaign(
+        self,
+        *,
+        campaign_id: str,
+        summer_target: int = 80,
+        fall_target: int = 20,
+    ) -> dict[str, Any]:
+        """Create the durable cross-run season ledger used by exact campaigns."""
+        _safe_file_identifier(campaign_id, "campaign id")
+        if summer_target < 0 or fall_target < 0 or summer_target + fall_target <= 0:
+            raise WorkflowError("campaign season targets must be non-negative and non-empty")
+        with self.connection:
+            self.connection.execute(
+                """
+                INSERT INTO workflow_campaigns(campaign_id, summer_target, fall_target, created_at)
+                VALUES(?, ?, ?, ?)
+                """,
+                (campaign_id, summer_target, fall_target, _now()),
+            )
+        return self.campaign_status(campaign_id)
+
+    def campaign_status(self, campaign_id: str) -> dict[str, Any]:
+        """Return durable, evidence-bound entries and exact season counters."""
+        _safe_file_identifier(campaign_id, "campaign id")
+        campaign = self.connection.execute(
+            "SELECT campaign_id, summer_target, fall_target, created_at FROM workflow_campaigns WHERE campaign_id = ?",
+            (campaign_id,),
+        ).fetchone()
+        if campaign is None:
+            raise WorkflowError("campaign does not exist")
+        rows = self.connection.execute(
+            """
+            SELECT e.campaign_id, e.run_id, e.candidate_id, e.season, e.approval_id,
+                   c.company, c.title, c.canonical_url,
+                   r.outcome, r.attempted_at, r.evidence_path,
+                   r.confirmation_kind, r.confirmation_text
+            FROM workflow_campaign_entries e
+            JOIN workflow_candidates c ON c.run_id = e.run_id AND c.candidate_id = e.candidate_id
+            LEFT JOIN workflow_submission_registry r
+              ON r.canonical_url = c.canonical_url AND r.approval_id = e.approval_id
+            WHERE e.campaign_id = ?
+            ORDER BY e.season, e.created_at, e.run_id, e.candidate_id
+            """,
+            (campaign_id,),
+        ).fetchall()
+        entries = [
+            {
+                "campaign_id": row["campaign_id"],
+                "company": row["company"],
+                "title": row["title"],
+                "season": row["season"],
+                "official_application_url": row["canonical_url"],
+                "submitted_at": row["attempted_at"] or "",
+                "confirmation_evidence_type": row["confirmation_kind"] or "",
+                "confirmation_evidence_value": row["confirmation_text"] or "",
+                "confirmation_evidence_path": row["evidence_path"] or "",
+                "workflow_run_id": row["run_id"],
+                "workflow_candidate_id": row["candidate_id"],
+                "approval_id": row["approval_id"],
+                "dedupe_key": row["canonical_url"],
+                "outcome": row["outcome"] or "not_attempted",
+            }
+            for row in rows
+        ]
+        counters = {
+            season: sum(
+                entry["outcome"] == "submitted_confirmed" and entry["season"] == season
+                for entry in entries
+            )
+            for season in CAMPAIGN_SEASONS
+        }
+        targets = {
+            "summer_2027": int(campaign["summer_target"]),
+            "fall_2026": int(campaign["fall_target"]),
+        }
+        replacement_rows = self.connection.execute(
+            """
+            SELECT r.campaign_id, r.run_id, r.candidate_id, r.season, r.category, r.reason,
+                   r.created_at, c.company, c.title, c.canonical_url
+            FROM workflow_campaign_replacements r
+            JOIN workflow_candidates c ON c.run_id = r.run_id AND c.candidate_id = r.candidate_id
+            WHERE r.campaign_id = ?
+            ORDER BY r.season, r.created_at, r.run_id, r.candidate_id
+            """,
+            (campaign_id,),
+        ).fetchall()
+        replacements = [
+            {
+                "campaign_id": row["campaign_id"],
+                "company": row["company"],
+                "title": row["title"],
+                "season": row["season"],
+                "official_application_url": row["canonical_url"],
+                "workflow_run_id": row["run_id"],
+                "workflow_candidate_id": row["candidate_id"],
+                "category": row["category"],
+                "reason": row["reason"],
+                "recorded_at": row["created_at"],
+            }
+            for row in replacement_rows
+        ]
+        return {
+            "campaign_id": campaign["campaign_id"],
+            "created_at": campaign["created_at"],
+            "targets": targets,
+            "confirmed": counters,
+            "total_confirmed": sum(counters.values()),
+            "failed_or_blocked": sum(
+                replacement["category"] in {"failed", "blocked"}
+                for replacement in replacements
+            ),
+            "duplicate": sum(replacement["category"] == "duplicate" for replacement in replacements),
+            "replacement_needed": len(replacements)
+            + sum(entry["outcome"] in {"blocked", "not_submitted", "submitted_unconfirmed"} for entry in entries),
+            "entries": entries,
+            "replacements": replacements,
+        }
+
+    def record_campaign_replacement(
+        self,
+        *,
+        campaign_id: str,
+        run_id: str,
+        candidate_id: str,
+        season: str,
+        category: str,
+        reason: str,
+    ) -> dict[str, Any]:
+        """Persist a verified non-submission so a campaign can replace it without counting it."""
+        _safe_file_identifier(campaign_id, "campaign id")
+        _safe_file_identifier(run_id, "run id")
+        _safe_file_identifier(candidate_id, "candidate id")
+        if season not in CAMPAIGN_SEASONS:
+            raise WorkflowError("campaign season is invalid")
+        if category not in {"blocked", "duplicate", "failed", "unqualified"}:
+            raise WorkflowError("campaign replacement category is invalid")
+        clean_reason = str(reason).strip()
+        if not clean_reason or len(clean_reason) > 1_000:
+            raise WorkflowError("campaign replacement reason must be 1-1000 characters")
+        if self.connection.execute(
+            "SELECT 1 FROM workflow_campaigns WHERE campaign_id = ?", (campaign_id,)
+        ).fetchone() is None:
+            raise WorkflowError("campaign does not exist")
+        if self.connection.execute(
+            "SELECT 1 FROM workflow_candidates WHERE run_id = ? AND candidate_id = ?",
+            (run_id, candidate_id),
+        ).fetchone() is None:
+            raise WorkflowError("campaign replacement candidate does not exist")
+        with self.connection:
+            self.connection.execute(
+                """
+                INSERT INTO workflow_campaign_replacements(
+                    campaign_id, run_id, candidate_id, season, category, reason, created_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(campaign_id, run_id, candidate_id) DO NOTHING
+                """,
+                (campaign_id, run_id, candidate_id, season, category, clean_reason, _now()),
+            )
+        return self.campaign_status(campaign_id)
+
     def create_dry_run_requests(
         self,
         *,
@@ -687,6 +912,8 @@ class WorkflowStore:
         form_fact_digest: str,
         max_submissions: int = 3,
         valid_hours: int = 24,
+        campaign_id: str = "",
+        season: str = "",
     ) -> dict[str, Any]:
         ids = tuple(dict.fromkeys(str(value) for value in candidate_ids if str(value)))
         if not 1 <= len(ids) <= 5:
@@ -697,6 +924,15 @@ class WorkflowStore:
             raise WorkflowError("approval validity must be between one and 72 hours")
         if len(form_fact_digest) != 64:
             raise WorkflowError("confirmed form fact digest is required")
+        if bool(campaign_id) != bool(season):
+            raise WorkflowError("campaign approval requires both campaign id and season")
+        if campaign_id:
+            _safe_file_identifier(campaign_id, "campaign id")
+            if season not in CAMPAIGN_SEASONS:
+                raise WorkflowError("campaign season is invalid")
+            campaign = self.campaign_status(campaign_id)
+            if campaign["confirmed"][season] + max_submissions > campaign["targets"][season]:
+                raise WorkflowError("approval could exceed the campaign season target")
         fact_snapshot_path = self._validated_fact_snapshot(run_id, form_fact_digest)
         bindings: dict[str, Any] = {}
         for candidate_id in ids:
@@ -745,14 +981,17 @@ class WorkflowStore:
             "max_submissions": max_submissions,
             "consumed_count": 0,
             "status": "active",
+            "campaign_id": campaign_id,
+            "season": season,
         }
         with self.connection:
             self.connection.execute(
                 """
                 INSERT INTO workflow_approvals(
                     approval_id, run_id, candidate_ids_json, bindings_json,
-                    issued_at, expires_at, max_submissions, consumed_count, status
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, 0, 'active')
+                    issued_at, expires_at, max_submissions, consumed_count, status,
+                    campaign_id, season
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, 0, 'active', ?, ?)
                 """,
                 (
                     approval_id,
@@ -762,8 +1001,20 @@ class WorkflowStore:
                     approval["issued_at"],
                     approval["expires_at"],
                     max_submissions,
+                    campaign_id,
+                    season,
                 ),
             )
+            if campaign_id:
+                for candidate_id in ids:
+                    self.connection.execute(
+                        """
+                        INSERT INTO workflow_campaign_entries(
+                            campaign_id, run_id, candidate_id, season, approval_id, created_at
+                        ) VALUES(?, ?, ?, ?, ?, ?)
+                        """,
+                        (campaign_id, run_id, candidate_id, season, approval_id, _now()),
+                    )
             self._event(run_id, "", "batch_authorized", "", "", approval)
         return approval
 
@@ -838,6 +1089,8 @@ class WorkflowStore:
                 "candidate_id": candidate_id,
                 "mode": "submit",
                 "approval_id": approval_id,
+                "campaign_id": approval["campaign_id"],
+                "season": approval["season"],
                 "official_url": row["canonical_url"],
                 "company": row["company"],
                 "title": row["title"],
@@ -898,6 +1151,8 @@ class WorkflowStore:
             "status": row["status"],
             "consumed_count": row["consumed_count"],
             "max_submissions": row["max_submissions"],
+            "campaign_id": row["campaign_id"],
+            "season": row["season"],
         }
 
     def _validate_browser_request(
@@ -956,6 +1211,8 @@ class WorkflowStore:
                 or binding.get("form_fact_digest") != request.get("form_fact_digest")
                 or binding.get("fact_snapshot_path") != request.get("fact_snapshot_path")
                 or request.get("form_review_digest") != row["form_review_digest"]
+                or request.get("campaign_id") != approval["campaign_id"]
+                or request.get("season") != approval["season"]
             ):
                 raise WorkflowError("browser request approval binding mismatch")
             expected_request = (
@@ -1074,6 +1331,11 @@ class WorkflowStore:
                 raise WorkflowError("confirmed submission lacks authoritative confirmation kind")
             if not str(response.get("confirmation_text") or "").strip():
                 raise WorkflowError("confirmed submission lacks confirmation text")
+            if approval["campaign_id"]:
+                campaign = self.campaign_status(approval["campaign_id"])
+                season = str(approval["season"])
+                if campaign["confirmed"][season] >= campaign["targets"][season]:
+                    raise WorkflowError("campaign season target already reached")
         if status == "submitted_unconfirmed" and not evidence_paths:
             raise WorkflowError("ambiguous submission requires evidence for reconciliation")
 
@@ -1095,10 +1357,18 @@ class WorkflowStore:
         self.connection.execute(
             """
             UPDATE workflow_submission_registry
-            SET outcome = ?, attempted_at = ?, evidence_path = ?
+            SET outcome = ?, attempted_at = ?, evidence_path = ?, confirmation_kind = ?, confirmation_text = ?
             WHERE canonical_url = ? AND approval_id = ?
             """,
-            (status, _now(), evidence_path, row["canonical_url"], approval_id),
+            (
+                status,
+                _now(),
+                evidence_path,
+                str(response.get("confirmation_kind") or ""),
+                str(response.get("confirmation_text") or "")[:500],
+                row["canonical_url"],
+                approval_id,
+            ),
         )
         self._update_candidate_fields(
             run_id,
@@ -1343,39 +1613,75 @@ class WorkflowStore:
         )
         cache_dir = self._run_dir(run_id) / "verification"
         cache_path = cache_dir / f"{role.candidate_id}.v3.json"
-        if not cache_path.is_file():
-            return None
+        if cache_path.is_file():
+            try:
+                evidence = CachedFirstPartyVerifier(None, cache_dir=cache_dir).verify(role)
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                return None
+            if (
+                evidence.first_party
+                and evidence.resolved
+                and evidence.open_state is True
+                and evidence.description.strip()
+                and canonicalize_url(evidence.official_url) == row["canonical_url"]
+            ):
+                self._upsert_candidate(
+                    run_id,
+                    {
+                        "candidate_id": row["candidate_id"],
+                        "official_url": evidence.official_url,
+                        "company": row["company"],
+                        "title": evidence.title or row["title"],
+                        "location": row["location"],
+                        "description": evidence.description,
+                        "source": row["source"],
+                    },
+                    state=row["state"],
+                )
+                self._update_candidate_fields(
+                    run_id,
+                    str(row["candidate_id"]),
+                    verified_description_digest=_sha256_text(evidence.description),
+                )
+                return self._candidate(run_id, str(row["candidate_id"]))
+            if (
+                not evidence.first_party
+                or not evidence.resolved
+                or evidence.open_state is not True
+                or canonicalize_url(evidence.official_url) != row["canonical_url"]
+            ):
+                return None
+
+        if self._visible_csod_form_review_matches(row):
+            self._update_candidate_fields(
+                run_id,
+                str(row["candidate_id"]),
+                verified_description_digest=_sha256_text(row["description"]),
+            )
+            return self._candidate(run_id, str(row["candidate_id"]))
+        return None
+
+    @staticmethod
+    def _visible_csod_form_review_matches(row: sqlite3.Row) -> bool:
+        """Permit browser-bound text only for the same client-rendered CSOD requisition."""
+        if not str(row["description"] or "").strip():
+            return False
         try:
-            evidence = CachedFirstPartyVerifier(None, cache_dir=cache_dir).verify(role)
-        except (OSError, ValueError, TypeError, json.JSONDecodeError):
-            return None
+            review = json.loads(str(row["form_review_json"] or "{}"))
+            official = urlsplit(str(row["canonical_url"] or ""))
+            observed = urlsplit(str(review.get("observed_url") or ""))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return False
         if (
-            not evidence.first_party
-            or not evidence.resolved
-            or evidence.open_state is not True
-            or not evidence.description.strip()
-            or canonicalize_url(evidence.official_url) != row["canonical_url"]
+            review.get("status") != "form_surface_reviewed"
+            or not official.hostname
+            or official.hostname != observed.hostname
+            or not official.hostname.endswith(".csod.com")
         ):
-            return None
-        self._upsert_candidate(
-            run_id,
-            {
-                "candidate_id": row["candidate_id"],
-                "official_url": evidence.official_url,
-                "company": row["company"],
-                "title": evidence.title or row["title"],
-                "location": row["location"],
-                "description": evidence.description,
-                "source": row["source"],
-            },
-            state=row["state"],
-        )
-        self._update_candidate_fields(
-            run_id,
-            str(row["candidate_id"]),
-            verified_description_digest=_sha256_text(evidence.description),
-        )
-        return self._candidate(run_id, str(row["candidate_id"]))
+            return False
+        official_match = re.search(r"/(?:home/)?requisition/([^/?]+)", official.path)
+        observed_match = re.search(r"/requisition/([^/?]+)(?:/|$)", observed.path)
+        return bool(official_match and observed_match and official_match.group(1) == observed_match.group(1))
 
     def _legacy_outcome_for_url(self, canonical_url: str) -> str:
         """Treat legacy applied/in-flight rows as duplicate-submission evidence."""

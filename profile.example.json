@@ -20,13 +20,22 @@
     "require_sponsorship": null,
     "work_permit_type": ""
   },
+  "eligibility": {
+    "is_at_least_18": null
+  },
   "availability": {
-    "earliest_start_date": "Immediately",
+    "earliest_start_date": "",
+    "available_for_full_internship_period": null,
+    "internship_period": "",
+    "preferred_locations": [],
+    "willing_to_relocate": null,
+    "willing_to_travel": null,
     "available_for_full_time": "Yes",
     "available_for_contract": "No"
   },
   "compensation": {
     "salary_expectation": "85000",
+    "hourly_rate_min": "30",
     "salary_currency": "USD",
     "salary_range_min": "80000",
     "salary_range_max": "100000",
@@ -38,6 +47,27 @@
     "current_title": "",
     "current_company": "",
     "target_role": "software engineer"
+  },
+  "education": {
+    "school": "",
+    "primary_degree": "",
+    "degree_programs": [],
+    "expected_graduation_date": "",
+    "current_student": null
+  },
+  "autofill": {
+    "pending_answers": [],
+    "custom_answers": [
+      {
+        "question": "How did you hear about this opportunity?",
+        "aliases": [
+          "How did you hear about us?"
+        ],
+        "value": "Company website",
+        "ats": [],
+        "domains": []
+      }
+    ]
   },
   "skills_boundary": {
     "programming_languages": ["Python", "SQL", "JavaScript"],

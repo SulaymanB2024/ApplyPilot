@@ -215,6 +215,92 @@ def test_result_sync_creates_ranked_canonical_candidate(tmp_path: Path) -> None:
         store.close()
 
 
+def test_form_surface_review_keeps_materials_ready_for_dry_run(tmp_path: Path) -> None:
+    store, run_dir = prepared_store(tmp_path)
+    try:
+        status = store.sync_batch_result(
+            run_dir=run_dir,
+            result={
+                "run_id": RUN_ID,
+                "status": "review_ready",
+                "form_reviews": [
+                    {
+                        "candidate_id": CANDIDATE_ID,
+                        "status": "form_surface_reviewed",
+                        "observed_url": URL,
+                        "required_fields": ["file:Resume"],
+                        "captcha_visible": False,
+                        "login_required": False,
+                        "account_creation_required": False,
+                        "form_filled": False,
+                        "file_uploaded": False,
+                        "submitted": False,
+                    }
+                ],
+            },
+        )
+
+        assert status["candidate_counts"] == {"materials_ready": 1}
+        assert store.create_dry_run_requests(
+            run_id=RUN_ID,
+            candidate_ids=[CANDIDATE_ID],
+            form_fact_digest=FORM_FACT_DIGEST,
+        )
+    finally:
+        store.close()
+
+
+def test_reconciliation_accepts_browser_bound_csod_requisition_text(tmp_path: Path) -> None:
+    store, run_dir = prepared_store(tmp_path)
+    csod_url = "https://example.csod.com/ux/ats/careersite/6/home/requisition/42?c=example"
+    csod_form_url = "https://example.csod.com/ux/ats/careersite/6/requisition/42/application?c=example"
+    try:
+        with store.connection:
+            store.connection.execute(
+                "UPDATE workflow_candidates SET canonical_url = ? WHERE run_id = ? AND candidate_id = ?",
+                (canonicalize_url(csod_url), RUN_ID, CANDIDATE_ID),
+            )
+        store.sync_batch_result(
+            run_dir=run_dir,
+            result={
+                "run_id": RUN_ID,
+                "status": "review_ready",
+                "form_reviews": [
+                    {
+                        "candidate_id": CANDIDATE_ID,
+                        "status": "form_surface_reviewed",
+                        "observed_url": csod_form_url,
+                    }
+                ],
+            },
+        )
+
+        profile = {
+            **FORM_PROFILE,
+            "availability": {
+                "earliest_start_date": "2027-06-01",
+                "preferred_locations": ["Austin"],
+            },
+        }
+        ledger = build_fact_ledger(profile, resume_text="Truthful resume.\n")
+        store.persist_fact_snapshot(RUN_ID, ledger.to_dict())
+        status = store.reconcile_candidate_eligibility(
+            run_id=RUN_ID,
+            profile=profile,
+            fact_digest=ledger.digest,
+        )
+
+        assert status["candidate_counts"] == {"materials_ready": 1}
+        row = store.connection.execute(
+            "SELECT verified_description_digest FROM workflow_candidates "
+            "WHERE run_id = ? AND candidate_id = ?",
+            (RUN_ID, CANDIDATE_ID),
+        ).fetchone()
+        assert row["verified_description_digest"]
+    finally:
+        store.close()
+
+
 def test_later_review_decision_removes_previously_prepared_candidate(
     tmp_path: Path,
 ) -> None:
@@ -449,11 +535,14 @@ def test_exact_approval_and_confirmation_are_durable_and_one_time(tmp_path: Path
     store, run_dir = prepared_store(tmp_path)
     try:
         dry_run_candidate(store, run_dir, tmp_path)
+        store.create_campaign(campaign_id="summer-fall-2026", summer_target=80, fall_target=20)
         approval = store.create_approval(
             run_id=RUN_ID,
             candidate_ids=[CANDIDATE_ID],
             form_fact_digest=FORM_FACT_DIGEST,
             max_submissions=1,
+            campaign_id="summer-fall-2026",
+            season="summer_2027",
         )
         request_path = store.create_submission_request(
             approval_id=approval["approval_id"],
@@ -506,6 +595,11 @@ def test_exact_approval_and_confirmation_are_durable_and_one_time(tmp_path: Path
             (approval["approval_id"],),
         ).fetchone()[0]
         assert consumed == 1
+        campaign = store.campaign_status("summer-fall-2026")
+        assert campaign["confirmed"] == {"summer_2027": 1, "fall_2026": 0}
+        assert campaign["total_confirmed"] == 1
+        assert campaign["entries"][0]["confirmation_evidence_type"] == "confirmation_page"
+        assert campaign["entries"][0]["dedupe_key"] == URL.split("?")[0]
         assert (
             store.create_submission_request(
                 approval_id=approval["approval_id"],
@@ -521,6 +615,42 @@ def test_exact_approval_and_confirmation_are_durable_and_one_time(tmp_path: Path
                 form_fact_digest=FORM_FACT_DIGEST,
                 max_submissions=1,
             )
+    finally:
+        store.close()
+
+
+def test_campaign_replacement_is_durable_and_does_not_count_as_submitted(tmp_path: Path) -> None:
+    store, _ = prepared_store(tmp_path)
+    try:
+        store.create_campaign(campaign_id="replacement-ledger", summer_target=80, fall_target=20)
+
+        campaign = store.record_campaign_replacement(
+            campaign_id="replacement-ledger",
+            run_id=RUN_ID,
+            candidate_id=CANDIDATE_ID,
+            season="summer_2027",
+            category="blocked",
+            reason="required transcript is absent from the verified profile",
+        )
+
+        assert campaign["confirmed"] == {"summer_2027": 0, "fall_2026": 0}
+        assert campaign["total_confirmed"] == 0
+        assert campaign["failed_or_blocked"] == 1
+        assert campaign["duplicate"] == 0
+        assert campaign["replacement_needed"] == 1
+        assert campaign["entries"] == []
+        assert campaign["replacements"][0]["official_application_url"] == URL.split("?")[0]
+        assert campaign["replacements"][0]["category"] == "blocked"
+
+        repeated = store.record_campaign_replacement(
+            campaign_id="replacement-ledger",
+            run_id=RUN_ID,
+            candidate_id=CANDIDATE_ID,
+            season="summer_2027",
+            category="blocked",
+            reason="required transcript is absent from the verified profile",
+        )
+        assert repeated["replacement_needed"] == 1
     finally:
         store.close()
 

@@ -33,11 +33,12 @@ applypilot prepare --query \
 ```
 
 The command creates a run and one browser handoff. Service that request in the
-applicant's authenticated Chrome session, save the one bare JSON response, then
-resume:
+applicant's authenticated Chrome session and save the final assistant response.
+Discovery replies are ordinary-language numbered lists; ApplyPilot normalizes
+them into its internal candidate schema when the run resumes:
 
 ```bash
-applypilot prepare --run-dir RUN_DIR --response BROWSER_OUTPUT.json
+applypilot prepare --run-dir RUN_DIR --response BROWSER_OUTPUT.md
 ```
 
 Repeat only while the command reports one pending request. Accepted candidates

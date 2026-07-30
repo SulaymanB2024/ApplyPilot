@@ -115,6 +115,13 @@ sites:
     source_kind: employer_careers
     direct_source: true
 
+  - name: "BNP Paribas BWelcome ATS"
+    company: "BNP Paribas"
+    url: "https://bwelcome.hr.bnpparibas"
+    type: static
+    source_kind: direct_ats
+    direct_source: true
+
   - name: "JPMorganChase Careers"
     company: "JPMorganChase"
     url: "https://careers.jpmorgan.com"
@@ -122,9 +129,65 @@ sites:
     source_kind: employer_careers
     direct_source: true
 
+  - name: "JPMorganChase Oracle Careers"
+    company: "JPMorganChase"
+    url: "https://jpmc.fa.oraclecloud.com"
+    type: static
+    source_kind: direct_ats
+    direct_source: true
+
   - name: "M&T Bank Workday"
     company: "M&T Bank"
     url: "https://mtb.wd5.myworkdayjobs.com"
+    type: static
+    source_kind: direct_ats
+    direct_source: true
+
+  - name: "Corient Workday"
+    company: "Corient"
+    url: "https://ci.wd3.myworkdayjobs.com"
+    type: static
+    source_kind: direct_ats
+    direct_source: true
+
+  - name: "Bessemer Venture Partners Greenhouse"
+    company: "Bessemer Venture Partners"
+    url: "https://job-boards.greenhouse.io/bvpanalyst"
+    type: static
+    source_kind: direct_ats
+    direct_source: true
+
+  - name: "Walleye Capital Greenhouse"
+    company: "Walleye Capital"
+    url: "https://job-boards.greenhouse.io/walleyecapital-external-students"
+    type: static
+    source_kind: direct_ats
+    direct_source: true
+
+  - name: "Wells Fargo Careers"
+    company: "Wells Fargo"
+    url: "https://www.wellsfargojobs.com"
+    type: static
+    source_kind: employer_careers
+    direct_source: true
+
+  - name: "Capital One Careers"
+    company: "Capital One"
+    url: "https://www.capitalonecareers.com"
+    type: static
+    source_kind: employer_careers
+    direct_source: true
+
+  - name: "Simon-Kucher Cornerstone ATS"
+    company: "Simon-Kucher"
+    url: "https://simon-kucher.csod.com/ux/ats/careersite/6"
+    type: static
+    source_kind: direct_ats
+    direct_source: true
+
+  - name: "FMI Capital Advisors BambooHR"
+    company: "FMI Capital Advisors"
+    url: "https://fmicorp.bamboohr.com/careers"
     type: static
     source_kind: direct_ats
     direct_source: true

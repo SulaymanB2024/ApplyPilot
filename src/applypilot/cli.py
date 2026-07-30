@@ -166,6 +166,105 @@ def init() -> None:
     run_wizard()
 
 
+@app.command("profile-cache")
+def profile_cache_status(
+    as_json: bool = typer.Option(
+        False,
+        "--json",
+        help="Print the value-free cache report as JSON.",
+    ),
+    collect: bool = typer.Option(
+        False,
+        "--collect",
+        help="Ask for missing applicant-owned facts and store them privately.",
+    ),
+    required_only: bool = typer.Option(
+        False,
+        "--required-only",
+        help="With --collect, ask only for facts required before form work.",
+    ),
+) -> None:
+    """Show which resume-backed and applicant-owned facts are ready for autofill."""
+    _bootstrap_config_only()
+    from applypilot import config
+    from applypilot.profile_cache import (
+        build_profile_cache_report,
+        missing_profile_cache_questions,
+        update_profile_cache,
+        write_private_profile,
+    )
+    from rich.prompt import Prompt
+
+    if not config.PROFILE_PATH.exists() or not config.RESUME_PATH.exists():
+        console.print("[red]Profile cache is incomplete. Run applypilot init first.[/red]")
+        raise typer.Exit(code=1)
+    if required_only and not collect:
+        console.print("[red]--required-only can only be used with --collect.[/red]")
+        raise typer.Exit(code=2)
+
+    profile = config.load_profile()
+    if collect:
+        answers: dict[str, Any] = {}
+        questions = missing_profile_cache_questions(profile, required_only=required_only)
+        for question in questions:
+            if question.value_kind == "boolean":
+                answer = Prompt.ask(
+                    question.prompt,
+                    choices=["yes", "no", "skip"],
+                    default="skip",
+                )
+                if answer != "skip":
+                    answers[question.path] = answer == "yes"
+                continue
+            answer = Prompt.ask(f"{question.prompt} (leave blank to skip)", default="")
+            if not answer.strip():
+                continue
+            answers[question.path] = (
+                [item.strip() for item in answer.split(",") if item.strip()]
+                if question.value_kind == "list"
+                else answer
+            )
+        if answers:
+            profile = update_profile_cache(profile, answers)
+            backup_path = write_private_profile(config.PROFILE_PATH, profile)
+            console.print(f"Updated [bold]{len(answers)}[/bold] private profile-cache fields.")
+            if backup_path is not None:
+                console.print(f"Previous profile backed up to {backup_path}.")
+        else:
+            console.print("No profile-cache values changed.")
+
+    report = build_profile_cache_report(
+        profile,
+        resume_text=config.RESUME_PATH.read_text(encoding="utf-8"),
+        resume_pdf_path=config.RESUME_PDF_PATH,
+    )
+    if as_json:
+        console.print_json(data=report)
+        return
+
+    table = Table(title="ApplyPilot profile cache")
+    table.add_column("Field")
+    table.add_column("Form work")
+    table.add_column("Source")
+    table.add_column("Status")
+    for field in report["fields"]:
+        table.add_row(
+            field["label"],
+            "required" if field["required_for_form_work"] else "recommended",
+            field["source"],
+            "ready" if field["present"] else "missing",
+        )
+    console.print(table)
+    state = "ready" if report["ready_for_form_work"] else "missing required facts"
+    console.print(f"Profile cache: [bold]{state}[/bold]")
+    if report["pending_verification"]:
+        console.print(
+            "Pending verification: "
+            + ", ".join(report["pending_verification"])
+            + " (not used for autofill)"
+        )
+
+
 @app.command("prepare")
 def prepare_workflow(
     query: Optional[str] = typer.Option(
@@ -274,6 +373,79 @@ def workflow_status(
         raise typer.Exit(code=1) from exc
 
 
+@app.command("campaign-ledger-create")
+def campaign_ledger_create(
+    campaign_id: str = typer.Option(..., "--campaign-id", help="Durable canonical campaign identifier."),
+    summer_target: int = typer.Option(80, "--summer-target", min=0),
+    fall_target: int = typer.Option(20, "--fall-target", min=0),
+) -> None:
+    """Create one canonical season-bound campaign ledger."""
+    _bootstrap_config_only()
+    from applypilot import config
+    from applypilot.workflow import WorkflowStore
+
+    try:
+        with WorkflowStore(config.APP_DIR / "workflow.sqlite3") as store:
+            console.print_json(
+                data=store.create_campaign(
+                    campaign_id=campaign_id,
+                    summer_target=summer_target,
+                    fall_target=fall_target,
+                )
+            )
+    except Exception as exc:
+        console.print(f"[red]Campaign ledger creation failed:[/red] {type(exc).__name__}: {str(exc)[:240]}")
+        raise typer.Exit(code=1) from exc
+
+
+@app.command("campaign-ledger-status")
+def campaign_ledger_status(
+    campaign_id: str = typer.Option(..., "--campaign-id", help="Canonical campaign identifier."),
+) -> None:
+    """Print durable candidate, confirmation, and season-count evidence."""
+    _bootstrap_config_only()
+    from applypilot import config
+    from applypilot.workflow import WorkflowStore
+
+    try:
+        with WorkflowStore(config.APP_DIR / "workflow.sqlite3") as store:
+            console.print_json(data=store.campaign_status(campaign_id))
+    except Exception as exc:
+        console.print(f"[red]Campaign ledger status failed:[/red] {type(exc).__name__}: {str(exc)[:240]}")
+        raise typer.Exit(code=1) from exc
+
+
+@app.command("campaign-ledger-replacement")
+def campaign_ledger_replacement(
+    campaign_id: str = typer.Option(..., "--campaign-id", help="Canonical campaign identifier."),
+    run_id: str = typer.Option(..., "--run-id", help="Workflow run id for the replacement."),
+    candidate: str = typer.Option(..., "--candidate", help="Workflow candidate id for the replacement."),
+    season: str = typer.Option(..., "--season", help="Campaign season: summer_2027 or fall_2026."),
+    category: str = typer.Option(..., "--category", help="blocked, duplicate, failed, or unqualified."),
+    reason: str = typer.Option(..., "--reason", help="Verified non-submission reason."),
+) -> None:
+    """Record a non-submission that must be replaced without counting it as applied."""
+    _bootstrap_config_only()
+    from applypilot import config
+    from applypilot.workflow import WorkflowStore
+
+    try:
+        with WorkflowStore(config.APP_DIR / "workflow.sqlite3") as store:
+            console.print_json(
+                data=store.record_campaign_replacement(
+                    campaign_id=campaign_id,
+                    run_id=run_id,
+                    candidate_id=candidate,
+                    season=season,
+                    category=category,
+                    reason=reason,
+                )
+            )
+    except Exception as exc:
+        console.print(f"[red]Campaign replacement recording failed:[/red] {type(exc).__name__}: {str(exc)[:240]}")
+        raise typer.Exit(code=1) from exc
+
+
 @app.command("dry-run")
 def dry_run_workflow(
     run_id: str = typer.Option(..., "--run-id", help="Canonical workflow run id."),
@@ -357,6 +529,8 @@ def approve_workflow_batch(
         help="Maximum final submissions permitted by this one approval.",
     ),
     valid_hours: int = typer.Option(24, "--valid-hours", min=1, max=72),
+    campaign_id: str = typer.Option("", "--campaign-id", help="Optional canonical campaign ledger."),
+    season: str = typer.Option("", "--season", help="Campaign season: summer_2027 or fall_2026."),
 ) -> None:
     """Authorize one exact, evidence-bound batch after candidate review."""
     _bootstrap_config_only()
@@ -372,6 +546,8 @@ def approve_workflow_batch(
                 form_fact_digest=form_fact_digest,
                 max_submissions=max_submissions,
                 valid_hours=valid_hours,
+                campaign_id=campaign_id,
+                season=season,
             )
             approval["candidates"] = [
                 item
@@ -928,10 +1104,10 @@ def autonomy_import_response(
     input_path: Path = typer.Option(
         ...,
         "--input",
-        help="File containing the one bare JSON object returned by ChatGPT Web.",
+        help="File containing ChatGPT's natural-language discovery reply or strict material JSON.",
     ),
 ) -> None:
-    """Validate and atomically import one ChatGPT Web response artifact."""
+    """Normalize, validate, and atomically import one ChatGPT Web response."""
     _bootstrap_config_only()
     from applypilot.autonomy.handoff import import_response_artifact
 

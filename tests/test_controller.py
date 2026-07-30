@@ -164,7 +164,7 @@ def test_field_value_for_password_uses_1password_credential():
     assert resolved.source == "1password"
 
 
-def test_required_terms_checkbox_can_be_checked_deterministically():
+def test_required_terms_checkbox_requires_explicit_user_action():
     resolved = field_value_for(
         FieldSpec(
             selector="#terms",
@@ -177,4 +177,4 @@ def test_required_terms_checkbox_can_be_checked_deterministically():
         job={"title": "Software Engineer"},
     )
 
-    assert resolved.value is True
+    assert resolved is None

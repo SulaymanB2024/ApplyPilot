@@ -8,9 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- **Tool-first ChatGPT Web autonomy** - Added a strict JSON-in/JSON-out adapter,
-  first-party role verification, compact fact packs, review-only form inspection, and
-  `applypilot autonomy plan|advance|import-response|probe-chatgpt|run` commands.
+- **Tool-first ChatGPT Web autonomy** - Added a natural-language discovery adapter with
+  strict evidence-bound material artifacts, first-party role verification, compact fact packs,
+  review-only form inspection, and the `applypilot autonomy` plan, advance,
+  import-response, probe-chatgpt, and run commands.
 - **Portable browser handoff queue** - Added manifest-bound, request-ID-bound ChatGPT Web
   artifacts so an authenticated browser tool can service up to eight bounded model calls
   without exposing browser credentials or spawning a nested model process.
@@ -63,11 +64,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   requires the per-run `--allow-account-creation` flag.
 - **Discovery source policy** - The autonomy funnel uses ChatGPT Web first, treats the campaign
   query as an objective rather than an exact-title allowlist, searches adjacent early-career role
-  families, and accepts only resolved official employer or ATS URLs. Prompt schema v6 confines
-  research to bounded live-job routes, excludes scholarly and generic background research, and
-  removes candidate links, named work samples, current-employer identity, and raw evidence from discovery
-  while preserving the rich pack for later material calls. It also requires route switching after
-  blocked or irrelevant sources. Direct ATS fallback still requires a recorded primary failure.
+  families, and accepts only resolved official employer or ATS URLs. Prompt schema v7 describes
+  the work in concise ordinary language, asks for semantic rather than title-only fit, and
+  normalizes a readable numbered-list reply into the internal candidate schema. It excludes
+  scholarly and generic background research and removes candidate links, named work samples,
+  current-employer identity, raw evidence, and internal digests from discovery while preserving
+  the rich pack for later material calls. Empty placeholder results fail closed. Direct ATS
+  fallback still requires a recorded primary failure.
 - **Action-proportional gates** - Unknown application facts, unsigned live approval, and stale
   Chronicle telemetry no longer suppress discovery, first-party verification, local material
   drafting, response import, or read-only form inspection. The same facts, signatures, and

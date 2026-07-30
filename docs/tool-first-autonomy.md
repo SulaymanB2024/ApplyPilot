@@ -27,8 +27,9 @@ The `applypilot autonomy` path is a finite, artifact-first coordinator:
 
 1. Build a source-bound fact ledger and a compact context pack from an explicit allowlist of
    confirmed facts.
-2. Ask ChatGPT Web for a high-recall, bounded list of official employer or ATS URLs using
-   broad search routes, adjacent early-career role families, and strict JSON.
+2. Describe the search to ChatGPT Web in ordinary language and ask for a high-recall,
+   readable list of official employer or ATS URLs using semantic fit and adjacent
+   early-career role families.
 3. Reject only clear senior, experience-ineligible, and known availability-conflicting roles
    locally; preserve ambiguous level, date, and location cases for review.
 4. Verify each remaining role against a first-party ATS or employer surface without a model.
@@ -101,11 +102,12 @@ approved live use. Live campaign state requires the separately signed approval d
 The recommended path is a portable request/response queue. `plan` binds the reviewed fact,
 context, policy, query, and run digests, then writes one compact discovery request. `advance`
 either performs deterministic local work or returns one pending request for the browser agent.
-The browser agent sends only that prompt in ChatGPT Web and returns one strict JSON object.
-ChatGPT is explicitly encouraged to research deeply, consider the candidate's broader
-trajectory and adjacent strengths, and compare multiple approaches internally before emitting
-the final object. The strict schema governs the returned artifact, not the depth of reasoning.
-ApplyPilot never receives cookies, local storage, passwords, sidebar history, or whole-page text.
+The browser agent sends only that prompt in ChatGPT Web and returns the final assistant
+response. Discovery uses a concise natural-language brief and a readable numbered-list reply.
+ApplyPilot then normalizes the reply into its internal schema before deterministic first-party,
+eligibility, and ranking gates run. Evidence-bound material packets remain strict JSON because
+their fact IDs are a truth-safety boundary. ApplyPilot never receives cookies, local storage,
+passwords, sidebar history, or whole-page text.
 
 ```bash
 applypilot autonomy advance \
@@ -113,7 +115,7 @@ applypilot autonomy advance \
   --approved-fact-digest COPY_THE_REVIEWED_PLAN_DIGEST_HERE
 
 # The result names one pending request and its expected response path.
-# After the authenticated browser tool returns a bare JSON object:
+# After the authenticated browser tool saves the final assistant response:
 applypilot autonomy import-response \
   --request COPY_THE_PENDING_REQUEST_PATH_HERE \
   --input COPY_THE_BROWSER_RESPONSE_FILE_HERE
@@ -124,13 +126,16 @@ applypilot autonomy advance \
   --approved-fact-digest COPY_THE_REVIEWED_PLAN_DIGEST_HERE
 ```
 
-Each response must echo a request ID that binds the run, stage, query or verified-job input,
-candidate, facts, context, policy, and prompt-schema version. Each semantically accepted
-response gets a coordinator-enforced hash receipt. Missing response files mean "pending," not
-"provider failed," so they cannot silently authorize fallback discovery. A stale, swapped,
-one-sided edited, or oversized response fails closed. Semantically rejected material is moved
-to a hash-named quarantine so a corrected bounded response can be imported without accepting
-the rejected output.
+The natural-language discovery brief ends with one lightweight response reference. The
+importer verifies that footer against the one active request path, then copies the full request
+ID into the normalized internal artifact; legacy JSON replies that carry a conflicting ID are
+also rejected. The ID binds the run, stage, query or verified-job input, candidate, facts,
+context, policy, and prompt-schema version. Each semantically accepted response gets a
+coordinator-enforced hash receipt. Missing response files mean "pending," not "provider failed,"
+so they cannot silently authorize fallback discovery. A stale, swapped, one-sided edited, or
+oversized response fails closed. Semantically rejected material is moved to a hash-named
+quarantine so a corrected bounded response can be imported without accepting the rejected
+output.
 Accepted receipts and hash-named rejection records are restored into the usage ledger on every
 `advance`, so resuming the CLI cannot reset the run's model-call budget or make a failed tool
 attempt disappear.
@@ -280,12 +285,15 @@ The browser form artifact is also bound to the verified role site and cannot rep
 when CAPTCHA, login, or account creation is required. Unknown JSON fields and all field-value
 aliases are rejected.
 
-Prompt schema v6 keeps the material-claim protections introduced in v4 and binds discovery to
-bounded live-job search. Discovery must use employer career pages, ATS postings, university
-recruiting pages, or job indexes as hints; it must not drift into scholarly literature, news,
-candidate-background research, or an indefinite search on one domain. The discovery packet carries
-role-matching facts but omits candidate links, named work samples, current-employer identity, and raw
-evidence; the complete evidence pack remains available only to later role-specific material calls.
+Prompt schema v7 keeps the material-claim protections introduced in v4 while replacing the
+discovery JSON protocol with a concise semantic brief and natural-language response. Discovery
+must use employer career pages, ATS postings, university recruiting pages, or job indexes as
+hints; it must not drift into scholarly literature, news, candidate-background research, or an
+indefinite search on one domain. The discovery brief carries role-matching facts but omits
+candidate links, named work samples, current-employer identity, raw evidence, and internal
+digests; the complete evidence pack remains available only to later role-specific material
+calls. The local normalizer requires at least one understandable role and rejects empty
+placeholder output before deterministic source and fit gates run.
 Every prose
 sentence that asserts something about the applicant through `I`, `me`, or `my` must be copied
 verbatim into a structured `applicant_claims` entry. Those entries may cite confirmed `F` facts
@@ -314,7 +322,7 @@ needed. The fallback has no default model-process deadline, receives only confir
 and requires an approved fact ledger even during a dry-run. All unresolved required fields still
 fail closed.
 
-Context pack v2 and prompt schema v6 intentionally require a fresh `autonomy plan`. Do not try to
+Context pack v2 and prompt schema v7 intentionally require a fresh `autonomy plan`. Do not try to
 advance a run packet created with context v1 or an older prompt schema after upgrading.
 
 ## Remaining live gate

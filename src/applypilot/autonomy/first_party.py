@@ -599,7 +599,10 @@ def _company_domain_labels(company: str) -> set[str]:
         "".join(_company_tokens(company)),
         "".join(token for token in normalized_tokens if token not in {"and", "the"}),
     }
-    return {variant for variant in variants if len(variant) >= 4}
+    # Exact direct domains such as drw.com and ibm.com are valid employer
+    # bindings even though their normalized company labels are three letters.
+    # Shared ATS tenant matching keeps its stricter four-character threshold.
+    return {variant for variant in variants if len(variant) >= 3}
 
 
 def _registrable_host_label(host: str) -> str:

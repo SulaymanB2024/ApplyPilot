@@ -245,147 +245,154 @@ def build_discovery_prompt(
     limit: int,
     request_id: str = "",
 ) -> str:
-    """Build one strict-JSON ChatGPT Web role-discovery request."""
-    payload = {
-        "task": (
-            "Build a high-recall, high-quality candidate set of currently open roles "
-            "matching this sanitized candidate profile."
-        ),
-        "query": query,
-        "limit": limit,
-        "source_rules": [
-            "Use ChatGPT Web research as the discovery surface.",
-            (
-                "This is live job-posting discovery, not topical or academic research. Use "
-                "ordinary web search for employer career pages, ATS postings, and university "
-                "recruiting pages; do not invoke long-running deep research."
-            ),
-            (
-                "Use general web search, employer career indexes, university recruiting pages, "
-                "and job boards as discovery hints when useful, but return only the resolved "
-                "official employer or ATS posting URL."
-            ),
-            (
-                "Do not search scholarly literature, arXiv, papers, publications, news, market "
-                "research, or generic company background. The supplied candidate context is "
-                "authoritative; search only for currently open roles."
-            ),
-            "Return official employer or ATS URLs only.",
-            "Do not return LinkedIn, Indeed, JobSpy, Glassdoor, ZipRecruiter, or Google Jobs URLs.",
-            "Treat every role as an unverified candidate; ApplyPilot will verify first-party status.",
-        ],
-        "route_order": [
-            "Employer jobs, careers, students, internships, and early-career indexes.",
-            (
-                "Public Greenhouse, Lever, Ashby, Workday, and Avature posting indexes, using "
-                "supported role-family and location terms."
-            ),
-            "Official university-recruiting and employer program pages with live role links.",
-            (
-                "General search or job-board snippets only as discovery hints; resolve every "
-                "candidate to its official employer or ATS posting before returning it."
-            ),
-        ],
-        "search_strategy": [
-            (
-                "Treat the query as a campaign objective with hard role-family, early-career, and "
-                "location boundaries. Expand title variants only within families supported by the "
-                "candidate's experience, projects, skills, education, and stated objective."
-            ),
-            (
-                "Search across internships, co-ops, apprenticeships, fellowships, new-grad, and "
-                "explicit early-career variants in the supported product, data/analytics, growth, "
-                "technical-business, venture, and SEO families. Generic analyst or associate "
-                "titles do not qualify without a supported family phrase."
-            ),
-            (
-                "Start with concrete hiring queries that combine a supported role family, an "
-                "early-career level, a location or recruiting cycle when useful, and terms such "
-                "as jobs, careers, openings, or apply. Follow route_order instead of exploring "
-                "general background pages."
-            ),
-            (
-                "Use graduation timing and availability to identify the appropriate recruiting "
-                "cycle. Do not discard an otherwise plausible role merely because compensation, "
-                "posting date, deadline, or start date is absent; return the field as null for "
-                "first-party verification."
-            ),
-            (
-                "Treat the locations named in the query as hard discovery boundaries. Return a "
-                "multi-location role only when at least one listed location matches. Do not spend "
-                "the result quota on clearly out-of-preference locations."
-            ),
-            (
-                "Favor credible paid roles and a diverse result set: multiple role families and "
-                "employers, no more than two roles per employer unless the evidence strongly "
-                "justifies it."
-            ),
-            (
-                "Reject senior or manager roles, generic finance/banking/credit/sales/audit roles, "
-                "roles outside the supported families, hard graduation or work-authorization "
-                "conflicts, unpaid work when paid work is required, and explicitly closed postings."
-            ),
-            (
-                "Time-box each route. After a blocked page or two irrelevant results, switch to "
-                "another employer, ATS, career index, or search query instead of waiting on one "
-                "domain."
-            ),
-        ],
-        "reasoning_guidance": [
-            (
-                "Reason privately only as much as needed to locate and compare live job postings; "
-                "do not research the candidate, their projects, academic literature, or industry "
-                "background."
-            ),
-            "Consider the candidate's full supplied background, adjacent strengths, trajectory, and preferences rather than matching only title keywords.",
-            "Cross-check promising roles against official employer or ATS pages.",
-            (
-                "If one site blocks content extraction, continue through other search routes and "
-                "official indexes instead of returning an empty list."
-            ),
-            "Do not expose chain-of-thought or research notes; return only the final contract object.",
-        ],
-        "completion_rules": [
-            "Stop when the requested limit of distinct plausible live roles is reached.",
-            (
-                "If fewer roles are found after bounded live-job routes are exhausted, return the "
-                "valid candidates found; do not expand into non-job research to fill the quota."
-            ),
-        ],
-        "candidate_context": _discovery_candidate_context(pack),
-        "candidate_context_policy": (
-            "Use this bounded matching context as supplied facts only. It intentionally omits "
-            "candidate links, named work samples, current-employer identity, and raw evidence "
-            "so they cannot become web-research targets."
-        ),
-        "output_contract": {
-            "schema_version": "applypilot.chatgpt_web.v1",
-            "kind": "role_candidates",
-            "request_id": request_id or "omit",
-            "items": [
-                {
-                    "company": "string",
-                    "title": "string",
-                    "official_url": "https:// official employer or ATS URL",
-                    "location": "string",
-                    "description": "max 800 chars",
-                    "required_experience_min": "integer or null",
-                    "required_experience_max": "integer or null",
-                    "posted_date": "YYYY-MM-DD or null",
-                    "start_date": "YYYY-MM-DD or null",
-                    "end_date": "YYYY-MM-DD or null",
-                    "evidence": ["short source-backed observation"],
-                }
-            ],
-        },
-        "response_rule": "Return exactly one JSON object. No markdown or commentary.",
-    }
-    return json.dumps(
-        payload,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
+    """Describe one live-role search in concise, ordinary language.
+
+    Discovery is deliberately a semantic, high-recall model task. ApplyPilot
+    keeps first-party verification, eligibility, and ranking deterministic
+    after the response is imported, so the prompt does not need to restate
+    those implementations as a large JSON protocol.
+    """
+    objective = _clean_prompt_text(query) or "Find suitable currently open early-career roles."
+    candidate_lines = _discovery_candidate_summary(_discovery_candidate_context(pack)["profile"])
+    candidate_summary = "\n".join(f"- {line}" for line in candidate_lines)
+    reference_instruction = (
+        f"\n\nEnd the answer with `Reference: {request_id}` so ApplyPilot can bind the "
+        "reply to this search."
+        if request_id
+        else ""
     )
+    return f"""Find up to {max(1, limit)} distinct, currently open roles for this person.
+
+## Search objective
+
+{objective}
+
+## Candidate snapshot
+
+{candidate_summary}
+
+## What a strong match means
+
+Use the meaning of the work, not only exact title keywords. Consider the person's full
+background, transferable capabilities, trajectory, and preferences. Include adjacent
+early-career titles when the actual responsibilities fit. Favor paid internships, co-ops,
+apprenticeships, fellowships, new-graduate, and other explicit early-career opportunities.
+
+## Research boundaries
+
+- Search live employer career pages, university recruiting pages, and public ATS postings.
+- Use job boards or search snippets only to discover a lead; link the official employer or
+  ATS posting in the answer.
+- Stay within the role, recruiting-cycle, and location boundaries in the objective. Skip
+  clearly senior, closed, unpaid, or incompatible roles.
+- Do not research the person, their projects, academic papers, news, or general company
+  background. The candidate snapshot is the complete matching context.
+- If a site blocks you, move to another employer or official index instead of stopping.
+
+## How to answer
+
+Respond in ordinary language with a concise numbered list, not JSON. Start each item with
+`Role title — Company`, then give the location, official posting URL, and one or two
+source-backed sentences explaining the work and why it is a plausible semantic match. Add
+posting, start, or experience details only when the source states them. Say when a detail is
+not stated rather than guessing.
+
+Return the useful roles you can verify even if there are fewer than {max(1, limit)}. Do not
+pad the list with weak matches or return an empty placeholder while viable search routes
+remain.{reference_instruction}
+""".strip()
+
+
+def _discovery_candidate_summary(profile: dict[str, Any]) -> list[str]:
+    """Turn sanitized matching facts into a short reader-facing narrative."""
+    lines: list[str] = []
+    current_title = _clean_prompt_text(profile.get("current_title"))
+    education = _clean_prompt_text(profile.get("education"))
+    target_role = _clean_prompt_text(profile.get("target_role"))
+    city_region = _clean_prompt_text(profile.get("city_region"))
+    if current_title:
+        lines.append(f"Current focus: {current_title}.")
+    if education:
+        lines.append(f"Education: {education}.")
+    if target_role:
+        lines.append(f"Target direction: {target_role}.")
+    if city_region:
+        lines.append(f"Based in {city_region}.")
+
+    skills = profile.get("skills")
+    if isinstance(skills, dict):
+        for category, values in skills.items():
+            items = _prompt_list(values, limit=20)
+            if items:
+                label = _prompt_category_label(category)
+                lines.append(f"{label or 'Capabilities'}: {', '.join(items)}.")
+
+    preferred_locations = _prompt_list(profile.get("preferred_locations"), limit=12)
+    preferences = profile.get("preferences")
+    if not preferred_locations and isinstance(preferences, dict):
+        preferred_locations = _prompt_list(preferences.get("locations"), limit=12)
+    if preferred_locations:
+        lines.append(f"Preferred locations: {', '.join(preferred_locations)}.")
+
+    availability = profile.get("availability")
+    if isinstance(availability, dict):
+        earliest = _clean_prompt_text(availability.get("earliest_start_date"))
+        if earliest:
+            lines.append(f"Earliest start: {earliest}.")
+
+    authorization = profile.get("work_authorization")
+    if isinstance(authorization, dict):
+        authorized = _prompt_bool(authorization.get("legally_authorized_to_work"))
+        sponsorship = _prompt_bool(authorization.get("require_sponsorship"))
+        if authorized is True:
+            lines.append("Legally authorized to work in the stated market.")
+        elif authorized is False:
+            lines.append("Not currently authorized to work in the stated market.")
+        if sponsorship is True:
+            lines.append("Requires employment sponsorship.")
+        elif sponsorship is False:
+            lines.append("Does not require employment sponsorship.")
+
+    return lines or [
+        "Only the search objective is available; do not infer missing candidate facts."
+    ]
+
+
+def _prompt_list(value: Any, *, limit: int) -> list[str]:
+    if isinstance(value, str):
+        values = [value]
+    elif isinstance(value, (list, tuple)):
+        values = list(value)
+    else:
+        return []
+    return [
+        cleaned
+        for item in values
+        if (cleaned := _clean_prompt_text(item))
+    ][:limit]
+
+
+def _prompt_bool(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    normalized = _clean_prompt_text(value).lower()
+    if normalized in {"true", "yes", "1"}:
+        return True
+    if normalized in {"false", "no", "0"}:
+        return False
+    return None
+
+
+def _prompt_category_label(value: Any) -> str:
+    acronyms = {"ai": "AI", "seo": "SEO", "sql": "SQL", "ga4": "GA4"}
+    return " ".join(
+        acronyms.get(word.lower(), word.capitalize())
+        for word in _clean_prompt_text(value).replace("_", " ").split()
+    )
+
+
+def _clean_prompt_text(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()
 
 
 def build_material_prompt(
