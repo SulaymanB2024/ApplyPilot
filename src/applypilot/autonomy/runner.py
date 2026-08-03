@@ -7,7 +7,7 @@ import json
 import os
 import re
 import secrets
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -102,9 +102,41 @@ def prepare_run(
     output_dir: Path,
     corrections_path: Path | None = None,
     policy: RunPolicy | None = None,
+    aggregation_snapshot_path: Path | None = None,
+    aggregation_snapshot_revision: int | None = None,
+    aggregation_snapshot_sha256: str = "",
+    legacy_web_discovery: bool = True,
 ) -> dict[str, str]:
     """Write a compact, auditable run packet without network/browser actions."""
-    active_policy = policy or RunPolicy()
+    if aggregation_snapshot_path is not None and legacy_web_discovery:
+        raise ValueError("aggregation snapshot and legacy web discovery are mutually exclusive")
+    if aggregation_snapshot_path is None and not legacy_web_discovery:
+        raise ValueError("an exact aggregation snapshot is required")
+    if aggregation_snapshot_path is not None:
+        if aggregation_snapshot_revision is None or aggregation_snapshot_revision < 1:
+            raise ValueError("aggregation snapshot revision must be positive")
+        if not re.fullmatch(r"[0-9a-f]{64}", aggregation_snapshot_sha256):
+            raise ValueError("aggregation snapshot digest is invalid")
+        from applypilot.aggregation.snapshot import SnapshotDiscovery
+
+        SnapshotDiscovery(
+            aggregation_snapshot_path,
+            expected_query=query,
+            expected_revision=aggregation_snapshot_revision,
+            expected_sha256=aggregation_snapshot_sha256,
+        )
+        if policy is None:
+            default_policy = RunPolicy()
+            active_policy = replace(
+                default_policy,
+                source=replace(default_policy.source, primary="aggregation_snapshot"),
+            )
+        else:
+            active_policy = policy
+            if active_policy.source.primary != "aggregation_snapshot":
+                raise ValueError("snapshot-backed run policy must use aggregation_snapshot")
+    else:
+        active_policy = policy or RunPolicy()
     active_policy.validate()
     profile = config.load_profile()
     resume_text = config.RESUME_PATH.read_text(encoding="utf-8")
@@ -132,6 +164,12 @@ def prepare_run(
     _write_json(Path(paths["facts"]), fact_ledger.to_dict())
     _write_json(Path(paths["context"]), context.to_dict())
     _write_json(Path(paths["policy"]), asdict(active_policy))
+    snapshot_target: Path | None = None
+    snapshot_payload: dict[str, Any] | None = None
+    if aggregation_snapshot_path is not None:
+        snapshot_target = run_dir / "aggregation_snapshot.json"
+        _copy_private_file(aggregation_snapshot_path, snapshot_target)
+        snapshot_payload = _read_json(snapshot_target)
     manifest = {
         "schema_version": RUN_SCHEMA_VERSION,
         "run_id": run_id,
@@ -150,20 +188,31 @@ def prepare_run(
             )
         },
     }
+    if snapshot_target is not None and snapshot_payload is not None:
+        manifest.update(
+            {
+                "aggregation_run_id": str(snapshot_payload.get("run_id") or ""),
+                "aggregation_snapshot_revision": int(snapshot_payload.get("revision") or 0),
+                "aggregation_snapshot_sha256": str(snapshot_payload.get("sha256") or ""),
+                "aggregation_snapshot_file_sha256": _sha256_file(snapshot_target),
+            }
+        )
+        manifest["immutable_artifacts"][snapshot_target.name] = _sha256_file(snapshot_target)
     _write_json(Path(paths["manifest"]), manifest)
-    request_path = ArtifactChatGPTClient(
-        run_dir=run_dir,
-        bindings=RunBindings.from_manifest(manifest),
-        ledger=UsageLedger(run_id=run_id, budget=active_policy.budget),
-    ).prepare_discovery_request(
-        pack=context,
-        query=query,
-        limit=active_policy.budget.discoveries,
-    )
-    relative_request = str(request_path.relative_to(run_dir))
-    manifest["immutable_artifacts"][relative_request] = _sha256_file(request_path)
-    _write_json(Path(paths["manifest"]), manifest)
-    paths["request"] = str(request_path)
+    if legacy_web_discovery:
+        request_path = ArtifactChatGPTClient(
+            run_dir=run_dir,
+            bindings=RunBindings.from_manifest(manifest),
+            ledger=UsageLedger(run_id=run_id, budget=active_policy.budget),
+        ).prepare_discovery_request(
+            pack=context,
+            query=query,
+            limit=active_policy.budget.discoveries,
+        )
+        relative_request = str(request_path.relative_to(run_dir))
+        manifest["immutable_artifacts"][relative_request] = _sha256_file(request_path)
+        _write_json(Path(paths["manifest"]), manifest)
+        paths["request"] = str(request_path)
     return paths
 
 
@@ -517,12 +566,15 @@ def load_reviewed_run_snapshot(
     query = str(manifest.get("query") or "").strip()
     if not query:
         raise ValueError("autonomy run query is missing")
-    _validate_discovery_request(
-        run_dir=run_dir,
-        manifest=manifest,
-        query=query,
-        discovery_limit=policy.budget.discoveries,
-    )
+    if manifest.get("aggregation_run_id"):
+        _validate_aggregation_snapshot(run_dir=run_dir, manifest=manifest, query=query)
+    else:
+        _validate_discovery_request(
+            run_dir=run_dir,
+            manifest=manifest,
+            query=query,
+            discovery_limit=policy.budget.discoveries,
+        )
     snapshot = {
         "run_id": bindings.run_id,
         "query": query,
@@ -535,6 +587,18 @@ def load_reviewed_run_snapshot(
         "approval_trust_store_sha256": "",
         "fact_approval_expires_at": "",
     }
+    if manifest.get("aggregation_run_id"):
+        snapshot.update(
+            {
+                "aggregation_run_id": str(manifest["aggregation_run_id"]),
+                "aggregation_snapshot_revision": str(
+                    manifest["aggregation_snapshot_revision"]
+                ),
+                "aggregation_snapshot_sha256": str(
+                    manifest["aggregation_snapshot_sha256"]
+                ),
+            }
+        )
     if require_signed_approval:
         from applypilot.autonomy.approval import (
             FactApprovalExpectation,
@@ -708,6 +772,17 @@ def advance_artifact_run(
         cache_dir=run_dir / "verification",
     )
     query = str(manifest.get("query") or "")
+    if manifest.get("aggregation_run_id"):
+        from applypilot.aggregation.snapshot import SnapshotDiscovery
+
+        discovery: Any = SnapshotDiscovery(
+            run_dir / "aggregation_snapshot.json",
+            expected_query=query,
+            expected_revision=int(manifest.get("aggregation_snapshot_revision") or 0),
+            expected_sha256=str(manifest.get("aggregation_snapshot_sha256") or ""),
+        )
+    else:
+        discovery = web
     result = AutonomousBatch(
         run_id=bindings.run_id,
         profile=candidate_profile_from_data(
@@ -717,7 +792,7 @@ def advance_artifact_run(
         ),
         context_pack=context_pack,
         dependencies=BatchDependencies(
-            discovery=web,
+            discovery=discovery,
             verifier=active_verifier,
             materials=web,
             form_review=ArtifactFormReviewer(
@@ -1242,6 +1317,28 @@ def _read_run_heartbeat(
     return parsed, status
 
 
+def _validate_aggregation_snapshot(
+    *, run_dir: Path, manifest: dict[str, Any], query: str
+) -> None:
+    from applypilot.aggregation.snapshot import SnapshotDiscovery
+
+    relative_path = "aggregation_snapshot.json"
+    artifacts = manifest.get("immutable_artifacts")
+    if not isinstance(artifacts, dict) or relative_path not in artifacts:
+        raise ValueError("autonomy run does not immutably bind its aggregation snapshot")
+    path = run_dir / relative_path
+    adapter = SnapshotDiscovery(
+        path,
+        expected_query=query,
+        expected_revision=int(manifest.get("aggregation_snapshot_revision") or 0),
+        expected_sha256=str(manifest.get("aggregation_snapshot_sha256") or ""),
+    )
+    if str(adapter.payload.get("run_id") or "") != str(manifest.get("aggregation_run_id") or ""):
+        raise ValueError("aggregation snapshot run binding mismatch")
+    if _sha256_file(path) != str(manifest.get("aggregation_snapshot_file_sha256") or ""):
+        raise ValueError("aggregation snapshot file digest mismatch")
+
+
 def _validate_discovery_request(
     *,
     run_dir: Path,
@@ -1311,6 +1408,31 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     temporary.write_text(text, encoding="utf-8")
     os.replace(temporary, path)
+
+
+def _copy_private_file(source: Path, target: Path) -> None:
+    source_path = source.expanduser()
+    if source_path.is_symlink() or not source_path.is_file():
+        raise ValueError("aggregation snapshot source must be a regular file")
+    data = source_path.read_bytes()
+    if len(data) > 20 * 1024 * 1024:
+        raise ValueError("aggregation snapshot source is too large")
+    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(target, flags, 0o600)
+    try:
+        view = memoryview(data)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError("aggregation snapshot copy made no progress")
+            view = view[written:]
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    os.chmod(target, 0o600)
 
 
 def _write_fsynced_json(path: Path, payload: dict[str, Any]) -> None:

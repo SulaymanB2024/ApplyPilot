@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import secrets
 from datetime import datetime, timezone
 from pathlib import Path
@@ -777,6 +778,16 @@ def prepare_workflow(
         "--response",
         help="Browser/model response for the run's one active handoff request.",
     ),
+    aggregation_snapshot: Optional[str] = typer.Option(
+        None,
+        "--aggregation-snapshot",
+        help="Exact aggregation selector RUN_ID@REVISION for a new run.",
+    ),
+    legacy_web_discovery: bool = typer.Option(
+        False,
+        "--legacy-web-discovery",
+        help="Compatibility-only ChatGPT Web discovery instead of an aggregation snapshot.",
+    ),
     out: Optional[Path] = typer.Option(None, "--out", help="Autonomy transport directory."),
 ) -> None:
     """Discover, verify, rank, and prepare one resumable reviewed shortlist."""
@@ -793,9 +804,42 @@ def prepare_workflow(
                 raise ValueError("--query is required when creating a workflow run")
             if response is not None:
                 raise ValueError("--response requires --run-dir")
+            if bool(aggregation_snapshot) == legacy_web_discovery:
+                raise ValueError(
+                    "use exactly one of --aggregation-snapshot or --legacy-web-discovery"
+                )
+            snapshot_path: Path | None = None
+            snapshot_revision: int | None = None
+            snapshot_sha256 = ""
+            if aggregation_snapshot is not None:
+                if not re.fullmatch(
+                    r"[a-zA-Z0-9_.:-]{1,120}@[1-9][0-9]*", aggregation_snapshot
+                ):
+                    raise ValueError(
+                        "--aggregation-snapshot must be an exact RUN_ID@REVISION selector"
+                    )
+                aggregation_run_id, revision_text = aggregation_snapshot.rsplit("@", 1)
+                snapshot_revision = int(revision_text)
+                from applypilot.aggregation.store import AggregationStore
+
+                aggregation_db, aggregation_runs, _ = _aggregation_data_paths()
+                aggregation_store = AggregationStore(
+                    aggregation_db, run_dir=aggregation_runs
+                )
+                try:
+                    snapshot_path, snapshot_payload = aggregation_store.verify_snapshot_chain(
+                        aggregation_run_id, snapshot_revision
+                    )
+                    snapshot_sha256 = str(snapshot_payload["sha256"])
+                finally:
+                    aggregation_store.close()
             paths = prepare_run(
                 query=query,
                 output_dir=out or config.APP_DIR / "autonomy-runs",
+                aggregation_snapshot_path=snapshot_path,
+                aggregation_snapshot_revision=snapshot_revision,
+                aggregation_snapshot_sha256=snapshot_sha256,
+                legacy_web_discovery=legacy_web_discovery,
             )
             run_dir = Path(paths["run_dir"])
             with WorkflowStore(workflow_path) as store:
@@ -806,11 +850,20 @@ def prepare_workflow(
                     "run_id": run_id,
                     "run_dir": str(run_dir),
                     "status": status["status"],
-                    "next_action": "service_browser_handoff",
-                    "request_path": str(paths["request"]),
+                    "next_action": (
+                        "service_browser_handoff"
+                        if paths.get("request")
+                        else "advance_snapshot_run"
+                    ),
+                    "request_path": str(paths.get("request") or ""),
                 }
             )
             return
+
+        if aggregation_snapshot is not None or legacy_web_discovery:
+            raise ValueError(
+                "--aggregation-snapshot and --legacy-web-discovery apply only to new runs"
+            )
 
         run_dir = run_dir.resolve()
         if response is not None:

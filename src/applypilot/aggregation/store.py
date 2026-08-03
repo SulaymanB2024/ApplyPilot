@@ -560,9 +560,27 @@ class AggregationStore:
         payload = json.loads(path.read_text(encoding="utf-8"))
         if payload.get("schema_version") != SNAPSHOT_SCHEMA_VERSION:
             raise ValueError("unsupported aggregation snapshot schema")
+        if payload.get("run_id") != run_id or int(payload.get("revision") or 0) != revision:
+            raise ValueError("aggregation snapshot run or revision binding mismatch")
         if snapshot_digest(payload) != row["sha256"] or payload.get("sha256") != row["sha256"]:
             raise ValueError("aggregation snapshot digest mismatch")
         return path, payload
+
+    def verify_snapshot_chain(self, run_id: str, revision: int) -> tuple[Path, dict[str, Any]]:
+        if revision < 1:
+            raise ValueError("aggregation snapshot revision must be positive")
+        expected_parent = ""
+        selected: tuple[Path, dict[str, Any]] | None = None
+        for current_revision in range(1, revision + 1):
+            current = self.get_snapshot(run_id, current_revision)
+            payload = current[1]
+            if str(payload.get("parent_sha256") or "") != expected_parent:
+                raise ValueError("aggregation snapshot parent chain mismatch")
+            expected_parent = str(payload["sha256"])
+            selected = current
+        if selected is None:
+            raise KeyError(f"unknown aggregation snapshot: {run_id}@{revision}")
+        return selected
 
     def latest_revision(self, run_id: str) -> int:
         run_id = _safe_id(run_id, field_name="aggregation run id")
