@@ -214,9 +214,13 @@ def _active_handoffs_unlocked(
         if kind not in candidate_free_kinds and not candidate_id:
             raise ValueError("candidate handoff is missing its candidate binding")
         resource_lock = str(request.get("resource_lock") or "")
-        if kind in {"handshake_job_observations", "runway_job_observations"}:
+        if kind in {
+            "handshake_job_observations",
+            "runway_job_observations",
+            "startup_opportunities",
+        }:
             if resource_lock != "authenticated_browser":
-                raise ValueError("portal handoff is missing the authenticated browser lock")
+                raise ValueError("browser mission is missing the authenticated browser lock")
         elif resource_lock:
             raise ValueError("handoff resource lock is not supported for this kind")
         raw_response_path = run_dir / str(request.get("response_path") or "")
@@ -913,6 +917,10 @@ def import_response_artifact(*, request_path: Path, input_path: Path) -> dict[st
                 from applypilot.aggregation.portal_handoff import validate_portal_response
 
                 payload = validate_portal_response(json.loads(text), request=request).to_dict()
+            elif expected_kind == "startup_opportunities":
+                from applypilot.opportunities.research import validate_research_response
+
+                payload = validate_research_response(json.loads(text), request=request)
             else:
                 raise ValueError(f"unsupported handoff response kind: {expected_kind}")
             if expected_kind == "role_candidates":

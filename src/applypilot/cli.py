@@ -46,9 +46,15 @@ campaign_app = typer.Typer(
     help="Durable, evidence-bound multi-application campaign state.",
     no_args_is_help=True,
 )
+opportunities_app = typer.Typer(
+    name="opportunities",
+    help="Evidence-bound startup opportunity research and outreach preparation.",
+    no_args_is_help=True,
+)
 app.add_typer(improve_app, name="improve")
 app.add_typer(autonomy_app, name="autonomy")
 app.add_typer(campaign_app, name="campaign")
+app.add_typer(opportunities_app, name="opportunities")
 console = Console()
 log = logging.getLogger(__name__)
 
@@ -155,6 +161,17 @@ def _aggregation_data_paths() -> tuple[Path, Path, Path]:
     data_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     run_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     return data_dir / "aggregation.sqlite3", run_dir, data_dir / "applypilot.db"
+
+
+def _opportunity_data_paths() -> tuple[Path, Path]:
+    """Resolve the company-intelligence ledger separately from job/workflow state."""
+    from applypilot import config
+
+    data_dir = Path(os.environ.get("APPLYPILOT_DIR") or config.APP_DIR).expanduser().resolve()
+    run_dir = data_dir / "opportunity-runs"
+    data_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    run_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    return data_dir / "opportunities.sqlite3", run_dir
 
 
 def _build_aggregation_sources(
@@ -354,6 +371,218 @@ def profile_cache_status(
             + ", ".join(report["pending_verification"])
             + " (not used for autofill)"
         )
+
+
+@opportunities_app.command("discover")
+def discover_opportunities(
+    signal: Optional[list[str]] = typer.Option(
+        None,
+        "--signal",
+        help="Repeat recently-funded and/or actively-hiring; defaults to both.",
+    ),
+    recent_days: int = typer.Option(45, "--recent-days", min=1, max=365),
+    watch: bool = typer.Option(False, "--watch", help="Include the current telemetry cursor."),
+) -> None:
+    """Create one bounded public-browser research mission; do not contact companies."""
+    _bootstrap_config_only()
+    from applypilot import config
+    from applypilot.observability.events import EventJournal
+    from applypilot.opportunities.models import OpportunitySignal
+    from applypilot.opportunities.research import (
+        build_research_request,
+        write_research_mission,
+    )
+    from applypilot.opportunities.store import OpportunityStore
+
+    aliases = {
+        "recently-funded": OpportunitySignal.RECENT_FUNDING,
+        "recent_funding": OpportunitySignal.RECENT_FUNDING,
+        "actively-hiring": OpportunitySignal.ACTIVELY_HIRING,
+        "actively_hiring": OpportunitySignal.ACTIVELY_HIRING,
+    }
+    requested = signal or ["recently-funded", "actively-hiring"]
+    try:
+        signals = tuple(aliases[item] for item in requested)
+        if len(set(signals)) != len(signals):
+            raise ValueError("opportunity signals must not be repeated")
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        run_id = f"opp-{stamp}-{secrets.token_hex(4)}"
+        database_path, run_root = _opportunity_data_paths()
+        run_dir = run_root / run_id
+        run_dir.mkdir(mode=0o700)
+        request = build_research_request(
+            run_id=run_id,
+            signals=signals,
+            recent_days=recent_days,
+            profile=config.load_profile(),
+        )
+        journal = EventJournal(run_dir / "events.ndjson", run_id=run_id)
+        request_path = write_research_mission(
+            run_dir=run_dir,
+            request=request,
+            journal=journal,
+        )
+        with OpportunityStore(database_path) as store:
+            store.start_run(run_id, request.to_dict(), request_path=request_path)
+        console.print_json(
+            data={
+                "run_id": run_id,
+                "status": "awaiting_browser",
+                "request_path": str(request_path),
+                "next_action": "service_bounded_browser_research_handoff",
+                "watch_requested": watch,
+                "event_sequence": journal.read()[-1].sequence,
+                "external_contact_attempted": False,
+            }
+        )
+    except KeyError as exc:
+        console.print(f"[red]Opportunity discovery failed:[/red] unknown signal {exc.args[0]!r}")
+        raise typer.Exit(code=2) from exc
+    except Exception as exc:
+        console.print(
+            f"[red]Opportunity discovery failed:[/red] {type(exc).__name__}: {str(exc)[:240]}"
+        )
+        raise typer.Exit(code=1) from exc
+
+
+@opportunities_app.command("status")
+def opportunity_status(
+    run_id: str = typer.Argument(...),
+    watch: bool = typer.Option(False, "--watch", help="Include the current telemetry cursor."),
+) -> None:
+    """Report durable research state without running or consuming the browser mission."""
+    from applypilot.observability.events import EventJournal
+    from applypilot.opportunities.store import OpportunityStore
+
+    database_path, _ = _opportunity_data_paths()
+    try:
+        with OpportunityStore(database_path) as store:
+            status = store.run_status(run_id)
+        request_path = Path(str(status["request_path"]))
+        response_path = request_path.with_name(
+            request_path.name.replace(".request.json", ".response.json")
+        )
+        receipt_path = response_path.with_name(
+            response_path.name.replace(".response.json", ".receipt.json")
+        )
+        journal_path = request_path.parent.parent / "events.ndjson"
+        events = EventJournal(journal_path, run_id=run_id).read() if journal_path.exists() else []
+        console.print_json(
+            data={
+                **status,
+                "request": status["request"],
+                "browser_state": (
+                    "consumed"
+                    if receipt_path.exists()
+                    else "response_ready"
+                    if response_path.exists()
+                    else "awaiting_response"
+                ),
+                "event_sequence": events[-1].sequence if events else 0,
+                "latest_phase": events[-1].phase if events else "",
+                "watch_requested": watch,
+            }
+        )
+    except Exception as exc:
+        console.print(
+            f"[red]Opportunity status failed:[/red] {type(exc).__name__}: {str(exc)[:240]}"
+        )
+        raise typer.Exit(code=1) from exc
+
+
+@opportunities_app.command("import")
+def import_opportunity_research(
+    run_id: str = typer.Argument(...),
+    response: Optional[Path] = typer.Option(
+        None,
+        "--response",
+        help="Browser-produced response to validate and import; omit if already at response_path.",
+    ),
+) -> None:
+    """Validate and consume one bounded research artifact into the separate ledger."""
+    from applypilot.autonomy.handoff import import_response_artifact
+    from applypilot.observability.events import EventJournal
+    from applypilot.opportunities.research import consume_research_response
+    from applypilot.opportunities.store import OpportunityStore
+
+    database_path, _ = _opportunity_data_paths()
+    try:
+        with OpportunityStore(database_path) as store:
+            status = store.run_status(run_id)
+            request_path = Path(str(status["request_path"]))
+            if response is not None:
+                import_response_artifact(request_path=request_path, input_path=response)
+            result = consume_research_response(
+                request_path=request_path,
+                store=store,
+                journal=EventJournal(
+                    request_path.parent.parent / "events.ndjson",
+                    run_id=run_id,
+                ),
+            )
+        console.print_json(data=result)
+    except Exception as exc:
+        console.print(
+            f"[red]Opportunity import failed:[/red] {type(exc).__name__}: {str(exc)[:240]}"
+        )
+        raise typer.Exit(code=1) from exc
+
+
+@opportunities_app.command("list")
+def list_opportunities(
+    status: Optional[str] = typer.Option(None, "--status"),
+    limit: int = typer.Option(25, "--limit", min=1, max=100),
+    as_json: bool = typer.Option(False, "--json"),
+) -> None:
+    """List company signals; these are not job candidates or sent messages."""
+    from applypilot.opportunities.store import OpportunityStore
+
+    database_path, _ = _opportunity_data_paths()
+    try:
+        with OpportunityStore(database_path) as store:
+            rows = store.list_leads(status=status, limit=limit)
+        if as_json:
+            console.print_json(data=rows)
+            return
+        table = Table(title="Verified startup opportunity ledger")
+        for column in ("Lead", "Domain", "Signal", "Status", "Score"):
+            table.add_column(column)
+        for row in rows:
+            table.add_row(
+                str(row["lead_id"]),
+                str(row["company_domain"]),
+                str(row["signal"]),
+                str(row["status"]),
+                str(row["score"] if row["score"] is not None else ""),
+            )
+        console.print(table)
+    except Exception as exc:
+        console.print(
+            f"[red]Opportunity list failed:[/red] {type(exc).__name__}: {str(exc)[:240]}"
+        )
+        raise typer.Exit(code=1) from exc
+
+
+@opportunities_app.command("show")
+def show_opportunity(
+    lead_id: str = typer.Argument(...),
+    evidence: bool = typer.Option(False, "--evidence"),
+) -> None:
+    """Show one company lead and optionally its complete structured evidence."""
+    from applypilot.opportunities.store import OpportunityStore
+
+    database_path, _ = _opportunity_data_paths()
+    try:
+        with OpportunityStore(database_path) as store:
+            record = store.get_lead(lead_id)
+        if not evidence:
+            record.pop("evidence", None)
+        console.print_json(data=record)
+    except Exception as exc:
+        console.print(
+            f"[red]Opportunity show failed:[/red] {type(exc).__name__}: {str(exc)[:240]}"
+        )
+        raise typer.Exit(code=1) from exc
 
 
 @app.command("aggregate")
