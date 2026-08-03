@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import secrets
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -142,6 +145,51 @@ def _current_git_revision(*, require_clean: bool = False) -> str:
     return revision
 
 
+def _aggregation_data_paths() -> tuple[Path, Path, Path]:
+    """Resolve aggregation paths at command time so APPLYPILOT_DIR remains testable."""
+    from applypilot import config
+
+    data_dir = Path(os.environ.get("APPLYPILOT_DIR") or config.APP_DIR).expanduser().resolve()
+    run_dir = data_dir / "aggregation-runs"
+    data_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    run_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    return data_dir / "aggregation.sqlite3", run_dir, data_dir / "applypilot.db"
+
+
+def _build_aggregation_sources(
+    *,
+    source_names: list[str],
+    import_path: Optional[Path],
+    cache_db_path: Path,
+) -> list[Any]:
+    """Build only explicit deterministic source adapters."""
+    from applypilot.aggregation.sources import (
+        CacheSource,
+        DirectATSSource,
+        ManualImportSource,
+        SmartExtractSource,
+        WorkdaySource,
+    )
+
+    registry = {
+        "cache": lambda: CacheSource(db_path=cache_db_path),
+        "direct_ats": DirectATSSource,
+        "workday": WorkdaySource,
+        "smart_extract": SmartExtractSource,
+    }
+    sources: list[Any] = []
+    for name in source_names:
+        factory = registry.get(name)
+        if factory is None:
+            if name in {"handshake", "runway"}:
+                raise ValueError(f"use --portal {name} for a browser mission")
+            raise ValueError(f"unknown aggregation source: {name}")
+        sources.append(factory())
+    if import_path is not None:
+        sources.append(ManualImportSource(import_path))
+    return sources
+
+
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
@@ -263,6 +311,172 @@ def profile_cache_status(
             + ", ".join(report["pending_verification"])
             + " (not used for autofill)"
         )
+
+
+@app.command("aggregate")
+def aggregate_jobs(
+    query: str = typer.Option(..., "--query", "-q", help="Exact aggregation objective."),
+    term: list[str] = typer.Option(
+        ...,
+        "--term",
+        help="Bounded provider search term; repeat to add terms.",
+    ),
+    location: Optional[list[str]] = typer.Option(
+        None,
+        "--location",
+        help="Bounded location; repeat to add locations.",
+    ),
+    source: Optional[list[str]] = typer.Option(
+        None,
+        "--source",
+        help="Deterministic source: cache, direct_ats, workday, or smart_extract.",
+    ),
+    enrich: Optional[list[str]] = typer.Option(
+        None,
+        "--enrich",
+        help="Non-blocking enrichment lane; currently jobspy.",
+    ),
+    portal: Optional[list[str]] = typer.Option(
+        None,
+        "--portal",
+        help="Serialized model-piloted browser mission: handshake or runway.",
+    ),
+    import_path: Optional[Path] = typer.Option(
+        None,
+        "--import",
+        help="Explicit Handshake or Runway JSONL import.",
+    ),
+    mode: str = typer.Option("quick", "--mode", help="quick or deep."),
+    watch: bool = typer.Option(True, "--watch/--no-watch", help="Show live source telemetry."),
+) -> None:
+    """Publish a fast immutable job snapshot and queue optional enrichment."""
+    import asyncio
+
+    from applypilot.aggregation.models import AggregationRequest
+    from applypilot.aggregation.orchestrator import Aggregator
+    from applypilot.aggregation.store import AggregationStore
+    from applypilot.aggregation.telemetry import run_with_live
+    from applypilot.observability.events import EventJournal
+
+    store: Optional[AggregationStore] = None
+    try:
+        source_names = list(source or ["cache", "direct_ats", "workday", "smart_extract"])
+        if len(set(source_names)) != len(source_names):
+            raise ValueError("aggregation sources must be unique")
+        enrichment = list(enrich or [])
+        if any(name != "jobspy" for name in enrichment) or len(set(enrichment)) != len(enrichment):
+            raise ValueError("--enrich accepts jobspy once")
+        portals = list(portal or [])
+        if not set(portals) <= {"handshake", "runway"} or len(set(portals)) != len(portals):
+            raise ValueError("--portal accepts handshake and runway at most once each")
+        if mode not in {"quick", "deep"}:
+            raise ValueError("aggregation mode must be quick or deep")
+
+        database_path, aggregation_runs, cache_db_path = _aggregation_data_paths()
+        adapters = _build_aggregation_sources(
+            source_names=source_names,
+            import_path=import_path,
+            cache_db_path=cache_db_path,
+        )
+        if not adapters:
+            raise ValueError("at least one deterministic source or import is required")
+        now = datetime.now(timezone.utc)
+        run_id = f"agg-{now.strftime('%Y%m%dT%H%M%SZ')}-{secrets.token_hex(4)}"
+        run_directory = aggregation_runs / run_id
+        run_directory.mkdir(parents=True, exist_ok=False, mode=0o700)
+        event_path = run_directory / "events.ndjson"
+        journal = EventJournal(event_path, run_id=run_id)
+        store = AggregationStore(database_path, run_dir=aggregation_runs)
+        request = AggregationRequest(
+            query=query,
+            query_terms=tuple(term),
+            locations=tuple(location or ()),
+            mode=mode,
+            global_deadline_seconds=15.0 if mode == "quick" else 90.0,
+            per_source_timeout_seconds=10.0 if mode == "quick" else 30.0,
+        )
+        pending = tuple(sorted(set(enrichment + portals)))
+        aggregator = Aggregator(
+            store=store,
+            journal=journal,
+            sources=adapters,
+            pending_enrichment=pending,
+        )
+
+        async def execute() -> dict:
+            if watch:
+                return await run_with_live(
+                    aggregator=aggregator,
+                    run_id=run_id,
+                    request=request,
+                    journal=journal,
+                    console=Console(stderr=True),
+                )
+            return await aggregator.run(run_id, request)
+
+        snapshot = asyncio.run(execute())
+        snapshot_path, _ = store.get_snapshot(run_id, int(snapshot["revision"]))
+        console.print_json(
+            data={
+                "run_id": run_id,
+                "status": snapshot["status"],
+                "candidate_count": snapshot["candidate_count"],
+                "snapshot_revision": snapshot["revision"],
+                "snapshot_path": str(snapshot_path),
+                "events_path": str(event_path),
+                "pending_enrichment": snapshot["pending_enrichment"],
+            }
+        )
+    except Exception as exc:
+        console.print(f"[red]Aggregation failed:[/red] {type(exc).__name__}: {str(exc)[:240]}")
+        raise typer.Exit(code=1) from exc
+    finally:
+        if store is not None:
+            store.close()
+
+
+@app.command("aggregate-status")
+def aggregate_status(
+    run_id: str = typer.Option(..., "--run-id", help="Exact aggregation run ID."),
+    as_json: bool = typer.Option(False, "--json", help="Print machine-readable state."),
+) -> None:
+    """Read persisted aggregation state without restarting any source."""
+    from applypilot.aggregation.store import AggregationStore
+
+    store: Optional[AggregationStore] = None
+    try:
+        database_path, aggregation_runs, _ = _aggregation_data_paths()
+        store = AggregationStore(database_path, run_dir=aggregation_runs)
+        revision = store.latest_revision(run_id)
+        if revision:
+            _, snapshot = store.get_snapshot(run_id, revision)
+        else:
+            snapshot = store.snapshot(run_id)
+            snapshot["revision"] = 0
+        if as_json:
+            console.print_json(data=snapshot)
+            return
+        table = Table(title=f"Aggregation {run_id}")
+        table.add_column("Source")
+        table.add_column("State")
+        table.add_column("Observed", justify="right")
+        for row in snapshot.get("sources") or []:
+            table.add_row(
+                str(row["source"]),
+                str(row["status"]),
+                str(row.get("observed_count") or 0),
+            )
+        console.print(table)
+        console.print(
+            f"Revision {snapshot['revision']} · {snapshot['candidate_count']} candidates · "
+            f"{snapshot['observation_count']} observations · {snapshot['status']}"
+        )
+    except Exception as exc:
+        console.print(f"[red]Aggregation status failed:[/red] {type(exc).__name__}: {str(exc)[:240]}")
+        raise typer.Exit(code=1) from exc
+    finally:
+        if store is not None:
+            store.close()
 
 
 @app.command("prepare")
