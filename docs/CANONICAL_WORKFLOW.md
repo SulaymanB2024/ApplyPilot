@@ -25,27 +25,66 @@ location. Role-specific requirements such as being at least 18 remain candidate
 gates. Search may proceed while these are missing, but a form dry-run, approval,
 or submission may not.
 
-## 2. Discover and prepare
+## 2. Aggregate, then prepare one exact revision
 
 ```bash
-applypilot prepare --query \
-  "Paid Summer 2027 product and analytics internships in Austin, New York, San Francisco, Chicago, or Remote US"
+applypilot aggregate \
+  --query "Paid Summer 2027 product and analytics internships in Austin, New York, San Francisco, Chicago, or Remote US" \
+  --term "product intern" \
+  --term "data analyst intern" \
+  --term "business analyst intern" \
+  --location "Austin, TX" \
+  --location "Remote US" \
+  --enrich jobspy \
+  --portal handshake \
+  --portal runway \
+  --mode quick \
+  --watch
 ```
 
-The command creates a run and one browser handoff. Service that request in the
-applicant's authenticated Chrome session and save the final assistant response.
-Discovery replies are ordinary-language numbered lists; ApplyPilot normalizes
-them into its internal candidate schema when the run resumes:
+Repeated `--term` options are the complete bounded provider query set. ApplyPilot
+does not silently expand every query in `searches.yaml`. Cache, direct ATS,
+Workday, and explicitly configured first-party extraction run concurrently and
+publish immutable revision 1 at the quick deadline. JobSpy, Handshake, and
+Runway are enrichment lanes; they do not delay revision 1.
+
+JobSpy provides broad board discovery evidence. Its board-only results cannot
+advance until an official first-party posting is resolved. It runs in bounded,
+killable workers without proxies, identity spoofing, cookie access, or automatic
+block evasion.
+
+Handshake and Runway are serialized, model-piloted browser missions using the
+applicant's authenticated real browser. They are not hidden-API or bulk scraper
+integrations. The applicant must take over for OTP, passkeys, CAPTCHA, MFA, or
+any provider challenge. A mission stops rather than exporting cookies,
+bypassing a challenge, or reading unrelated account data. Every validated
+response publishes a new immutable digest-linked revision.
+
+Inspect persisted source and browser-queue state without restarting work:
 
 ```bash
-applypilot prepare --run-dir RUN_DIR --response BROWSER_OUTPUT.md
+applypilot aggregate-status --run-id AGGREGATION_RUN_ID --watch --json
 ```
 
-Repeat only while the command reports one pending request. Accepted candidates
-must have a supported role family, an explicit early-career signal, an allowed
-location, first-party open-state evidence, and a deterministic score of at least
-70/100. Provider errors, challenge pages, and missing rendered evidence remain
-review gaps and cannot receive materials.
+Then bind the canonical workflow to one exact revision:
+
+```bash
+applypilot prepare \
+  --query "Paid Summer 2027 product and analytics internships in Austin, New York, San Francisco, Chicago, or Remote US" \
+  --aggregation-snapshot AGGREGATION_RUN_ID@REVISION
+```
+
+The resolver verifies the full parent chain, revision, query, and canonical
+digest, then copies the selected snapshot into the run at mode `0600`. A newer
+aggregation revision cannot silently change that run. Snapshot discovery uses
+zero model calls; `--legacy-web-discovery` is an explicit compatibility path for
+one release.
+
+Resume only while the command reports one pending material or form request.
+Accepted candidates must have a supported role family, an explicit early-career
+signal, an allowed location, first-party open-state evidence, and a deterministic
+score of at least 70/100. Provider errors, challenge pages, and missing rendered
+evidence remain review gaps and cannot receive materials.
 
 Search configuration is a discovery instruction, not an applicant fact. A city
 listed only in `searches.yaml` never becomes relocation consent. Full
@@ -58,6 +97,37 @@ reasons, evidence-bound cover letters, and role-specific resumes. Resume
 tailoring can only reorder exact source bullet lines; it cannot add or rewrite an
 applicant claim. A provenance artifact proves the source-line multiset is
 unchanged.
+
+Telemetry in `events.ndjson` exposes lifecycle phases, counts, source deadlines,
+validation outcomes, and safe browser checkpoints. It never exposes model
+chain-of-thought, prompts, response bodies, applicant fields, recipients,
+message IDs, or browser selectors.
+
+### Startup opportunities are a separate route
+
+Company-level signals never enter the job snapshot unless research resolves a
+real current first-party posting:
+
+```bash
+applypilot opportunities discover \
+  --signal recently-funded \
+  --signal actively-hiring \
+  --recent-days 45 \
+  --watch
+```
+
+A completed-funding claim requires a dated company or investor source plus an
+independent dated source. SEC Form D alone is a financing notice, not proof that
+a raise completed. An active-hiring claim requires a current official careers
+page or first-party ATS. Unverified domains, dates, funding details, job titles,
+and contact routes remain unknown.
+
+`opportunities.sqlite3` is separate from job and workflow state. Drafting is
+local-only. Sending requires a separately reviewed, 30-minute, one-time grant
+bound to the exact sender, channel, lead IDs, draft IDs, body and attachment
+digests. Provider acceptance, contact-form submission, delivery, bounce, and
+reply remain distinct receipts. An ambiguous timeout becomes
+`send_state_unknown` and is never retried automatically.
 
 ## 3. Dry-run exact roles
 

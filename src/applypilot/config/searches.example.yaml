@@ -8,6 +8,44 @@
 #   job_boards     = configured JobSpy boards only
 discovery_mode: hybrid
 
+# Progressive aggregation is explicit and bounded. Repeated CLI --term values
+# select provider queries; the overlay never expands every configured query.
+aggregation:
+  default_mode: quick
+  quick_deadline_seconds: 15
+  deep_deadline_seconds: 90
+  per_source_timeout_seconds: 30
+  max_concurrency: 8
+  workday_max_employers: 12
+  workday_max_query_terms: 3
+  smart_extract_max_targets: 6
+  cache_max_age_days: 14
+  automatic_sources: [cache, direct_ats, workday, smart_extract]
+  enrichment_sources: [jobspy, handshake_browser, runway_browser]
+  jobspy:
+    enabled: true
+    boards: [indeed, google, zip_recruiter]
+    max_query_terms: 2
+    max_locations: 2
+    results_per_board: 25
+    max_workers: 3
+    deadline_seconds: 30
+    use_proxies: false
+    fetch_full_descriptions: false
+  browser_portals:
+    enabled: [handshake, runway]
+    serialized: true
+    max_results_per_portal: 25
+    max_navigations_per_portal: 30
+    deadline_seconds_per_portal: 180
+    checkpoint_seconds: 5
+  opportunities:
+    enabled: true
+    recent_funding_days: 45
+    max_company_leads: 25
+    max_drafts_per_run: 10
+    require_send_authorization: true
+
 direct_sources:
   workday: true
   direct_ats: true

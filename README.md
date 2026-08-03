@@ -34,7 +34,10 @@ pip install 'applypilot[discovery]'
 applypilot init
 applypilot profile-cache
 applypilot doctor --strict
-applypilot prepare --query "paid Summer 2027 product and analytics internships in Austin or Remote US"
+applypilot aggregate --query "paid Summer 2027 product and analytics internships in Austin or Remote US" \
+  --term "product intern" --term "data analyst intern" --mode quick --watch
+applypilot prepare --query "paid Summer 2027 product and analytics internships in Austin or Remote US" \
+  --aggregation-snapshot AGGREGATION_RUN_ID@REVISION
 applypilot dry-run --run-id RUN_ID --candidate CANDIDATE_ID
 applypilot approve --run-id RUN_ID --candidate CANDIDATE_ID --max-submissions 1
 applypilot execute --approval-id APPROVAL_ID
@@ -60,6 +63,14 @@ key.
 Runs discovery, verification, deterministic ranking, evidence-bound materials,
 visible form dry-runs, exact approval, and evidence-gated execution through one
 resumable candidate store.
+
+Progressive aggregation publishes a useful immutable first revision from cache
+and first-party sources without waiting for slower enrichment. JobSpy is bounded
+board discovery evidence; Handshake and Runway are serialized model-piloted
+missions in the user's authenticated browser, with user takeover for OTP,
+passkeys, CAPTCHA, MFA, and provider challenges. They are not hidden-API or bulk
+scraper integrations. Later validated results produce digest-linked revisions;
+the canonical workflow binds one exact `RUN_ID@REVISION`.
 
 Search configuration never counts as applicant consent to work in a location.
 Dry-run and submission packets bind one private confirmed-fact snapshot; missing
@@ -93,11 +104,11 @@ Each stage is independent. Run them all or pick what you need.
 
 | Feature | ApplyPilot | AIHawk | Manual |
 |---------|-----------|--------|--------|
-| Job discovery | Direct employer/ATS sources + optional boards/Runway | LinkedIn only | One board at a time |
+| Job discovery | Progressive first-party sources + bounded boards + browser-mediated Handshake/Runway | LinkedIn only | One board at a time |
 | AI scoring | 1-10 fit score per job | Basic filtering | Your gut feeling |
 | Resume tailoring | Evidence-bound role ordering; no invented claims | Template-based | Hours per application |
 | Auto-apply | Visible dry-run, exact batch approval, durable outcome | LinkedIn Easy Apply only | Click, type, repeat |
-| Supported sites | Workday, Greenhouse, Ashby, SmartRecruiters, company career pages, optional Indeed/LinkedIn/Glassdoor/ZipRecruiter/Google Jobs/Runway | LinkedIn | Whatever you open |
+| Supported sites | Workday, Greenhouse, Ashby, SmartRecruiters, company careers, bounded Indeed/Google/ZipRecruiter, browser-mediated Handshake/Runway | LinkedIn | Whatever you open |
 | License | AGPL-3.0 | MIT | N/A |
 
 ---
@@ -149,7 +160,12 @@ and legal attestations, credentials, identity documents, payment, and tax fields
 are rejected from this cache.
 
 ### `searches.yaml`
-Job search queries, target titles, locations, discovery mode, direct ATS boards, and optional aggregators. Set `discovery_mode: direct_sources` to skip aggregator boards and focus on employer-owned or ATS-native pages.
+Job search queries, target titles, locations, discovery mode, direct ATS boards,
+optional aggregators, and bounded progressive-aggregation defaults. Repeated
+`applypilot aggregate --term` options are the entire provider query set; the
+overlay never silently expands all configured queries. Set
+`discovery_mode: direct_sources` to skip aggregator boards and focus on
+employer-owned or ATS-native pages.
 
 ### `.env`
 API keys and runtime config: `GEMINI_API_KEY`, `LLM_MODEL`, plus harness overrides such as `APPLYPILOT_LLM_PROVIDER=chatgpt_web`, `APPLYPILOT_AGENT_BACKEND`, `APPLYPILOT_EXECUTOR_MODEL`, `APPLYPILOT_SUPERVISOR_MODEL`, `APPLYPILOT_DETERMINISTIC_CONTROLLER`, `APPLYPILOT_FIELD_MODEL_CALL_BUDGET`, `APPLYPILOT_CREDENTIAL_PROVIDER`, and `APPLYPILOT_CHROME_PROFILE_DIRECTORY`. Account creation is intentionally a per-run CLI permission rather than a persistent environment default. `APPLYPILOT_CREDENTIAL_PROVIDER` defaults to `google_password_manager`, which uses the selected Chrome profile's browser-managed credentials without exporting passwords. The field model-call budget defaults to zero, so deterministic auto-apply does not spawn a model subprocess. Legacy 1Password settings remain available with `APPLYPILOT_CREDENTIAL_PROVIDER=onepassword`. The self-improvement development harness uses separate optional settings: `APPLYPILOT_DEV_MODE`, `APPLYPILOT_DEV_WORKER_MODEL`, `APPLYPILOT_DEV_REVIEWER_MODEL`, and `APPLYPILOT_DEV_FORBIDDEN_MODELS`. API secret values can also be stored in the OS keyring.
@@ -215,6 +231,13 @@ applypilot workflow-status --run-id ID  # Inspect canonical state and shortlist
 applypilot dry-run --run-id ID           # Create/import visible form reviews
 applypilot approve --run-id ID --candidate CANDIDATE_ID
 applypilot execute --approval-id ID      # Resume one approved submission at a time
+applypilot aggregate --query QUERY --term TERM --mode quick --watch
+applypilot aggregate-status --run-id ID --watch --json
+applypilot prepare --query QUERY --aggregation-snapshot RUN_ID@REVISION
+applypilot opportunities discover --signal recently-funded --signal actively-hiring --watch
+applypilot opportunities list --status verified --limit 25 --json
+applypilot opportunities draft LEAD_ID --channel email  # local only; no send
+applypilot opportunities review-draft DRAFT_ID
 
 # Legacy compatibility and diagnostic commands
 applypilot run [stages...]              # Run pipeline stages (or 'all')
