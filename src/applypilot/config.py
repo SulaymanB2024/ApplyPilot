@@ -46,6 +46,10 @@ TAILORED_DIR = APP_DIR / "tailored_resumes"
 COVER_LETTER_DIR = APP_DIR / "cover_letters"
 LOG_DIR = APP_DIR / "logs"
 CAMPAIGN_DIR = APP_DIR / "campaigns"
+AGGREGATION_DB_PATH = APP_DIR / "aggregation.sqlite3"
+AGGREGATION_RUN_DIR = APP_DIR / "aggregation-runs"
+OPPORTUNITY_DB_PATH = APP_DIR / "opportunities.sqlite3"
+OPPORTUNITY_RUN_DIR = APP_DIR / "opportunity-runs"
 SYSTEM_APPROVAL_TRUST_STORE_PATH = (
     Path("/Library/Application Support/ApplyPilot/approval_allowed_signers")
     if platform.system() == "Darwin"
@@ -131,6 +135,8 @@ def ensure_dirs():
         COVER_LETTER_DIR,
         LOG_DIR,
         CAMPAIGN_DIR,
+        AGGREGATION_RUN_DIR,
+        OPPORTUNITY_RUN_DIR,
         CHROME_WORKER_DIR,
         APPLY_WORKER_DIR,
     ]:
