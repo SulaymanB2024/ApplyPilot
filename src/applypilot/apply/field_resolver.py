@@ -651,11 +651,15 @@ class CodexResolver:
         self,
         *,
         model: str,
+        reasoning_effort: str = "medium",
+        service_tier: str = "default",
         worker_dir: Path,
         timeout: float | None = None,
         max_calls: int = 2,
     ) -> None:
         self.model = model
+        self.reasoning_effort = reasoning_effort
+        self.service_tier = service_tier
         self.worker_dir = worker_dir
         self.timeout = timeout
         self.max_calls = max_calls
@@ -689,6 +693,10 @@ class CodexResolver:
             "exec",
             "--model",
             self.model,
+            "-c",
+            f'model_reasoning_effort="{self.reasoning_effort}"',
+            "-c",
+            f'service_tier="{self.service_tier}"',
             "--sandbox",
             "read-only",
             "--ephemeral",
@@ -776,6 +784,10 @@ class CodexResolver:
             "exec",
             "--model",
             self.model,
+            "-c",
+            f'model_reasoning_effort="{self.reasoning_effort}"',
+            "-c",
+            f'service_tier="{self.service_tier}"',
             "--sandbox",
             "read-only",
             "--ephemeral",

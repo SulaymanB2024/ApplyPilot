@@ -41,6 +41,7 @@ _CONTACT_TYPES = frozenset(
         "company_mailbox",
         "verified_named_person",
         "account_backed_profile",
+        "general_interest_form",
     }
 )
 
@@ -134,6 +135,22 @@ def fact_snapshot_digest(snapshot: dict[str, Any]) -> str:
 
 
 def _verified_contact(lead: OpportunityLead, *, channel: str) -> tuple[str, tuple[str, ...]]:
+    if lead.route is OpportunityRoute.GENERAL_INTEREST_APPLICATION:
+        if channel != "contact_form" or not lead.general_application_url:
+            raise OutreachGateError(
+                "general-interest applications require the verified contact_form channel"
+            )
+        expected = canonicalize_url(lead.general_application_url)
+        form_evidence = tuple(
+            item
+            for item in (*lead.evidence, *lead.contact_evidence)
+            if item.evidence_type == "general_interest_form"
+            and item.is_primary
+            and canonicalize_url(item.source_url) == expected
+        )
+        if not form_evidence:
+            raise OutreachGateError("verified general-interest form required")
+        return expected, tuple(_evidence_id(item) for item in form_evidence)
     route = lead.contact_route.strip()
     if not route or not lead.contact_evidence:
         raise OutreachGateError("verified contact route required")
@@ -193,7 +210,10 @@ def build_outreach_draft(
     """Build a deterministic inquiry from verified evidence without mailbox access."""
     if lead.status is not OpportunityStatus.VERIFIED:
         raise OutreachGateError("verified opportunity required")
-    if lead.route is not OpportunityRoute.SPECULATIVE_OUTREACH:
+    if lead.route not in {
+        OpportunityRoute.SPECULATIVE_OUTREACH,
+        OpportunityRoute.GENERAL_INTEREST_APPLICATION,
+    }:
         raise OutreachGateError("posted jobs must use the normal application workflow")
     recipient, contact_ids = _verified_contact(lead, channel=channel)
     if any(not _SHA256.fullmatch(item) for item in attachment_digests):
@@ -221,12 +241,24 @@ def build_outreach_draft(
         company_context = "I saw current roles on your official careers site."
     else:
         company_context = "I have been following the public information about your work."
-    if channel == "linkedin":
+    if lead.route is OpportunityRoute.GENERAL_INTEREST_APPLICATION:
+        body = (
+            f"Hello {lead.company_name} team,\n\n"
+            f"{applicant_context} I am submitting this general-interest form because I would "
+            "value consideration for a fitting internship or early-career role, including future "
+            "opportunities. I understand this is not tied to a currently posted requisition.\n\n"
+            "Thank you for your time and consideration.\n\nBest,"
+        )
+        subject = f"General interest in opportunities at {lead.company_name}"
+        intent = "general_interest_application"
+    elif channel == "linkedin":
         body = (
             f"Hello {lead.company_name} team — {company_context} {applicant_context} "
             "I would value learning about internships, short-term projects, or early-career "
             "ways to contribute. Thank you."
         )
+        subject = f"Inquiry about contributing to {lead.company_name}"
+        intent = "inquiry"
     else:
         body = (
             f"Hello {lead.company_name} team,\n\n"
@@ -235,7 +267,8 @@ def build_outreach_draft(
             "or early-career way to contribute; I am not assuming a current role is available.\n\n"
             "Thank you for your time and consideration.\n\nBest,"
         )
-    subject = f"Inquiry about contributing to {lead.company_name}"
+        subject = f"Inquiry about contributing to {lead.company_name}"
+        intent = "inquiry"
     created_at = (now or datetime.now(timezone.utc)).astimezone(timezone.utc).isoformat()
     lead_digest = lead.digest
     basis = {
@@ -251,7 +284,7 @@ def build_outreach_draft(
         "fact_snapshot_digest": snapshot_sha256,
         "cited_lead_evidence_ids": list(contact_ids),
         "cited_profile_fact_ids": list(cited_profile),
-        "intent": "inquiry",
+        "intent": intent,
         "unsupported_claims": [],
         "created_at": created_at,
     }
@@ -269,7 +302,7 @@ def build_outreach_draft(
         fact_snapshot_digest=snapshot_sha256,
         cited_lead_evidence_ids=contact_ids,
         cited_profile_fact_ids=cited_profile,
-        intent="inquiry",
+        intent=intent,
         unsupported_claims=(),
         created_at=created_at,
         sha256=digest,
@@ -279,8 +312,10 @@ def build_outreach_draft(
 
 
 def validate_outreach_draft(draft: OutreachDraft) -> None:
-    if draft.intent != "inquiry" or draft.unsupported_claims:
+    if draft.intent not in {"inquiry", "general_interest_application"} or draft.unsupported_claims:
         raise OutreachGateError("outreach draft contains an unsupported intent or claim")
+    if draft.intent == "general_interest_application" and draft.channel != "contact_form":
+        raise OutreachGateError("general-interest application must use a contact form")
     if draft.channel not in {"email", "linkedin", "contact_form"}:
         raise OutreachGateError("outreach draft channel is invalid")
     if not draft.sender or not draft.recipient or not draft.subject or not draft.body:

@@ -6,7 +6,6 @@ import fcntl
 import json
 import os
 import re
-import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -63,6 +62,13 @@ def _validate_name(value: str, *, field_name: str, allow_empty: bool = False) ->
     return normalized
 
 
+def _event_timestamp(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        raise ValueError("event timestamp must include a timezone")
+    return parsed
+
+
 def _validate_mapping(
     value: dict[str, Any], *, counts: bool
 ) -> dict[str, int] | dict[str, str | int | float | bool | None]:
@@ -104,7 +110,11 @@ class EventJournal:
         os.chmod(self.path, 0o600)
         existing = self.read()
         self._sequence = existing[-1].sequence if existing else 0
-        self._started = time.monotonic()
+        self._started_at = (
+            _event_timestamp(existing[0].timestamp)
+            if existing
+            else datetime.now(timezone.utc)
+        )
 
     def emit(
         self,
@@ -122,6 +132,7 @@ class EventJournal:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
             handle.seek(0)
             last_sequence = 0
+            first_timestamp: datetime | None = None
             for line_number, line in enumerate(handle, 1):
                 if not line.strip():
                     continue
@@ -129,20 +140,24 @@ class EventJournal:
                     payload = json.loads(line)
                     if payload.get("run_id") != self.run_id:
                         raise ValueError("event run binding changed")
+                    if first_timestamp is None:
+                        first_timestamp = _event_timestamp(str(payload["timestamp"]))
                     last_sequence = int(payload["sequence"])
                 except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
                     raise ValueError(f"invalid event journal line {line_number}") from exc
             self._sequence = last_sequence + 1
+            observed_at = datetime.now(timezone.utc)
+            started_at = first_timestamp or self._started_at
             event = RunEvent(
                 schema_version=EVENT_SCHEMA_VERSION,
                 run_id=self.run_id,
                 sequence=self._sequence,
-                timestamp=datetime.now(timezone.utc).isoformat(),
+                timestamp=observed_at.isoformat(),
                 component=_validate_name(component, field_name="component"),
                 phase=_validate_name(phase, field_name="phase"),
                 status=_validate_name(status, field_name="status"),
                 source=_validate_name(source, field_name="source", allow_empty=True),
-                elapsed_ms=max(0, int((time.monotonic() - self._started) * 1000)),
+                elapsed_ms=max(0, int((observed_at - started_at).total_seconds() * 1000)),
                 counts=dict(safe_counts),
                 detail=dict(safe_detail),
             )

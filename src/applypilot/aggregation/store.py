@@ -211,7 +211,7 @@ class AggregationStore:
         stable_id = _safe_id(source_id or observation.source.value, field_name="aggregation source id")
         payload = json.dumps(asdict(observation), sort_keys=True)
         with self._lock, self.connection:
-            if observation.advanceable:
+            if observation.verification_state is VerificationState.FIRST_PARTY_RESOLVED:
                 prior_rows = self.connection.execute(
                     "SELECT DISTINCT canonical_key FROM job_observations "
                     "WHERE run_id = ? AND source = ? AND source_job_id = ?",

@@ -9,6 +9,7 @@ from typing import Any
 
 from applypilot.aggregation.store import SNAPSHOT_SCHEMA_VERSION, snapshot_digest
 from applypilot.autonomy.models import RoleCandidate
+from applypilot.employment import ApplicationSurface, OpportunityKind
 
 
 class SnapshotDiscovery:
@@ -90,8 +91,16 @@ class SnapshotDiscovery:
                     source="aggregation_snapshot",
                     location=str(item.get("location") or ""),
                     description=str(item.get("description") or ""),
+                    compensation=str(item.get("salary") or "")[:300],
                     posted_date=posted_date,
                     evidence=evidence,
+                    opportunity_kind=OpportunityKind(
+                        str(item.get("opportunity_kind") or OpportunityKind.UNKNOWN)
+                    ),
+                    application_surface=ApplicationSurface(
+                        str(item.get("application_surface") or ApplicationSurface.UNKNOWN)
+                    ),
+                    requisition_id=str(item.get("canonical_key") or ""),
                     metadata={
                         "aggregation_run_id": str(self.payload["run_id"]),
                         "aggregation_snapshot_revision": int(self.payload["revision"]),

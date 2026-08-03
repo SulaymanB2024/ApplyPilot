@@ -72,6 +72,7 @@ from applypilot.autonomy.models import (
     FreshnessEvidence,
     MaterialPacket,
     MaterialParagraph,
+    ResumeStrategy,
     RoleCandidate,
 )
 from applypilot.autonomy.policy import (
@@ -86,6 +87,7 @@ from applypilot.autonomy.policy import (
     freshness_gate,
     require_authorization,
 )
+from applypilot.employment import ApplicationSurface, OpportunityKind
 from applypilot.autonomy.telemetry import BudgetExceeded, UsageLedger
 from applypilot.autonomy.supervisor import record_runtime_observation
 from applypilot.autonomy.runner import (
@@ -198,6 +200,9 @@ def fresh(candidate, **overrides):
         "title": candidate.title,
         "description": candidate.description,
         "evidence": ("official ATS response",),
+        "opportunity_kind": OpportunityKind.POSTED_EMPLOYMENT,
+        "application_surface": ApplicationSurface.PROVIDER_REQUISITION,
+        "requisition_id": "123",
     }
     values.update(overrides)
     return FreshnessEvidence(**values)
@@ -614,6 +619,12 @@ def test_discovery_prompt_uses_non_navigable_matching_context_and_live_job_contr
     assert "Target direction: Product analyst." in prompt
     assert "Analytics: SQL, Python." in prompt
     assert "Use the meaning of the work, not only exact title keywords." in prompt
+    assert "deterministic eligibility gate accepts these role families" in prompt
+    assert "AI product and product management" in prompt
+    assert (
+        "generic internship, analyst, associate, sales, or talent-pool title is not enough"
+        in prompt
+    )
     assert "official employer" in prompt
     assert "ATS posting" in prompt
     assert "Respond in ordinary language with a concise numbered list, not JSON." in prompt
@@ -659,6 +670,53 @@ def test_material_prompt_prioritizes_relevant_facts_without_dropping_context():
     assert ranked[0]["id"] == "F02"
     assert {item["id"] for item in ranked} == {"F01", "F02", "F03"}
     assert any("Think deeply" in rule for rule in payload["reasoning_guidance"])
+    assert payload["output_contract"]["resume_strategy"] == {
+        "priority_evidence_ids": ["F01"],
+        "priority_job_terms": ["exact phrase from verified_description"],
+    }
+
+
+def test_material_packet_accepts_only_verified_role_resume_strategy() -> None:
+    pack = build_context_pack(PROFILE, job_text="Python product analytics")
+    candidate = role(description="Use Python product analytics and customer research.")
+    payload = {
+        "schema_version": "applypilot.chatgpt_web.v1",
+        "kind": "material_packet",
+        "candidate_id": candidate.candidate_id,
+        "paragraphs": [
+            {
+                "text": "The role uses Python product analytics.",
+                "evidence_ids": ["JOB"],
+                "applicant_claims": [],
+            }
+        ],
+        "verification_gaps": [],
+        "resume_strategy": {
+            "priority_evidence_ids": [pack.evidence[0]["id"]],
+            "priority_job_terms": ["product analytics", "customer research"],
+        },
+    }
+
+    packet = material_packet_from_payload(
+        payload,
+        pack=pack,
+        candidate=candidate,
+        verified_job_text=candidate.description,
+    )
+
+    assert packet.resume_strategy == ResumeStrategy(
+        priority_evidence_ids=(pack.evidence[0]["id"],),
+        priority_job_terms=("product analytics", "customer research"),
+    )
+
+    payload["resume_strategy"]["priority_job_terms"] = ["fabricated credential"]
+    with pytest.raises(ChatGPTContractError, match="absent from verified job text"):
+        material_packet_from_payload(
+            payload,
+            pack=pack,
+            candidate=candidate,
+            verified_job_text=candidate.description,
+        )
 
 
 def test_fact_ledger_context_excludes_identity_and_eeo_facts():
@@ -2017,7 +2075,7 @@ def test_verified_redirect_keeps_discovery_candidate_identity() -> None:
     assert result.freshness[0]["resolved_official_url"] == canonical
 
 
-def test_batch_holds_missing_freshness_dates_before_materials():
+def test_batch_accepts_live_application_surface_without_freshness_dates():
     candidate = role()
     pack = build_context_pack(PROFILE, job_text=candidate.description)
     evidence = fresh(candidate, posted_date=None, updated_date=None)
@@ -2032,12 +2090,11 @@ def test_batch_holds_missing_freshness_dates_before_materials():
         ),
     ).run(query="product analyst internships")
 
-    assert result.status == "no_eligible_verified_roles"
-    assert result.materials == []
-    assert any(
-        item.get("reason_codes") == ["freshness_dates_missing"]
-        for item in result.blockers
-    )
+    assert result.status == "review_ready"
+    assert result.materials
+    assert result.freshness[0]["reason_codes"] == [
+        "live_application_surface_without_dates"
+    ]
 
 
 def test_batch_fallback_runs_only_after_primary_failure():
@@ -2536,9 +2593,11 @@ def test_pre_campaign_status_and_heartbeat_are_fixed_name_and_redacted(
         "run_id": status["run_id"],
         "status": "candidate@example.com",
         "pending_requests": [],
-        "source_attempts": [],
-        "discoveries": [],
-            "eligibility": [],
+            "source_attempts": [],
+            "discoveries": [],
+            "routed_opportunities": [],
+            "decision_log": [],
+                "eligibility": [],
             "freshness": [],
             "rankings": [],
             "materials": [],

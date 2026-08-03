@@ -185,6 +185,8 @@ def candidate_profile_from_data(
         or (profile.get("availability") or {}).get("preferred_locations")
     )
     search_config = search_config or {}
+    preferences = profile.get("preferences") or {}
+    compensation = profile.get("compensation") or {}
     target_text = " ".join(
         str(part or "")
         for part in (
@@ -226,6 +228,16 @@ def candidate_profile_from_data(
         ),
         preferred_locations=locations,
         target_families=target_families or CandidateProfile.target_families,
+        preferred_companies=_string_tuple(preferences.get("target_companies")),
+        minimum_annual_compensation_usd=_usd_compensation_value(
+            compensation.get("salary_range_min"),
+            currency=compensation.get("salary_currency"),
+        ),
+        minimum_hourly_compensation_usd=_usd_compensation_value(
+            compensation.get("hourly_rate_min"),
+            currency=compensation.get("salary_currency"),
+            allow_decimal=True,
+        ),
         skills=skills,
         education_evidence=education_evidence,
         legally_authorized_to_work=_safe_bool(
@@ -253,8 +265,13 @@ def build_discovery_prompt(
     those implementations as a large JSON protocol.
     """
     objective = _clean_prompt_text(query) or "Find suitable currently open early-career roles."
-    candidate_lines = _discovery_candidate_summary(_discovery_candidate_context(pack)["profile"])
+    discovery_profile = _discovery_candidate_context(pack)["profile"]
+    candidate_lines = _discovery_candidate_summary(discovery_profile)
     candidate_summary = "\n".join(f"- {line}" for line in candidate_lines)
+    accepted_families = _discovery_role_family_summary(
+        discovery_profile,
+        objective=objective,
+    )
     reference_instruction = (
         f"\n\nEnd the answer with `Reference: {request_id}` so ApplyPilot can bind the "
         "reply to this search."
@@ -277,6 +294,9 @@ Use the meaning of the work, not only exact title keywords. Consider the person'
 background, transferable capabilities, trajectory, and preferences. Include adjacent
 early-career titles when the actual responsibilities fit. Favor paid internships, co-ops,
 apprenticeships, fellowships, new-graduate, and other explicit early-career opportunities.
+The deterministic eligibility gate accepts these role families: {accepted_families}.
+Return a role only when its title or stated responsibilities clearly fit at least one accepted
+family. A generic internship, analyst, associate, sales, or talent-pool title is not enough.
 
 ## Research boundaries
 
@@ -287,20 +307,43 @@ apprenticeships, fellowships, new-graduate, and other explicit early-career oppo
   clearly senior, closed, unpaid, or incompatible roles.
 - Do not research the person, their projects, academic papers, news, or general company
   background. The candidate snapshot is the complete matching context.
-- If a site blocks you, move to another employer or official index instead of stopping.
+- If a site blocks you, move to another employer or official index when useful.
+- Exclude task marketplaces, annotation/rating piecework, freelance profiles, assessments,
+  talent-network signups, and pages that do not represent a defined employment requisition.
 
 ## How to answer
 
 Respond in ordinary language with a concise numbered list, not JSON. Start each item with
 `Role title — Company`, then give the location, official posting URL, and one or two
 source-backed sentences explaining the work and why it is a plausible semantic match. Add
-posting, start, or experience details only when the source states them. Say when a detail is
-not stated rather than guessing.
+posting, compensation, start, or experience details only when the source states them. Say
+when a detail is not stated rather than guessing.
 
-Return the useful roles you can verify even if there are fewer than {max(1, limit)}. Do not
-pad the list with weak matches or return an empty placeholder while viable search routes
-remain.{reference_instruction}
+Return only the useful roles you can verify, even if there are fewer than {max(1, limit)}.
+An empty numbered list with a short statement that no qualifying postings were found is a
+valid result. Never pad the list or relabel a gig, task, profile, talent pool, general-interest
+form, or speculative company lead as a posted role.{reference_instruction}
 """.strip()
+
+
+def _discovery_role_family_summary(profile: dict[str, Any], *, objective: str) -> str:
+    """Describe the same supported taxonomy used by deterministic eligibility."""
+    from applypilot.autonomy.matching import infer_target_families
+
+    target_role = _clean_prompt_text(profile.get("target_role"))
+    families = infer_target_families(f"{objective} {target_role}")
+    labels = {
+        "ai_product": "AI product and product management",
+        "data_analytics": "data and business analytics",
+        "growth_analytics": "growth and marketing analytics",
+        "technical_business": "technical business, strategy, and operations",
+        "venture": "venture and startup analysis",
+        "seo_analytics": "SEO and organic-search analytics",
+    }
+    accepted = [labels[family] for family in families if family in labels]
+    if accepted:
+        return "; ".join(accepted)
+    return "the explicit target direction and search objective only"
 
 
 def _discovery_candidate_summary(profile: dict[str, Any]) -> list[str]:
@@ -427,6 +470,8 @@ def build_material_prompt(
             "Do not refer to the applicant as the candidate, applicant, we, or our; write applicant assertions in first person so coverage is unambiguous.",
             "Keep applicant assertions as simple evidence-grounded sentences; put job requirements or role fit in separate sentences.",
             "Flag unsupported requirements as verification gaps.",
+            "Choose resume emphasis only from supplied applicant F ids and exact skills, responsibility, or domain phrases present in the verified job description.",
+            "Resume emphasis may prioritize existing evidence; it must not propose new bullets, claims, metrics, employers, dates, education, or credentials.",
             "Do not include phone, email, street address, salary, demographics, or passwords.",
             "Use no more than four short paragraphs and 450 words total.",
         ],
@@ -459,6 +504,10 @@ def build_material_prompt(
                 }
             ],
             "verification_gaps": ["string"],
+            "resume_strategy": {
+                "priority_evidence_ids": ["F01"],
+                "priority_job_terms": ["exact phrase from verified_description"],
+            },
         },
         "response_rule": "Return exactly one JSON object. No markdown or commentary.",
     }
@@ -920,6 +969,30 @@ def _safe_int(value: Any, *, default: int) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def _usd_compensation_value(
+    value: Any,
+    *,
+    currency: Any,
+    allow_decimal: bool = False,
+) -> int | float | None:
+    """Parse an explicit local USD floor without exposing it to model context."""
+    normalized_currency = str(currency or "USD").strip().upper()
+    if normalized_currency not in {"USD", "$", "US$"}:
+        return None
+    match = re.fullmatch(
+        r"\s*\$?\s*(\d[\d,]*(?:\.\d+)?)\s*([kK])?\s*",
+        str(value or ""),
+    )
+    if not match:
+        return None
+    amount = float(match.group(1).replace(",", ""))
+    if match.group(2):
+        amount *= 1_000
+    if amount <= 0:
+        return None
+    return round(amount, 2) if allow_decimal else int(amount)
 
 
 def _safe_bool(value: Any) -> bool | None:

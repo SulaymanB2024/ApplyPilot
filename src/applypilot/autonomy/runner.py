@@ -78,6 +78,8 @@ RUN_RESULT_LIST_FIELDS = frozenset(
         "pending_requests",
         "source_attempts",
         "discoveries",
+        "routed_opportunities",
+        "decision_log",
         "eligibility",
         "freshness",
         "rankings",
@@ -1407,6 +1409,7 @@ def _validate_discovery_request(
         "fact_digest": request_id_payload["fact_digest"],
         "context_digest": request_id_payload["context_digest"],
         "policy_digest": request_id_payload["policy_digest"],
+        "surface": "chatgpt_web",
         "response_path": "handoff/discovery.response.json",
     }
     mismatches = [key for key, value in expected.items() if request.get(key) != value]

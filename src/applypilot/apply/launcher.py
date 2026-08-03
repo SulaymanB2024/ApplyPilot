@@ -457,6 +457,8 @@ def _run_deterministic_job(
             {
                 "mode": "deterministic_controller",
                 "codex_fallback_model": settings.executor_model,
+                "codex_fallback_effort": settings.executor_effort,
+                "codex_service_tier": settings.model_service_tier,
                 "dry_run": dry_run,
                 "job_url": job.get("application_url") or job.get("url"),
                 "account_creation_allowed": settings.allow_account_creation,
@@ -509,7 +511,8 @@ def _run_deterministic_job(
             f"\n{'=' * 60}\n"
             f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {job['title']} @ {job.get('site', '')}\n"
             f"URL: {job.get('application_url') or job['url']}\n"
-            f"Agent: deterministic-controller / {settings.executor_model}\n"
+            f"Agent: deterministic-controller / {settings.executor_model} / "
+            f"{settings.executor_effort}\n"
             f"Contract: {contract_path}\n"
             f"Result: {status}\n"
             f"Artifacts: {json.dumps(result.artifacts, indent=2)}\n"
@@ -644,6 +647,8 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             "codex",
             "exec",
             "--model", settings.executor_model,
+            "-c", f'model_reasoning_effort="{settings.executor_effort}"',
+            "-c", f'service_tier="{settings.model_service_tier}"',
             "--sandbox", "read-only",
             "--ephemeral",
             "--cd", str(worker_dir),
@@ -663,8 +668,9 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         f"[{ts_header}] {job['title']} @ {job.get('site', '')}\n"
         f"URL: {job.get('application_url') or job['url']}\n"
         f"Score: {job.get('fit_score', 'N/A')}/10\n"
-        f"Agent: {settings.agent_backend} / {settings.executor_model}\n"
-        f"Supervisor: {settings.supervisor_model} ({settings.supervisor_poll_seconds}s poll)\n"
+        f"Agent: {settings.agent_backend} / {settings.executor_model} / {settings.executor_effort}\n"
+        f"Supervisor: {settings.supervisor_model} / {settings.supervisor_effort} "
+        f"({settings.supervisor_poll_seconds}s poll)\n"
         f"Contract: {contract_path}\n"
         f"{'=' * 60}\n"
     )

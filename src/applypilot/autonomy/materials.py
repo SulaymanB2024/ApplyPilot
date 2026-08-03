@@ -16,10 +16,30 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
+from applypilot.autonomy.models import ResumeStrategy
 
-def build_evidence_bound_resume(base_text: str, *, verified_job_text: str) -> tuple[str, dict[str, Any]]:
+
+def build_evidence_bound_resume(
+    base_text: str,
+    *,
+    verified_job_text: str,
+    resume_strategy: ResumeStrategy | None = None,
+    evidence_by_id: dict[str, str] | None = None,
+) -> tuple[str, dict[str, Any]]:
     source_lines = base_text.splitlines()
     job_tokens = _tokens(verified_job_text)
+    strategy = resume_strategy or ResumeStrategy()
+    evidence_by_id = evidence_by_id or {}
+    priority_terms = {
+        token
+        for term in strategy.priority_job_terms
+        for token in _tokens(term)
+    }
+    priority_evidence_tokens = {
+        token
+        for evidence_id in strategy.priority_evidence_ids
+        for token in _tokens(evidence_by_id.get(evidence_id, ""))
+    }
     output_lines = list(source_lines)
 
     index = 0
@@ -34,7 +54,12 @@ def build_evidence_bound_resume(base_text: str, *, verified_job_text: str) -> tu
         ranked_run = sorted(
             enumerate(original_run),
             key=lambda item: (
-                -len(_tokens(item[1]) & job_tokens),
+                -_line_relevance(
+                    item[1],
+                    job_tokens=job_tokens,
+                    priority_terms=priority_terms,
+                    priority_evidence_tokens=priority_evidence_tokens,
+                ),
                 item[0],
             ),
         )
@@ -57,6 +82,11 @@ def build_evidence_bound_resume(base_text: str, *, verified_job_text: str) -> tu
         "claims_added": False,
         "line_multiset_preserved": True,
         "line_order_changed": source_lines != output_lines,
+        "resume_strategy": {
+            "priority_evidence_ids": list(strategy.priority_evidence_ids),
+            "priority_job_terms": list(strategy.priority_job_terms),
+            "applied": bool(priority_terms or priority_evidence_tokens),
+        },
     }
     return output_text, provenance
 
@@ -66,6 +96,8 @@ def write_evidence_bound_resume(
     base_path: Path,
     output_dir: Path,
     verified_job_text: str,
+    resume_strategy: ResumeStrategy | None = None,
+    evidence_by_id: dict[str, str] | None = None,
     render_pdf: bool = True,
 ) -> dict[str, str]:
     """Write text, provenance, HTML, and best-effort PDF resume artifacts."""
@@ -73,6 +105,8 @@ def write_evidence_bound_resume(
     output_text, provenance = build_evidence_bound_resume(
         base_text,
         verified_job_text=verified_job_text,
+        resume_strategy=resume_strategy,
+        evidence_by_id=evidence_by_id,
     )
     output_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     output_dir.chmod(0o700)
@@ -125,6 +159,21 @@ def _tokens(value: str) -> set[str]:
         for token in re.findall(r"[a-z0-9][a-z0-9+#.-]{1,}", value.lower())
         if token not in {"and", "for", "from", "the", "this", "with"}
     }
+
+
+def _line_relevance(
+    line: str,
+    *,
+    job_tokens: set[str],
+    priority_terms: set[str],
+    priority_evidence_tokens: set[str],
+) -> int:
+    line_tokens = _tokens(line)
+    return (
+        len(line_tokens & job_tokens)
+        + 3 * len(line_tokens & priority_terms)
+        + 2 * len(line_tokens & priority_evidence_tokens)
+    )
 
 
 def _sha256(value: str) -> str:

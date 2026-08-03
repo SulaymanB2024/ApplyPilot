@@ -7,6 +7,8 @@ from datetime import datetime
 from enum import StrEnum
 from typing import AsyncIterator, Protocol
 
+from applypilot.employment import ApplicationSurface, OpportunityKind
+
 
 class SourceKind(StrEnum):
     CACHE = "cache"
@@ -96,6 +98,9 @@ class JobObservation:
     posted_at: str = ""
     verification_state: VerificationState = VerificationState.FIRST_PARTY_RESOLVED
     advanceable: bool = True
+    opportunity_kind: OpportunityKind = OpportunityKind.UNKNOWN
+    application_surface: ApplicationSurface = ApplicationSurface.UNKNOWN
+    routing_reasons: tuple[str, ...] = ()
     metadata: dict[str, str | int | float | bool | None] = field(default_factory=dict)
 
 
@@ -112,6 +117,9 @@ class CanonicalJob:
     posted_at: str
     verification_state: VerificationState
     advanceable: bool
+    opportunity_kind: OpportunityKind
+    application_surface: ApplicationSurface
+    routing_reasons: tuple[str, ...]
     observations: tuple[JobObservation, ...]
 
     @property

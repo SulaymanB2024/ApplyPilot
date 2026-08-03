@@ -10,7 +10,7 @@ import socket
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol
@@ -19,6 +19,11 @@ from urllib.parse import urlparse
 from applypilot import config
 from applypilot.autonomy.models import DateWindow, FreshnessEvidence, RoleCandidate
 from applypilot.autonomy.telemetry import UsageLedger
+from applypilot.employment import (
+    ApplicationSurface,
+    OpportunityKind,
+    classify_opportunity,
+)
 
 ATS_HOSTS = {
     "boards.greenhouse.io",
@@ -86,8 +91,8 @@ class TrustedFirstPartySource:
 class CachedFirstPartyVerifier:
     """Persist immutable verification evidence so resumptions do not refetch roles."""
 
-    SCHEMA_VERSION = "applypilot-first-party-cache-v3"
-    CACHE_NAMESPACE = "v3"
+    SCHEMA_VERSION = "applypilot-first-party-cache-v4"
+    CACHE_NAMESPACE = "v4"
 
     def __init__(self, delegate: Any, *, cache_dir: Path) -> None:
         self.delegate = delegate
@@ -142,6 +147,9 @@ def _freshness_to_cache(evidence: FreshnessEvidence) -> dict[str, Any]:
         "description": evidence.description,
         "evidence": list(evidence.evidence),
         "provider_error": evidence.provider_error,
+        "opportunity_kind": evidence.opportunity_kind.value,
+        "application_surface": evidence.application_surface.value,
+        "requisition_id": evidence.requisition_id,
     }
 
 
@@ -173,6 +181,13 @@ def _freshness_from_cache(raw: Any) -> FreshnessEvidence:
         description=str(raw.get("description") or ""),
         evidence=tuple(str(item) for item in (raw.get("evidence") or [])),
         provider_error=str(raw.get("provider_error") or ""),
+        opportunity_kind=OpportunityKind(
+            str(raw.get("opportunity_kind") or OpportunityKind.UNKNOWN.value)
+        ),
+        application_surface=ApplicationSurface(
+            str(raw.get("application_surface") or ApplicationSurface.UNKNOWN.value)
+        ),
+        requisition_id=str(raw.get("requisition_id") or ""),
     )
 
 
@@ -228,6 +243,28 @@ class FirstPartyVerifier:
     def verify(self, candidate: RoleCandidate) -> FreshnessEvidence:
         parsed = urlparse(candidate.official_url)
         host = (parsed.hostname or "").lower()
+        initial = classify_opportunity(
+            title=candidate.title,
+            description=candidate.description,
+            official_url=candidate.official_url,
+            application_surface=candidate.application_surface,
+            requisition_id=candidate.requisition_id,
+        )
+        if initial.kind in {
+            OpportunityKind.MARKETPLACE_GIG,
+            OpportunityKind.MICROTASK_PLATFORM,
+            OpportunityKind.ASSESSMENT_OR_PROFILE_SIGNUP,
+        }:
+            return FreshnessEvidence.now(
+                official_url=candidate.official_url,
+                first_party=False,
+                resolved=False,
+                open_state=None,
+                provider_error="non_employment_surface",
+                evidence=initial.reason_codes,
+                opportunity_kind=initial.kind,
+                application_surface=initial.application_surface,
+            )
         if (
             not _url_is_structurally_public(candidate.official_url)
             or any(marker in host for marker in DISALLOWED_HOST_MARKERS)
@@ -273,6 +310,18 @@ class FirstPartyVerifier:
                 provider_error=f"{type(exc).__name__}: {str(exc)[:160]}",
                 evidence=(f"host={host}",),
             )
+        classification = classify_opportunity(
+            title=result.title or candidate.title,
+            description=result.description or candidate.description,
+            official_url=result.official_url,
+            application_surface=result.application_surface,
+            requisition_id=result.requisition_id,
+        )
+        result = replace(
+            result,
+            opportunity_kind=classification.kind,
+            application_surface=classification.application_surface,
+        )
         self.ledger.record_event(
             stage="verification",
             operation="verify_first_party",
@@ -325,6 +374,8 @@ class FirstPartyVerifier:
             title=str(payload.get("title") or ""),
             description=description[:20_000],
             evidence=(f"greenhouse_job_id={payload.get('id')}",),
+            application_surface=ApplicationSurface.PROVIDER_REQUISITION,
+            requisition_id=str(payload.get("id") or ""),
         )
 
     def _verify_lever(self, candidate: RoleCandidate) -> FreshnessEvidence:
@@ -371,6 +422,8 @@ class FirstPartyVerifier:
             title=str(payload.get("text") or ""),
             description=description[:20_000],
             evidence=(f"lever_job_id={payload.get('id')}",),
+            application_surface=ApplicationSurface.PROVIDER_REQUISITION,
+            requisition_id=str(payload.get("id") or ""),
         )
 
     def _verify_workday(self, candidate: RoleCandidate) -> FreshnessEvidence:
@@ -451,6 +504,8 @@ class FirstPartyVerifier:
             title=title,
             description=description[:20_000],
             evidence=(f"workday_job_id={job_id}",),
+            application_surface=ApplicationSurface.PROVIDER_REQUISITION,
+            requisition_id=str(job_id),
         )
 
     def _verify_html(self, candidate: RoleCandidate, *, first_party: bool) -> FreshnessEvidence:
@@ -479,6 +534,7 @@ class FirstPartyVerifier:
         challenge = any(marker in lower for marker in CHALLENGE_MARKERS)
         closed = any(marker in lower for marker in CLOSED_MARKERS)
         title_match = _page_matches_title(response.text, candidate.title)
+        surface, surface_evidence = _html_application_surface(response.text)
         resolved = 200 <= response.status_code < 400 and not challenge and title_match
         open_state: bool | None = None if challenge else (False if closed else (True if resolved else None))
         return FreshnessEvidence.now(
@@ -492,7 +548,7 @@ class FirstPartyVerifier:
             status_code=response.status_code,
             title=candidate.title,
             description=_clean_text(response.text)[:20_000],
-            evidence=(f"http_status={response.status_code}",),
+            evidence=(f"http_status={response.status_code}", *surface_evidence),
             provider_error=(
                 "challenge_page"
                 if challenge
@@ -500,6 +556,7 @@ class FirstPartyVerifier:
                 if not title_match
                 else ""
             ),
+            application_surface=surface,
         )
 
     def _url_matches_candidate(self, company: str, url: str) -> bool:
@@ -683,6 +740,45 @@ def _extract_structured_date(page_text: str, key: str) -> date | None:
         re.I,
     )
     return _parse_api_date(match.group(1)) if match else None
+
+
+def _html_application_surface(
+    page_text: str,
+) -> tuple[ApplicationSurface, tuple[str, ...]]:
+    """Recognize explicit job/application evidence, never a title match alone."""
+    if re.search(
+        r'["\']@type["\']\s*:\s*["\']JobPosting["\']',
+        page_text,
+        re.IGNORECASE,
+    ):
+        return (
+            ApplicationSurface.JOB_POSTING_STRUCTURED_DATA,
+            ("structured_data_type=JobPosting",),
+        )
+    visible = _clean_text(page_text).casefold()
+    has_form = re.search(r"<form\b[^>]*>", page_text, re.IGNORECASE) is not None
+    if has_form and any(
+        marker in visible
+        for marker in (
+            "general application",
+            "general interest",
+            "register your interest",
+        )
+    ):
+        return ApplicationSurface.GENERAL_INTEREST_FORM, ("general_interest_form",)
+    if has_form and any(
+        marker in visible
+        for marker in ("apply now", "apply for this job", "submit application")
+    ):
+        return ApplicationSurface.JOB_APPLICATION_FORM, ("job_application_form",)
+    if re.search(
+        r'<(?:a|button)\b[^>]*(?:href=["\'][^"\']*(?:apply|application)[^"\']*["\'])?'
+        r"[^>]*>[^<]{0,80}\bapply(?: now| for this job)?\b",
+        page_text,
+        re.IGNORECASE,
+    ):
+        return ApplicationSurface.JOB_APPLICATION_FORM, ("job_apply_control",)
+    return ApplicationSurface.UNKNOWN, ()
 
 
 def _page_matches_title(page_text: str, title: str) -> bool:

@@ -79,7 +79,8 @@ def test_jobspy_normalization_requires_first_party_direct_url():
         )
     )
     assert resolved.verification_state is VerificationState.FIRST_PARTY_RESOLVED
-    assert resolved.advanceable is True
+    assert resolved.advanceable is False
+    assert resolved.opportunity_kind.value == "unknown"
     assert board_only.verification_state is VerificationState.BOARD_ONLY
     assert board_only.advanceable is False
 

@@ -230,6 +230,11 @@ def test_progressive_multi_lane_revision_and_operator_contract(monkeypatch, tmp_
         "verified": 0,
         "draft_ready": 0,
         "sent": 0,
+        "posted_job_leads": 0,
+        "general_interest_application_leads": 0,
+        "general_interest_application_completed": 0,
+        "speculative_outreach_leads": 0,
+        "speculative_outreach_completed": 0,
     }
 
     third = _import_portal(

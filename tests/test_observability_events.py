@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import stat
+import time
 
 import pytest
 
@@ -49,3 +50,15 @@ def test_two_journal_instances_share_one_sequence(tmp_path):
     first.emit(component="aggregation", phase="run", status="started")
     second.emit(component="aggregation", phase="run", status="heartbeat")
     assert [event.sequence for event in first.read()] == [1, 2]
+
+
+def test_reopened_journal_preserves_run_elapsed_time(tmp_path):
+    path = tmp_path / "events.ndjson"
+    first = EventJournal(path, run_id="agg-1")
+    first.emit(component="aggregation", phase="run", status="started")
+    time.sleep(0.02)
+
+    resumed = EventJournal(path, run_id="agg-1")
+    heartbeat = resumed.emit(component="aggregation", phase="run", status="heartbeat")
+
+    assert heartbeat.elapsed_ms >= 15

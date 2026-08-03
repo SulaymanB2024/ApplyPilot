@@ -18,6 +18,7 @@ class OpportunitySignal(StrEnum):
 
 class OpportunityRoute(StrEnum):
     POSTED_JOB = "posted_job"
+    GENERAL_INTEREST_APPLICATION = "general_interest_application"
     SPECULATIVE_OUTREACH = "speculative_outreach"
 
 
@@ -70,6 +71,7 @@ class OpportunityLead:
     funding_amount: str | None = None
     careers_url: str = ""
     posted_job_url: str = ""
+    general_application_url: str = ""
     open_role_count: int | None = None
     fit_hypothesis: str = ""
     contact_route: str = ""
@@ -119,6 +121,7 @@ class OpportunityLead:
             ),
             careers_url=str(payload.get("careers_url") or ""),
             posted_job_url=str(payload.get("posted_job_url") or ""),
+            general_application_url=str(payload.get("general_application_url") or ""),
             open_role_count=(
                 int(payload["open_role_count"])
                 if payload.get("open_role_count") is not None

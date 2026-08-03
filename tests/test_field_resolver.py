@@ -347,6 +347,8 @@ def test_codex_resolver_uses_current_exec_flags(monkeypatch, tmp_path):
         assert "--ask-for-approval" not in cmd
         assert 'approval_policy="never"' in cmd
         assert 'web_search="disabled"' in cmd
+        assert 'model_reasoning_effort="medium"' in cmd
+        assert 'service_tier="default"' in cmd
         assert "web_search=false" not in cmd
         assert "--dangerously-bypass-approvals-and-sandbox" not in cmd
         assert cmd[cmd.index("--sandbox") + 1] == "read-only"

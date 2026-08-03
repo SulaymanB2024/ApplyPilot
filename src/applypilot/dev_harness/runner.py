@@ -60,7 +60,10 @@ def create_plan(
         "mode": active_settings.mode,
         "models": {
             "worker": active_settings.worker_model,
+            "worker_effort": active_settings.worker_effort,
             "reviewer": active_settings.reviewer_model,
+            "reviewer_effort": active_settings.reviewer_effort,
+            "service_tier": active_settings.service_tier,
             "forbidden": list(active_settings.forbidden_models),
         },
         "allowed_files": list(files),
@@ -161,7 +164,11 @@ def create_worker_proposal(*, plan_path: Path, dry_run: bool = True) -> Path:
         "created_at": utc_timestamp(),
         "plan_path": str(plan_path),
         "mode": "dry-run",
-        "models": {"worker": plan["models"]["worker"]},
+        "models": {
+            "worker": plan["models"]["worker"],
+            "worker_effort": plan["models"]["worker_effort"],
+            "service_tier": plan["models"]["service_tier"],
+        },
         "summary": "Dry-run worker artifact created. No repository files were edited.",
         "touches_files": [],
         "proposed_changes": [],

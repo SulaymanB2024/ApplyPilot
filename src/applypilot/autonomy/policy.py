@@ -19,6 +19,12 @@ from applypilot.autonomy.models import (
     GateDecision,
     RoleCandidate,
 )
+from applypilot.employment import (
+    OpportunityKind,
+    classify_opportunity,
+    is_accepted_job_surface,
+    is_data_labeling_function,
+)
 
 
 @dataclass(frozen=True)
@@ -151,6 +157,40 @@ def eligibility_gate(candidate: RoleCandidate, profile: CandidateProfile) -> Gat
     reasons: list[str] = []
     evidence: list[str] = []
 
+    classification = classify_opportunity(
+        title=candidate.title,
+        description=candidate.description,
+        official_url=candidate.official_url,
+        application_surface=candidate.application_surface,
+        requisition_id=candidate.requisition_id,
+    )
+    if classification.kind in {
+        OpportunityKind.MARKETPLACE_GIG,
+        OpportunityKind.MICROTASK_PLATFORM,
+        OpportunityKind.ASSESSMENT_OR_PROFILE_SIGNUP,
+    }:
+        return GateDecision(
+            Decision.REJECT,
+            ("not_employment_requisition", *classification.reason_codes),
+            classification.evidence or (candidate.official_url,),
+        )
+    if classification.kind in {
+        OpportunityKind.GENERAL_INTEREST_APPLICATION,
+        OpportunityKind.SPECULATIVE_OUTREACH,
+    }:
+        return GateDecision(
+            Decision.REJECT,
+            ("separate_off_posting_route", classification.kind.value),
+            (candidate.official_url,),
+        )
+    labeling_function = is_data_labeling_function(candidate.title)
+    if labeling_function:
+        return GateDecision(
+            Decision.REJECT,
+            ("excluded_data_labeling_function",),
+            (labeling_function, candidate.title),
+        )
+
     senior_marker = senior_title_signal(candidate)
     if senior_marker or any(_phrase(title, marker) for marker in profile.excluded_levels):
         reasons.append("senior_title")
@@ -277,6 +317,26 @@ def freshness_gate(
     if evidence.open_state is None:
         return GateDecision(Decision.REVIEW, ("open_state_ambiguous",), evidence.evidence)
 
+    classification = classify_opportunity(
+        title=evidence.title,
+        description=evidence.description,
+        official_url=evidence.official_url,
+        application_surface=evidence.application_surface,
+        requisition_id=evidence.requisition_id,
+    )
+    if classification.kind is not OpportunityKind.POSTED_EMPLOYMENT:
+        return GateDecision(
+            Decision.REJECT,
+            ("not_verified_posted_employment", *classification.reason_codes),
+            classification.evidence or evidence.evidence,
+        )
+    if not is_accepted_job_surface(classification.application_surface):
+        return GateDecision(
+            Decision.REJECT,
+            ("job_application_surface_unverified",),
+            (classification.application_surface.value,),
+        )
+
     observed_date = evidence.updated_date or evidence.posted_date
     if observed_date and (current - observed_date).days > max_post_age_days:
         if not evidence.start_window or evidence.start_window.start <= current:
@@ -296,7 +356,11 @@ def freshness_gate(
                 ("first_party_open_current_cycle",),
                 evidence.evidence,
             )
-        return GateDecision(Decision.REVIEW, ("freshness_dates_missing",), evidence.evidence)
+        return GateDecision(
+            Decision.ACCEPT,
+            ("live_application_surface_without_dates",),
+            evidence.evidence,
+        )
     return GateDecision(Decision.ACCEPT, ("first_party_open_and_plausible",), evidence.evidence)
 
 

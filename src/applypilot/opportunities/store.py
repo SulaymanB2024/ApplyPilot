@@ -356,10 +356,24 @@ class OpportunityStore:
             draft_rows = self.connection.execute(
                 "SELECT status,COUNT(*) AS count FROM opportunity_draft_bindings GROUP BY status"
             ).fetchall()
+            route_rows = self.connection.execute(
+                "SELECT route,COUNT(*) AS count FROM opportunity_leads GROUP BY route"
+            ).fetchall()
+            routed_receipts = self.connection.execute(
+                "SELECT l.route,COUNT(*) AS count FROM opportunity_send_receipts r "
+                "JOIN opportunity_draft_bindings d ON d.draft_id=r.draft_id "
+                "JOIN opportunity_leads l ON l.lead_id=d.lead_id "
+                "WHERE r.status IN ('provider_accepted','submitted','sent','delivered','replied') "
+                "GROUP BY l.route"
+            ).fetchall()
         counts = {status.value: 0 for status in OpportunityStatus}
         for row in (*lead_rows, *draft_rows):
             counts[str(row["status"])] = counts.get(str(row["status"]), 0) + int(row["count"])
         counts["sent"] = self.sent_count()
+        for row in route_rows:
+            counts[f"{row['route']}_leads"] = int(row["count"])
+        for row in routed_receipts:
+            counts[f"{row['route']}_completed"] = int(row["count"])
         return counts
 
     def record_artifact(self, run_id: str, *, kind: str, path: Path, sha256: str) -> None:

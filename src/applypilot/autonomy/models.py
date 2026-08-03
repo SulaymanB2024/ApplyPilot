@@ -10,6 +10,8 @@ from enum import StrEnum
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
+from applypilot.employment import ApplicationSurface, OpportunityKind
+
 
 class Decision(StrEnum):
     """Machine-readable decision emitted by deterministic gates."""
@@ -67,6 +69,9 @@ class CandidateProfile:
         "venture",
         "seo_analytics",
     )
+    preferred_companies: tuple[str, ...] = ()
+    minimum_annual_compensation_usd: int | None = None
+    minimum_hourly_compensation_usd: float | None = None
     skills: tuple[str, ...] = ()
     education_evidence: tuple[str, ...] = ()
     commitments: tuple[DateWindow, ...] = ()
@@ -85,11 +90,15 @@ class RoleCandidate:
     source: str = "chatgpt_web"
     location: str = ""
     description: str = ""
+    compensation: str = ""
     required_experience_min: int | None = None
     required_experience_max: int | None = None
     posted_date: date | None = None
     start_window: DateWindow | None = None
     evidence: tuple[str, ...] = ()
+    opportunity_kind: OpportunityKind = OpportunityKind.UNKNOWN
+    application_surface: ApplicationSurface = ApplicationSurface.UNKNOWN
+    requisition_id: str = ""
     metadata: dict[str, Any] = field(default_factory=dict, compare=False)
 
     @property
@@ -141,6 +150,9 @@ class FreshnessEvidence:
     description: str = ""
     evidence: tuple[str, ...] = ()
     provider_error: str = ""
+    opportunity_kind: OpportunityKind = OpportunityKind.UNKNOWN
+    application_surface: ApplicationSurface = ApplicationSurface.UNKNOWN
+    requisition_id: str = ""
 
     @classmethod
     def now(cls, **kwargs: Any) -> FreshnessEvidence:
@@ -165,12 +177,21 @@ class MaterialParagraph:
 
 
 @dataclass(frozen=True)
+class ResumeStrategy:
+    """Bounded role-specific emphasis; it never authorizes new resume prose."""
+
+    priority_evidence_ids: tuple[str, ...] = ()
+    priority_job_terms: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class MaterialPacket:
     """Reviewable local material packet; never an external send."""
 
     candidate_id: str
     paragraphs: tuple[MaterialParagraph, ...]
     verification_gaps: tuple[str, ...] = ()
+    resume_strategy: ResumeStrategy = field(default_factory=ResumeStrategy)
     artifact_paths: dict[str, str] = field(default_factory=dict, compare=False)
     derived_applicant_claim_count: int = 0
 
@@ -184,6 +205,7 @@ class MaterialPacket:
             "candidate_id": self.candidate_id,
             "paragraphs": [asdict(paragraph) for paragraph in self.paragraphs],
             "verification_gaps": list(self.verification_gaps),
+            "resume_strategy": asdict(self.resume_strategy),
         }
         if self.derived_applicant_claim_count:
             payload["derived_applicant_claim_count"] = self.derived_applicant_claim_count
@@ -245,6 +267,8 @@ class BatchResult:
     pending_requests: list[dict[str, Any]] = field(default_factory=list)
     source_attempts: list[dict[str, Any]] = field(default_factory=list)
     discoveries: list[dict[str, Any]] = field(default_factory=list)
+    routed_opportunities: list[dict[str, Any]] = field(default_factory=list)
+    decision_log: list[dict[str, Any]] = field(default_factory=list)
     eligibility: list[dict[str, Any]] = field(default_factory=list)
     freshness: list[dict[str, Any]] = field(default_factory=list)
     rankings: list[dict[str, Any]] = field(default_factory=list)

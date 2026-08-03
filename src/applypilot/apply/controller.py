@@ -150,6 +150,8 @@ class DeterministicApplyController:
         self._resolver = (
             CodexResolver(
                 model=settings.executor_model,
+                reasoning_effort=settings.executor_effort,
+                service_tier=settings.model_service_tier,
                 worker_dir=worker_dir,
                 max_calls=settings.field_model_call_budget,
             )

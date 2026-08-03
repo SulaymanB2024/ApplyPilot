@@ -157,6 +157,37 @@ def verify_opportunity(
         return OpportunityDecision(OpportunityStatus.REJECTED, ("evidence_contract_invalid",))
 
     threshold = now.date() - timedelta(days=recent_days)
+    if lead.route is OpportunityRoute.GENERAL_INTEREST_APPLICATION:
+        if not lead.general_application_url or not _host_matches_company_or_ats(
+            lead.general_application_url,
+            company_domain,
+        ):
+            return OpportunityDecision(
+                OpportunityStatus.REJECTED,
+                ("general_application_url_unverified",),
+            )
+        exact_url = canonicalize_url(lead.general_application_url)
+        current_forms = [
+            item
+            for item in lead.evidence
+            if item.evidence_type == "general_interest_form"
+            and item.is_primary
+            and canonicalize_url(item.source_url) == exact_url
+            and (observed := _parse_observed(item.observed_at)) is not None
+            and threshold <= observed.date() <= now.date()
+        ]
+        if not current_forms:
+            return OpportunityDecision(
+                OpportunityStatus.NEEDS_CORROBORATION,
+                ("current_general_application_form_not_verified",),
+            )
+        return OpportunityDecision(
+            OpportunityStatus.VERIFIED,
+            ("current_first_party_general_application_form",),
+            signal_date=max(_parse_observed(item.observed_at) for item in current_forms)
+            .date()
+            .isoformat(),
+        )
     if lead.signal is OpportunitySignal.RECENT_FUNDING:
         primary = [
             item
@@ -454,6 +485,8 @@ def write_research_mission(
             "For a recent raise, return a dated company or investor source and an independent source.",
             "Treat SEC Form D as a financing notice, never proof of a completed raise.",
             "Open the official company site or first-party careers/ATS page before claiming active hiring.",
+            "When no fitting posting exists, prefer an official general-interest application form; record it as route general_interest_application with exact general_application_url and primary general_interest_form evidence.",
+            "If no application form exists, use speculative_outreach only with a verified public contact route; never relabel either route as a posted job.",
             "Do not use hidden endpoints, export cookies, bypass challenges, contact anyone, or apply.",
             "Return bounded structured claims and URLs; do not copy articles or page dumps.",
         ],

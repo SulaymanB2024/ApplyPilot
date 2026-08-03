@@ -60,6 +60,25 @@ def write_json(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload), encoding="utf-8")
 
 
+def test_workflow_migrates_role_quality_log_columns(tmp_path: Path) -> None:
+    path = tmp_path / "workflow.sqlite3"
+    WorkflowStore(path).close()
+    connection = sqlite3.connect(path)
+    for column in ("compensation", "quality_gaps_json", "score_components_json"):
+        connection.execute(f"ALTER TABLE workflow_candidates DROP COLUMN {column}")
+    connection.commit()
+    connection.close()
+
+    reopened = WorkflowStore(path)
+    columns = {
+        row["name"]
+        for row in reopened.connection.execute("PRAGMA table_info(workflow_candidates)")
+    }
+    reopened.close()
+
+    assert {"compensation", "quality_gaps_json", "score_components_json"} <= columns
+
+
 def prepared_store(tmp_path: Path) -> tuple[WorkflowStore, Path]:
     run_dir = tmp_path / "run"
     run_dir.mkdir()
@@ -95,6 +114,10 @@ def prepared_store(tmp_path: Path) -> tuple[WorkflowStore, Path]:
                     "location": "Austin, TX",
                     "description": "Python and SQL analytics internship.",
                     "source": "chatgpt_web",
+                    "record_type": "discovery_lead",
+                    "opportunity_kind": "posted_employment",
+                    "application_surface": "provider_requisition",
+                    "requisition_id": "123",
                 }
             ],
             "eligibility": [
@@ -180,7 +203,7 @@ def write_verified_cache(run_dir: Path, description: str) -> None:
         description="Python and SQL analytics internship.",
     )
     write_json(
-        run_dir / "verification" / f"{role.candidate_id}.v3.json",
+        run_dir / "verification" / f"{role.candidate_id}.v4.json",
         {
             "schema_version": CachedFirstPartyVerifier.SCHEMA_VERSION,
             "candidate_id": role.candidate_id,
@@ -199,6 +222,9 @@ def write_verified_cache(run_dir: Path, description: str) -> None:
                 "description": description,
                 "evidence": ["official posting rendered open"],
                 "provider_error": "",
+                "opportunity_kind": "posted_employment",
+                "application_surface": "provider_requisition",
+                "requisition_id": "123",
             },
         },
     )
@@ -382,10 +408,13 @@ def test_corrected_preapproval_result_can_reopen_excluded_candidate(
                         "title": "Business Analytics Intern",
                         "official_url": URL,
                         "location": "Austin, TX",
+                        "compensation": "$45-$55/hour",
                         "fit_score": 94,
                         "qualifies": True,
                         "inclusion_reasons": ["target role family: data_analytics"],
                         "exclusion_reasons": [],
+                        "quality_gaps": ["compensation range needs final review"],
+                        "score_components": {"role_family": 35, "compensation_disclosed": 2},
                     }
                 ],
                 "materials": [
@@ -404,6 +433,11 @@ def test_corrected_preapproval_result_can_reopen_excluded_candidate(
         )
         assert status["candidate_counts"] == {"materials_ready": 1}
         assert status["shortlist"][0]["candidate_id"] == CANDIDATE_ID
+        assert status["shortlist"][0]["compensation"] == "$45-$55/hour"
+        assert status["shortlist"][0]["quality_gaps"] == [
+            "compensation range needs final review"
+        ]
+        assert status["shortlist"][0]["score_components"]["role_family"] == 35
     finally:
         store.close()
 

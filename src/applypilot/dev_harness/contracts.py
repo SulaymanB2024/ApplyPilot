@@ -5,8 +5,11 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 
+from applypilot.model_routing import DEV_REVIEWER_ROUTE, DEV_WORKER_ROUTE
+
 HARNESS_VERSION = "applypilot-dev-harness-v1"
-DEFAULT_DEV_MODEL = "gpt-5.5"
+DEFAULT_DEV_MODEL = DEV_WORKER_ROUTE.requested_model
+DEFAULT_DEV_REVIEWER_MODEL = DEV_REVIEWER_ROUTE.requested_model
 DEFAULT_FORBIDDEN_MODELS = ("gpt-5.3-codex-spark",)
 
 DEFAULT_FORBIDDEN_BOUNDARIES = (
@@ -59,7 +62,22 @@ class DevHarnessSettings:
     reviewer_model: str = field(
         default_factory=lambda: os.environ.get(
             "APPLYPILOT_DEV_REVIEWER_MODEL",
-            os.environ.get("APPLYPILOT_SUPERVISOR_MODEL", DEFAULT_DEV_MODEL),
+            os.environ.get("APPLYPILOT_SUPERVISOR_MODEL", DEFAULT_DEV_REVIEWER_MODEL),
+        )
+    )
+    worker_effort: str = field(
+        default_factory=lambda: os.environ.get(
+            "APPLYPILOT_DEV_WORKER_EFFORT", DEV_WORKER_ROUTE.requested_effort
+        )
+    )
+    reviewer_effort: str = field(
+        default_factory=lambda: os.environ.get(
+            "APPLYPILOT_DEV_REVIEWER_EFFORT", DEV_REVIEWER_ROUTE.requested_effort
+        )
+    )
+    service_tier: str = field(
+        default_factory=lambda: os.environ.get(
+            "APPLYPILOT_DEV_SERVICE_TIER", DEV_WORKER_ROUTE.service_tier
         )
     )
     mode: str = field(default_factory=lambda: os.environ.get("APPLYPILOT_DEV_MODE", "dry-run"))
@@ -79,6 +97,11 @@ class DevHarnessSettings:
         for role, model in selected.items():
             if model.lower() in forbidden:
                 raise ValueError(f"{role} model is forbidden by APPLYPILOT_DEV_FORBIDDEN_MODELS: {model}")
+        allowed_efforts = {"low", "medium", "high", "xhigh", "max", "ultra"}
+        if self.worker_effort not in allowed_efforts or self.reviewer_effort not in allowed_efforts:
+            raise ValueError("development harness reasoning effort is invalid")
+        if self.service_tier not in {"default", "priority"}:
+            raise ValueError("development harness service tier is invalid")
 
 
 def load_settings() -> DevHarnessSettings:

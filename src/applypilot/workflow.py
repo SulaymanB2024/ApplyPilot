@@ -102,6 +102,11 @@ class WorkflowStore:
                 title TEXT NOT NULL DEFAULT '',
                 location TEXT NOT NULL DEFAULT '',
                 description TEXT NOT NULL DEFAULT '',
+                compensation TEXT NOT NULL DEFAULT '',
+                record_type TEXT NOT NULL DEFAULT 'discovery_lead',
+                opportunity_kind TEXT NOT NULL DEFAULT 'unknown',
+                application_surface TEXT NOT NULL DEFAULT 'unknown',
+                requisition_id TEXT NOT NULL DEFAULT '',
                 verified_description_digest TEXT NOT NULL DEFAULT '',
                 source TEXT NOT NULL DEFAULT '',
                 state TEXT NOT NULL,
@@ -112,6 +117,8 @@ class WorkflowStore:
                 fit_score INTEGER,
                 inclusion_reasons_json TEXT NOT NULL DEFAULT '[]',
                 exclusion_reasons_json TEXT NOT NULL DEFAULT '[]',
+                quality_gaps_json TEXT NOT NULL DEFAULT '[]',
+                score_components_json TEXT NOT NULL DEFAULT '{}',
                 material_paths_json TEXT NOT NULL DEFAULT '{}',
                 material_digest TEXT NOT NULL DEFAULT '',
                 form_review_json TEXT NOT NULL DEFAULT '{}',
@@ -211,11 +218,21 @@ class WorkflowStore:
                 "PRAGMA table_info(workflow_candidates)"
             ).fetchall()
         }
-        if "verified_description_digest" not in candidate_columns:
-            self.connection.execute(
-                "ALTER TABLE workflow_candidates ADD COLUMN "
-                "verified_description_digest TEXT NOT NULL DEFAULT ''"
-            )
+        candidate_column_defaults = {
+            "verified_description_digest": "TEXT NOT NULL DEFAULT ''",
+            "compensation": "TEXT NOT NULL DEFAULT ''",
+            "quality_gaps_json": "TEXT NOT NULL DEFAULT '[]'",
+            "score_components_json": "TEXT NOT NULL DEFAULT '{}'",
+            "record_type": "TEXT NOT NULL DEFAULT 'discovery_lead'",
+            "opportunity_kind": "TEXT NOT NULL DEFAULT 'unknown'",
+            "application_surface": "TEXT NOT NULL DEFAULT 'unknown'",
+            "requisition_id": "TEXT NOT NULL DEFAULT ''",
+        }
+        for column, declaration in candidate_column_defaults.items():
+            if column not in candidate_columns:
+                self.connection.execute(
+                    f"ALTER TABLE workflow_candidates ADD COLUMN {column} {declaration}"
+                )
         approval_columns = {
             str(row["name"])
             for row in self.connection.execute("PRAGMA table_info(workflow_approvals)").fetchall()
@@ -369,6 +386,8 @@ class WorkflowStore:
                     fit_score=int(item.get("fit_score") or 0),
                     inclusion_reasons_json=_json(item.get("inclusion_reasons") or []),
                     exclusion_reasons_json=_json(item.get("exclusion_reasons") or []),
+                    quality_gaps_json=_json(item.get("quality_gaps") or []),
+                    score_components_json=_json(item.get("score_components") or {}),
                 )
                 if not bool(item.get("qualifies")):
                     self._transition(run_id, candidate_id, "excluded", "ranking", item)
@@ -407,6 +426,12 @@ class WorkflowStore:
                     fit_score=int(item.get("fit_score") or 0),
                     inclusion_reasons_json=_json(item.get("inclusion_reasons") or []),
                     exclusion_reasons_json=_json(item.get("exclusion_reasons") or []),
+                    quality_gaps_json=_json(
+                        item.get("quality_gaps") or ranking.get("quality_gaps") or []
+                    ),
+                    score_components_json=_json(
+                        item.get("score_components") or ranking.get("score_components") or {}
+                    ),
                 )
                 self._transition(run_id, candidate_id, "materials_ready", "materials", item)
 
@@ -449,6 +474,7 @@ class WorkflowStore:
             "source_run_dir": run["source_run_dir"],
             "status": run["status"],
             "candidate_counts": {row["state"]: row["count"] for row in rows},
+            "record_counts": self._record_counts(run_id),
             "shortlist": self.shortlist(run_id, limit=10),
         }
 
@@ -556,6 +582,10 @@ class WorkflowStore:
                     source=row["source"],
                     location=row["location"],
                     description=row["description"],
+                    compensation=row["compensation"],
+                    opportunity_kind=row["opportunity_kind"],
+                    application_surface=row["application_surface"],
+                    requisition_id=row["requisition_id"],
                 )
                 decision = eligibility_gate(candidate, eligibility_profile)
                 self._update_candidate_fields(
@@ -589,10 +619,13 @@ class WorkflowStore:
             """
             SELECT candidate_id, company, title, canonical_url, location, state,
                    fit_score, inclusion_reasons_json, exclusion_reasons_json,
+                   quality_gaps_json, score_components_json, compensation,
+                   record_type, opportunity_kind, application_surface, requisition_id,
                    material_paths_json, form_review_json, outcome
             FROM workflow_candidates
             WHERE run_id = ? AND fit_score IS NOT NULL
               AND state IN ('verified', 'materials_ready', 'dry_run_ready', 'authorized')
+              AND opportunity_kind = 'posted_employment'
             ORDER BY fit_score DESC, candidate_id
             LIMIT ?
             """,
@@ -609,6 +642,13 @@ class WorkflowStore:
                 "fit_score": row["fit_score"],
                 "inclusion_reasons": json.loads(row["inclusion_reasons_json"]),
                 "exclusion_reasons": json.loads(row["exclusion_reasons_json"]),
+                "quality_gaps": json.loads(row["quality_gaps_json"]),
+                "score_components": json.loads(row["score_components_json"]),
+                "compensation": row["compensation"],
+                "record_type": row["record_type"],
+                "opportunity_kind": row["opportunity_kind"],
+                "application_surface": row["application_surface"],
+                "requisition_id": row["requisition_id"],
                 "material_paths": json.loads(row["material_paths_json"]),
                 "form_review": json.loads(row["form_review_json"]),
                 "outcome": row["outcome"],
@@ -1420,15 +1460,21 @@ class WorkflowStore:
             """
             INSERT INTO workflow_candidates(
                 run_id, candidate_id, canonical_url, company, title, location,
-                description, source, state, created_at, updated_at
-            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                description, compensation, source, record_type, opportunity_kind,
+                application_surface, requisition_id, state, created_at, updated_at
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(run_id, candidate_id) DO UPDATE SET
                 canonical_url = CASE WHEN excluded.canonical_url != '' THEN excluded.canonical_url ELSE canonical_url END,
                 company = CASE WHEN excluded.company != '' THEN excluded.company ELSE company END,
                 title = CASE WHEN excluded.title != '' THEN excluded.title ELSE title END,
                 location = CASE WHEN excluded.location != '' THEN excluded.location ELSE location END,
                 description = CASE WHEN excluded.description != '' THEN excluded.description ELSE description END,
+                compensation = CASE WHEN excluded.compensation != '' THEN excluded.compensation ELSE compensation END,
                 source = CASE WHEN excluded.source != '' THEN excluded.source ELSE source END,
+                record_type = CASE WHEN excluded.record_type != '' THEN excluded.record_type ELSE record_type END,
+                opportunity_kind = CASE WHEN excluded.opportunity_kind != '' THEN excluded.opportunity_kind ELSE opportunity_kind END,
+                application_surface = CASE WHEN excluded.application_surface != '' THEN excluded.application_surface ELSE application_surface END,
+                requisition_id = CASE WHEN excluded.requisition_id != '' THEN excluded.requisition_id ELSE requisition_id END,
                 updated_at = excluded.updated_at
             """,
             (
@@ -1439,12 +1485,25 @@ class WorkflowStore:
                 str(item.get("title") or ""),
                 str(item.get("location") or ""),
                 str(item.get("description") or ""),
+                str(item.get("compensation") or "")[:300],
                 str(item.get("source") or ""),
+                str(item.get("record_type") or ""),
+                str(item.get("opportunity_kind") or ""),
+                str(item.get("application_surface") or ""),
+                str(item.get("requisition_id") or "")[:300],
                 state,
                 now,
                 now,
             ),
         )
+
+    def _record_counts(self, run_id: str) -> dict[str, int]:
+        rows = self.connection.execute(
+            "SELECT record_type, COUNT(*) AS count FROM workflow_candidates "
+            "WHERE run_id = ? GROUP BY record_type ORDER BY record_type",
+            (run_id,),
+        ).fetchall()
+        return {str(row["record_type"]): int(row["count"]) for row in rows}
 
     def _ensure_candidate(self, run_id: str, candidate_id: str) -> None:
         if self.connection.execute(
@@ -1523,6 +1582,8 @@ class WorkflowStore:
             "fit_score",
             "inclusion_reasons_json",
             "exclusion_reasons_json",
+            "quality_gaps_json",
+            "score_components_json",
             "material_paths_json",
             "material_digest",
             "form_review_json",
@@ -1610,9 +1671,13 @@ class WorkflowStore:
             source=row["source"],
             location=row["location"],
             description=row["description"],
+            compensation=row["compensation"],
+            opportunity_kind=row["opportunity_kind"],
+            application_surface=row["application_surface"],
+            requisition_id=row["requisition_id"],
         )
         cache_dir = self._run_dir(run_id) / "verification"
-        cache_path = cache_dir / f"{role.candidate_id}.v3.json"
+        cache_path = cache_dir / f"{role.candidate_id}.v4.json"
         if cache_path.is_file():
             try:
                 evidence = CachedFirstPartyVerifier(None, cache_dir=cache_dir).verify(role)
@@ -1635,6 +1700,10 @@ class WorkflowStore:
                         "location": row["location"],
                         "description": evidence.description,
                         "source": row["source"],
+                        "record_type": "verified_job_evidence",
+                        "opportunity_kind": evidence.opportunity_kind.value,
+                        "application_surface": evidence.application_surface.value,
+                        "requisition_id": evidence.requisition_id,
                     },
                     state=row["state"],
                 )

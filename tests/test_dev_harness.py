@@ -21,6 +21,24 @@ def test_settings_reject_forbidden_worker_model(monkeypatch):
         load_settings()
 
 
+def test_settings_route_mechanical_worker_to_luna_and_review_to_terra(monkeypatch):
+    for name in (
+        "APPLYPILOT_DEV_WORKER_MODEL",
+        "APPLYPILOT_DEV_REVIEWER_MODEL",
+        "APPLYPILOT_DEV_WORKER_EFFORT",
+        "APPLYPILOT_DEV_REVIEWER_EFFORT",
+        "APPLYPILOT_EXECUTOR_MODEL",
+        "APPLYPILOT_SUPERVISOR_MODEL",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    settings = load_settings()
+
+    assert (settings.worker_model, settings.worker_effort) == ("gpt-5.6-luna", "medium")
+    assert (settings.reviewer_model, settings.reviewer_effort) == ("gpt-5.6-terra", "high")
+    assert settings.service_tier == "default"
+
+
 def test_create_plan_writes_bounded_prompt_packet(tmp_path):
     settings = DevHarnessSettings(worker_model="gpt-5.5", reviewer_model="gpt-5.5")
 

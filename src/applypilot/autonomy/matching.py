@@ -222,6 +222,9 @@ class FitAssessment:
     matched_skills: tuple[str, ...]
     inclusion_reasons: tuple[str, ...]
     exclusion_reasons: tuple[str, ...]
+    quality_gaps: tuple[str, ...]
+    score_components: tuple[tuple[str, int], ...]
+    compensation_annual_min_usd: int | None
 
     @property
     def qualifies(self) -> bool:
@@ -231,12 +234,16 @@ class FitAssessment:
 def infer_target_families(text: str) -> tuple[str, ...]:
     """Map an applicant objective to explicit supported role families."""
     normalized = normalize(text)
-    families = [
-        family
-        for family, markers in TARGET_FAMILY_HINTS.items()
-        if any(phrase_present(normalized, marker) for marker in markers)
-    ]
-    return tuple(families)
+    ranked: list[tuple[int, int, str]] = []
+    for order, (family, markers) in enumerate(TARGET_FAMILY_HINTS.items()):
+        positions = [
+            normalized.find(normalize(marker))
+            for marker in markers
+            if phrase_present(normalized, marker)
+        ]
+        if positions:
+            ranked.append((min(positions), order, family))
+    return tuple(family for _, _, family in sorted(ranked))
 
 
 def classify_role(candidate: RoleCandidate) -> tuple[str, ...]:
@@ -410,16 +417,21 @@ def assess_fit(
     )
     inclusion: list[str] = []
     exclusion: list[str] = []
-    score = 0
+    quality_gaps: list[str] = []
+    components: dict[str, int] = {}
 
     if matched_families:
-        score += 40
+        components["role_family"] = 35
         inclusion.append("target role family: " + ", ".join(matched_families))
+        first_family = profile.target_families[0] if profile.target_families else ""
+        if first_family and first_family in matched_families:
+            components["role_family_priority"] = 5
+            inclusion.append(f"highest-priority role family: {first_family}")
     else:
         exclusion.append("no supported target role family")
 
     if early_career_signal(candidate):
-        score += 20
+        components["early_career"] = 15
         inclusion.append("explicit internship or early-career signal")
     else:
         exclusion.append("no internship or early-career signal")
@@ -429,7 +441,7 @@ def assess_fit(
         profile.preferred_locations,
     )
     if location_match is True:
-        score += 15
+        components["location"] = 15
         inclusion.append(f"preferred location: {matched_location}")
     elif location_match is False:
         exclusion.append(f"location outside preferences: {candidate.location}")
@@ -445,11 +457,11 @@ def assess_fit(
         )
     )[:8]
     if matched_skills:
-        score += min(15, 5 + len(matched_skills) * 2)
+        components["skills"] = min(20, 8 + len(matched_skills) * 4)
         inclusion.append("confirmed skill overlap: " + ", ".join(matched_skills))
 
     if evidence.first_party and evidence.resolved and evidence.open_state is True:
-        score += 10
+        components["first_party_open"] = 10
         inclusion.append("first-party posting rendered open")
     else:
         exclusion.append("first-party open state not verified")
@@ -461,12 +473,50 @@ def assess_fit(
     if out_of_scope:
         exclusion.append(f"out-of-scope function: {out_of_scope}")
 
+    preferred_company = next(
+        (
+            company
+            for company in profile.preferred_companies
+            if phrase_present(normalize(candidate.company), normalize(company))
+        ),
+        "",
+    )
+    if preferred_company:
+        components["preferred_company"] = 5
+        inclusion.append(f"preferred company: {preferred_company}")
+
+    compensation_range = annualized_compensation_usd(candidate.compensation)
+    compensation_min = compensation_range[0] if compensation_range else None
+    configured_floor = profile.minimum_annual_compensation_usd
+    if configured_floor is None and profile.minimum_hourly_compensation_usd is not None:
+        configured_floor = int(profile.minimum_hourly_compensation_usd * 2_080)
+    if compensation_range:
+        components["compensation_disclosed"] = 2
+        inclusion.append("compensation disclosed by source")
+        if configured_floor is not None:
+            if compensation_range[0] >= configured_floor:
+                components["compensation_floor"] = 5
+                inclusion.append("compensation meets configured local floor")
+            elif compensation_range[1] >= configured_floor:
+                components["compensation_floor"] = 2
+                components["compensation_partial_floor"] = -2
+                quality_gaps.append("compensation range only partially meets configured local floor")
+            else:
+                components["compensation_below_floor"] = -10
+                quality_gaps.append("compensation below configured local floor")
+    elif configured_floor is not None:
+        components["compensation_unknown"] = -2
+        quality_gaps.append("compensation not stated; configured local floor cannot be evaluated")
+
     return FitAssessment(
-        score=min(score, 100),
+        score=max(0, min(sum(components.values()), 100)),
         matched_families=matched_families,
         matched_skills=matched_skills,
         inclusion_reasons=tuple(inclusion),
         exclusion_reasons=tuple(dict.fromkeys(exclusion)),
+        quality_gaps=tuple(quality_gaps),
+        score_components=tuple(components.items()),
+        compensation_annual_min_usd=compensation_min,
     )
 
 
@@ -483,7 +533,51 @@ def preliminary_fit_score(candidate: RoleCandidate, profile: CandidateProfile) -
         score += 5
     if candidate.description:
         score += 10
+    if families and profile.target_families and profile.target_families[0] in families:
+        score += 5
+    if any(
+        phrase_present(normalize(candidate.company), normalize(company))
+        for company in profile.preferred_companies
+    ):
+        score += 5
+    if annualized_compensation_usd(candidate.compensation):
+        score += 2
     return score
+
+
+def annualized_compensation_usd(value: str) -> tuple[int, int] | None:
+    """Conservatively normalize an explicitly USD compensation string to annual bounds."""
+    text = value.strip().lower()
+    if not text or any(marker in text for marker in ("£", "€", " gbp", " eur", " cad", " aud")):
+        return None
+    if "$" not in text and "usd" not in text and "us dollar" not in text:
+        return None
+    matches = re.findall(r"(?<![a-z0-9])(\d[\d,]*(?:\.\d+)?)\s*([km])?", text)
+    amounts: list[float] = []
+    for raw, suffix in matches[:2]:
+        amount = float(raw.replace(",", ""))
+        if suffix == "k":
+            amount *= 1_000
+        elif suffix == "m":
+            amount *= 1_000_000
+        amounts.append(amount)
+    if not amounts:
+        return None
+    multiplier = 1.0
+    if re.search(r"(?:/|per\s+|an?\s+)(?:hour|hr)\b|\bhourly\b", text):
+        multiplier = 2_080
+    elif re.search(r"(?:/|per\s+)week\b|\bweekly\b", text):
+        multiplier = 52
+    elif re.search(r"(?:/|per\s+)month\b|\bmonthly\b", text):
+        multiplier = 12
+    elif not re.search(r"(?:/|per\s+)(?:year|yr)\b|\bannual(?:ly)?\b|\byearly\b", text):
+        if max(amounts) < 1_000:
+            return None
+    annualized = [int(round(amount * multiplier)) for amount in amounts]
+    if any(amount <= 0 or amount > 10_000_000 for amount in annualized):
+        return None
+    low, high = min(annualized), max(annualized)
+    return low, high
 
 
 def normalize(value: str) -> str:

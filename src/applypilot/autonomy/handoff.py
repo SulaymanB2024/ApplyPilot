@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import fcntl
+import re
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -37,8 +38,9 @@ from applypilot.observability.events import EventJournal
 HANDOFF_SCHEMA_VERSION = "applypilot.handoff.v1"
 HANDOFF_RECONCILIATION_SCHEMA_VERSION = "applypilot.handoff-reconciliation.v1"
 RUN_SCHEMA_VERSION = "applypilot.autonomy-run.v1"
-PROMPT_SCHEMA_VERSION = "applypilot.chatgpt-prompt.v7"
+PROMPT_SCHEMA_VERSION = "applypilot.chatgpt-prompt.v9"
 HANDOFF_QUEUE_LOCK_NAME = ".queue.lock"
+OBSERVED_MODEL_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9 ._:/+()-]{0,119}$")
 
 
 class ArtifactPending(RuntimeError):
@@ -574,6 +576,7 @@ class ArtifactChatGPTClient:
             "fact_digest": self.bindings.fact_digest,
             "context_digest": self.bindings.context_digest,
             "policy_digest": self.bindings.policy_digest,
+            "surface": "chatgpt_web",
             "prompt": prompt,
             "prompt_sha256": _sha256_text(prompt),
             "response_path": str(response_path.relative_to(self.run_dir)),
@@ -633,7 +636,9 @@ class ArtifactChatGPTClient:
                 phase="handoff_wait",
                 status="started",
                 surface="chatgpt_web_artifact",
-                detail={"kind": kind},
+                detail={
+                    "kind": kind,
+                },
             )
         return request_path, response_path
 
@@ -661,6 +666,7 @@ class ArtifactChatGPTClient:
             "fact_digest": self.bindings.fact_digest,
             "context_digest": self.bindings.context_digest,
             "policy_digest": self.bindings.policy_digest,
+            "surface": "chatgpt_web",
             "response_path": str(response_path.relative_to(self.run_dir)),
         }
         if any(request.get(key) != value for key, value in expected.items()):
@@ -700,6 +706,11 @@ class ArtifactChatGPTClient:
             or receipt.get("response_sha256") != _sha256_text(response)
         ):
             raise ValueError("consumed ChatGPT response receipt mismatch")
+        _observed_model_for_response(
+            response_path=response_path,
+            request_id=request_id,
+            response=response,
+        )
 
     def _exchange(
         self,
@@ -733,10 +744,16 @@ class ArtifactChatGPTClient:
             )
 
         response = response_path.read_text(encoding="utf-8")
+        observed_model = _observed_model_for_response(
+            response_path=response_path,
+            request_id=request_id,
+            response=response,
+        )
         receipt_path = response_path.with_name(
             response_path.name.replace(".response.json", ".receipt.json")
         )
         had_receipt = receipt_path.exists()
+        wait_ms = _request_wait_ms(request_path)
         recovered_rejection = _matching_rejected_response(response_path, response)
         if not had_receipt and recovered_rejection is None:
             self.ledger.reserve("model_calls")
@@ -775,10 +792,14 @@ class ArtifactChatGPTClient:
                 }
             _write_immutable_json(receipt_path, receipt)
         except Exception as exc:
-            if recovered_rejection is not None:
+            if recovered_rejection is not None or had_receipt:
                 self.ledger.record_event(
                     stage=stage,
-                    operation="revalidate_rejected_artifact",
+                    operation=(
+                        "revalidate_rejected_artifact"
+                        if recovered_rejection is not None
+                        else "replay_consumed_artifact"
+                    ),
                     surface="local_artifact_recovery",
                     status="error",
                     error_class=type(exc).__name__,
@@ -790,9 +811,10 @@ class ArtifactChatGPTClient:
                     surface="chatgpt_web_artifact",
                     request=bound_prompt,
                     response=response,
-                    duration_ms=0,
+                    duration_ms=wait_ms,
                     status="error",
                     error_class=type(exc).__name__,
+                    observed_model=observed_model,
                 )
             if not had_receipt and response_path.exists():
                 _quarantine_rejected_response(response_path, response)
@@ -804,6 +826,13 @@ class ArtifactChatGPTClient:
                 surface="local_artifact_recovery",
                 status="ok",
             )
+        elif had_receipt:
+            self.ledger.record_event(
+                stage=stage,
+                operation="replay_consumed_artifact",
+                surface="local_artifact_replay",
+                status="ok",
+            )
         else:
             self.ledger.record_model_exchange(
                 stage=stage,
@@ -811,7 +840,8 @@ class ArtifactChatGPTClient:
                 surface="chatgpt_web_artifact",
                 request=bound_prompt,
                 response=response,
-                duration_ms=0,
+                duration_ms=wait_ms,
+                observed_model=observed_model,
             )
         if not had_receipt:
             self.ledger.lifecycle(
@@ -821,13 +851,19 @@ class ArtifactChatGPTClient:
                 detail={
                     "kind": kind,
                     "output_chars": len(response),
-                    "wait_ms": _request_wait_ms(request_path),
+                    "wait_ms": wait_ms,
+                    "observed_model": observed_model,
                 },
             )
         return validated
 
 
-def import_response_artifact(*, request_path: Path, input_path: Path) -> dict[str, str]:
+def import_response_artifact(
+    *,
+    request_path: Path,
+    input_path: Path,
+    observed_model: str = "unobserved",
+) -> dict[str, str]:
     """Normalize and atomically import one browser-produced response."""
     if request_path.is_symlink():
         raise ValueError("handoff request must not be a symbolic link")
@@ -838,6 +874,7 @@ def import_response_artifact(*, request_path: Path, input_path: Path) -> dict[st
         raise ValueError("handoff request path is not active")
     run_dir = request_path.parent.parent.resolve()
     text = input_path.read_text(encoding="utf-8")
+    observed_model = _normalize_observed_model(observed_model)
 
     with _handoff_queue_lock(run_dir):
         request = _read_json_object(request_path)
@@ -875,6 +912,8 @@ def import_response_artifact(*, request_path: Path, input_path: Path) -> dict[st
         ):
             raise ValueError("handoff request is missing its run bindings")
         journal = EventJournal(run_dir / "events.ndjson", run_id=bindings.run_id)
+        existing_events = journal.read()
+        current_counts = dict(existing_events[-1].counts) if existing_events else {}
         surface = (
             "chatgpt_web_artifact"
             if expected_kind in {"role_candidates", "material_packet"}
@@ -885,13 +924,19 @@ def import_response_artifact(*, request_path: Path, input_path: Path) -> dict[st
             phase="handoff_response",
             status="imported",
             source=surface,
-            detail={"kind": expected_kind, "output_chars": len(text)},
+            counts=current_counts,
+            detail={
+                "kind": expected_kind,
+                "output_chars": len(text),
+                "observed_model": observed_model,
+            },
         )
         journal.emit(
             component="model_or_browser",
             phase="handoff_validation",
             status="started",
             source=surface,
+            counts=current_counts,
             detail={"kind": expected_kind},
         )
         if not target.exists():
@@ -947,6 +992,7 @@ def import_response_artifact(*, request_path: Path, input_path: Path) -> dict[st
                 phase="handoff_validation",
                 status="error",
                 source=surface,
+                counts=current_counts,
                 detail={"error_class": type(exc).__name__, "output_chars": len(text)},
             )
             _record_rejected_import(target, text, kind=expected_kind)
@@ -957,6 +1003,7 @@ def import_response_artifact(*, request_path: Path, input_path: Path) -> dict[st
             phase="handoff_validation",
             status="complete",
             source=surface,
+            counts=current_counts,
             detail={"kind": expected_kind, "output_chars": len(text)},
         )
 
@@ -967,12 +1014,57 @@ def import_response_artifact(*, request_path: Path, input_path: Path) -> dict[st
                 raise FileExistsError("a different response is already bound to this request")
         else:
             _atomic_write_text(target, canonical)
+        observation_path = _observation_path(target)
+        _write_immutable_json(
+            observation_path,
+            {
+                "schema_version": HANDOFF_SCHEMA_VERSION,
+                "request_id": request_id,
+                "response_sha256": _sha256_text(canonical),
+                "observed_model": observed_model,
+                "observation_scope": "visible_ui_label",
+            },
+        )
         return {
             "request_id": request_id,
             "request_path": str(request_path),
             "response_path": str(target),
             "response_sha256": _sha256_text(canonical),
+            "observed_model": observed_model,
         }
+
+
+def _normalize_observed_model(value: str) -> str:
+    normalized = re.sub(r"\s+", " ", str(value or "")).strip() or "unobserved"
+    if not OBSERVED_MODEL_RE.fullmatch(normalized):
+        raise ValueError("observed model label is invalid")
+    return normalized
+
+
+def _observation_path(response_path: Path) -> Path:
+    return response_path.with_name(
+        response_path.name.replace(".response.json", ".observation.json")
+    )
+
+
+def _observed_model_for_response(
+    *,
+    response_path: Path,
+    request_id: str,
+    response: str,
+) -> str:
+    observation_path = _observation_path(response_path)
+    if not observation_path.exists():
+        return "unobserved"
+    observation = _read_json_object(observation_path)
+    if (
+        observation.get("schema_version") != HANDOFF_SCHEMA_VERSION
+        or observation.get("request_id") != request_id
+        or observation.get("response_sha256") != _sha256_text(response)
+        or observation.get("observation_scope") != "visible_ui_label"
+    ):
+        raise ValueError("ChatGPT model observation binding mismatch")
+    return _normalize_observed_model(str(observation.get("observed_model") or ""))
 
 
 def _request_wait_ms(request_path: Path) -> int:
@@ -1021,12 +1113,26 @@ def _quarantine_rejected_response(path: Path, text: str) -> Path:
     rejected = path.with_name(
         path.name.replace(".response.json", f".rejected.{digest}.json")
     )
+    observation = _observation_path(path)
+    rejected_observation = path.parent / "observations" / (
+        rejected.name + ".observation.json"
+    )
     if rejected.exists():
         if rejected.read_text(encoding="utf-8") != text:
             raise FileExistsError("rejected response quarantine collision")
         path.unlink()
     else:
         os.replace(path, rejected)
+    if observation.exists():
+        if rejected_observation.exists():
+            if rejected_observation.read_text(encoding="utf-8") != observation.read_text(
+                encoding="utf-8"
+            ):
+                raise FileExistsError("rejected model observation quarantine collision")
+            observation.unlink()
+        else:
+            rejected_observation.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            os.replace(observation, rejected_observation)
     return rejected
 
 

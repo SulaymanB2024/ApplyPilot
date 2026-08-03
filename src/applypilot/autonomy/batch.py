@@ -30,6 +30,7 @@ from applypilot.autonomy.policy import (
     require_authorization,
 )
 from applypilot.autonomy.telemetry import BudgetExceeded, UsageLedger
+from applypilot.employment import OpportunityKind, classify_opportunity
 
 
 class DiscoveryTool(Protocol):
@@ -120,6 +121,46 @@ class AutonomousBatch:
             candidates = self._discover(query=query, attempts=attempts, result=result)
             accepted: list[RoleCandidate] = []
             for candidate in candidates:
+                classification = classify_opportunity(
+                    title=candidate.title,
+                    description=candidate.description,
+                    official_url=candidate.official_url,
+                    application_surface=candidate.application_surface,
+                    requisition_id=candidate.requisition_id,
+                )
+                if classification.kind in {
+                    OpportunityKind.GENERAL_INTEREST_APPLICATION,
+                    OpportunityKind.SPECULATIVE_OUTREACH,
+                }:
+                    result.routed_opportunities.append(
+                        {
+                            "candidate_id": candidate.candidate_id,
+                            "record_type": "routed_opportunity",
+                            "company": candidate.company,
+                            "title": candidate.title,
+                            "official_url": candidate.official_url,
+                            "opportunity_kind": classification.kind.value,
+                            "application_surface": classification.application_surface.value,
+                            "route": classification.kind.value,
+                            "reason_codes": list(classification.reason_codes),
+                            "workflow_action": "opportunity_research",
+                        }
+                    )
+                    result.decision_log.append(
+                        {
+                            "candidate_id": candidate.candidate_id,
+                            "stage": "route",
+                            "source": candidate.source,
+                            "opportunity_kind": classification.kind.value,
+                            "application_surface": classification.application_surface.value,
+                            "route": classification.kind.value,
+                            "admission_decision": "routed_separately",
+                            "rejection_reasons": [],
+                            "workflow_action": "opportunity_research",
+                            "receipt_status": "not_attempted",
+                        }
+                    )
+                    continue
                 decision = eligibility_gate(candidate, self.profile)
                 result.eligibility.append(
                     {
@@ -128,6 +169,28 @@ class AutonomousBatch:
                         "decision": decision.decision.value,
                         "reason_codes": list(decision.reason_codes),
                         "evidence": list(decision.evidence),
+                    }
+                )
+                result.decision_log.append(
+                    {
+                        "candidate_id": candidate.candidate_id,
+                        "stage": "eligibility",
+                        "source": candidate.source,
+                        "opportunity_kind": classification.kind.value,
+                        "application_surface": classification.application_surface.value,
+                        "route": "posted_job_verification",
+                        "admission_decision": decision.decision.value,
+                        "rejection_reasons": (
+                            list(decision.reason_codes)
+                            if decision.decision is not Decision.ACCEPT
+                            else []
+                        ),
+                        "workflow_action": (
+                            "first_party_verification"
+                            if decision.decision is Decision.ACCEPT
+                            else "none"
+                        ),
+                        "receipt_status": "not_attempted",
                     }
                 )
                 if decision.decision is Decision.ACCEPT:
@@ -170,6 +233,30 @@ class AutonomousBatch:
                         "official_url": evidence.official_url,
                         "title": evidence.title,
                         "description": evidence.description,
+                        "record_type": "verified_job_evidence",
+                        "opportunity_kind": evidence.opportunity_kind.value,
+                        "application_surface": evidence.application_surface.value,
+                        "requisition_id": evidence.requisition_id,
+                    }
+                )
+                result.decision_log.append(
+                    {
+                        "candidate_id": candidate.candidate_id,
+                        "stage": "first_party_verification",
+                        "source": candidate.source,
+                        "opportunity_kind": evidence.opportunity_kind.value,
+                        "application_surface": evidence.application_surface.value,
+                        "route": "posted_job",
+                        "admission_decision": decision.decision.value,
+                        "rejection_reasons": (
+                            list(decision.reason_codes)
+                            if decision.decision is not Decision.ACCEPT
+                            else []
+                        ),
+                        "workflow_action": (
+                            "fit_ranking" if decision.decision is Decision.ACCEPT else "none"
+                        ),
+                        "receipt_status": "not_attempted",
                     }
                 )
                 if decision.decision is Decision.ACCEPT:
@@ -179,6 +266,9 @@ class AutonomousBatch:
                         description=evidence.description or candidate.description,
                         posted_date=evidence.posted_date or candidate.posted_date,
                         start_window=evidence.start_window or candidate.start_window,
+                        opportunity_kind=evidence.opportunity_kind,
+                        application_surface=evidence.application_surface,
+                        requisition_id=evidence.requisition_id,
                     )
                     verified_eligibility = eligibility_gate(verified_candidate, self.profile)
                     result.eligibility.append(
@@ -201,13 +291,21 @@ class AutonomousBatch:
                                 "official_url": verified_candidate.official_url,
                                 "location": verified_candidate.location,
                                 "description": verified_candidate.description,
+                                "compensation": verified_candidate.compensation,
                                 "source": verified_candidate.source,
+                                "record_type": "verified_posted_job",
+                                "opportunity_kind": verified_candidate.opportunity_kind.value,
+                                "application_surface": verified_candidate.application_surface.value,
+                                "requisition_id": verified_candidate.requisition_id,
                                 "fit_score": fit.score,
                                 "qualifies": fit.qualifies,
                                 "matched_families": list(fit.matched_families),
                                 "matched_skills": list(fit.matched_skills),
                                 "inclusion_reasons": list(fit.inclusion_reasons),
                                 "exclusion_reasons": list(fit.exclusion_reasons),
+                                "quality_gaps": list(fit.quality_gaps),
+                                "score_components": dict(fit.score_components),
+                                "compensation_annual_min_usd": fit.compensation_annual_min_usd,
                             }
                         )
                         if fit.qualifies:
@@ -297,6 +395,7 @@ class AutonomousBatch:
                         candidate_id=packet.candidate_id,
                         paragraphs=packet.paragraphs,
                         verification_gaps=packet.verification_gaps,
+                        resume_strategy=packet.resume_strategy,
                         derived_applicant_claim_count=(
                             packet.derived_applicant_claim_count
                         ),
@@ -311,6 +410,8 @@ class AutonomousBatch:
                         "matched_skills": list(fit.matched_skills),
                         "inclusion_reasons": list(fit.inclusion_reasons),
                         "exclusion_reasons": list(fit.exclusion_reasons),
+                        "quality_gaps": list(fit.quality_gaps),
+                        "score_components": dict(fit.score_components),
                         "verification_gaps": list(packet.verification_gaps),
                         "derived_applicant_claim_count": (
                             packet.derived_applicant_claim_count
@@ -391,6 +492,20 @@ class AutonomousBatch:
                     action = self.dependencies.final_action.submit(candidate=candidate, packet=packet)
                     result.final_actions.append(
                         {"candidate_id": candidate.candidate_id, **_bounded_mapping(action)}
+                    )
+                    result.decision_log.append(
+                        {
+                            "candidate_id": candidate.candidate_id,
+                            "stage": "final_action",
+                            "source": candidate.source,
+                            "opportunity_kind": candidate.opportunity_kind.value,
+                            "application_surface": candidate.application_surface.value,
+                            "route": "posted_job",
+                            "admission_decision": "attempted",
+                            "rejection_reasons": [],
+                            "workflow_action": "submit_application",
+                            "receipt_status": str(action.get("status") or "missing"),
+                        }
                     )
                     if action.get("status") != "submitted_confirmed":
                         raise SubmissionUnconfirmed(
@@ -514,11 +629,38 @@ class AutonomousBatch:
                 "official_url": candidate.official_url,
                 "location": candidate.location,
                 "description": candidate.description,
+                "compensation": candidate.compensation,
                 "posted_date": candidate.posted_date.isoformat() if candidate.posted_date else None,
                 "source": candidate.source,
+                "record_type": "discovery_lead",
+                "opportunity_kind": candidate.opportunity_kind.value,
+                "application_surface": candidate.application_surface.value,
+                "requisition_id": candidate.requisition_id,
             }
             for candidate in candidates
         )
+        for candidate in candidates:
+            classification = classify_opportunity(
+                title=candidate.title,
+                description=candidate.description,
+                official_url=candidate.official_url,
+                application_surface=candidate.application_surface,
+                requisition_id=candidate.requisition_id,
+            )
+            result.decision_log.append(
+                {
+                    "candidate_id": candidate.candidate_id,
+                    "stage": "discovery",
+                    "source": candidate.source,
+                    "opportunity_kind": classification.kind.value,
+                    "application_surface": classification.application_surface.value,
+                    "route": "classification",
+                    "admission_decision": "observed_lead",
+                    "rejection_reasons": [],
+                    "workflow_action": "classify_before_fit",
+                    "receipt_status": "not_attempted",
+                }
+            )
         return candidates
 
     def _write_packet(
@@ -548,6 +690,7 @@ class AutonomousBatch:
                     "fit_score": score,
                     "paragraphs": [asdict(paragraph) for paragraph in packet.paragraphs],
                     "verification_gaps": list(packet.verification_gaps),
+                    "resume_strategy": asdict(packet.resume_strategy),
                     "derived_applicant_claim_count": (
                         packet.derived_applicant_claim_count
                     ),
@@ -565,6 +708,11 @@ class AutonomousBatch:
             base_path=config.RESUME_PATH,
             output_dir=run_dir,
             verified_job_text=verified_job_text,
+            resume_strategy=packet.resume_strategy,
+            evidence_by_id={
+                str(item["id"]): str(item["fact"])
+                for item in self.context_pack.evidence
+            },
         )
         return {
             "cover_letter": str(cover_path),

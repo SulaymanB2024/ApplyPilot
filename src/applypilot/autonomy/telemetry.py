@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from applypilot.autonomy.policy import FunnelBudget
+from applypilot.model_routing import ModelRoute
 from applypilot.observability.events import EventJournal
 
 
@@ -36,6 +37,12 @@ class UsageEvent:
     estimate_method: str = ""
     request_sha256: str = ""
     error_class: str = ""
+    requested_model: str = ""
+    requested_effort: str = ""
+    observed_model: str = ""
+    routing_reason: str = ""
+    service_tier: str = ""
+    fallback_reason: str = ""
 
 
 @dataclass
@@ -90,6 +97,9 @@ class UsageLedger:
         status: str = "ok",
         observed: dict[str, int] | None = None,
         error_class: str = "",
+        route: ModelRoute | None = None,
+        observed_model: str = "",
+        fallback_reason: str = "",
     ) -> None:
         """Record observed API usage or estimated Web usage."""
         self._check_elapsed()
@@ -115,6 +125,12 @@ class UsageLedger:
                 estimate_method="chars_div_4" if not observed else "observed_plus_chars_div_4",
                 request_sha256=hashlib.sha256(request.encode("utf-8")).hexdigest(),
                 error_class=error_class,
+                requested_model=route.requested_model if route else "",
+                requested_effort=route.requested_effort if route else "",
+                observed_model=observed_model,
+                routing_reason=route.routing_reason if route else "",
+                service_tier=route.service_tier if route else "",
+                fallback_reason=fallback_reason,
             )
         )
 
@@ -164,6 +180,7 @@ class UsageLedger:
                 phase=phase,
                 status=status,
                 source=surface,
+                counts=dict(self.counts),
                 detail=safe_detail,
             )
 

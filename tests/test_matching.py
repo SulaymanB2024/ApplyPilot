@@ -5,9 +5,13 @@ from datetime import datetime, timezone
 
 from applypilot.autonomy.context import candidate_profile_from_data
 from applypilot.autonomy.first_party import CachedFirstPartyVerifier
-from applypilot.autonomy.matching import assess_fit, location_preference_match
+from applypilot.autonomy.matching import (
+    annualized_compensation_usd,
+    assess_fit,
+    location_preference_match,
+)
 from applypilot.autonomy.materials import build_evidence_bound_resume
-from applypilot.autonomy.models import CandidateProfile, FreshnessEvidence, RoleCandidate
+from applypilot.autonomy.models import CandidateProfile, FreshnessEvidence, ResumeStrategy, RoleCandidate
 from applypilot.autonomy.policy import Decision, eligibility_gate
 
 
@@ -62,6 +66,32 @@ def test_missing_location_preferences_do_not_gain_defaults() -> None:
     )
 
     assert profile.preferred_locations == ()
+
+
+def test_target_role_wording_preserves_role_family_priority() -> None:
+    profile = candidate_profile_from_data(
+        {"experience": {"target_role": "venture first, then data analytics internships"}}
+    )
+
+    assert profile.target_families == ("venture", "data_analytics")
+
+
+def test_local_role_quality_preferences_include_company_and_compensation_floor() -> None:
+    profile = candidate_profile_from_data(
+        {
+            "experience": {"target_role": "data analytics internship"},
+            "preferences": {"target_companies": ["Example"]},
+            "compensation": {
+                "salary_currency": "USD",
+                "salary_range_min": "90,000",
+                "hourly_rate_min": "25.50",
+            },
+        }
+    )
+
+    assert profile.preferred_companies == ("Example",)
+    assert profile.minimum_annual_compensation_usd == 90_000
+    assert profile.minimum_hourly_compensation_usd == 25.5
 
 
 def test_location_state_names_and_postal_abbreviations_match() -> None:
@@ -408,6 +438,32 @@ def test_fit_score_has_human_readable_components() -> None:
     assert any("target role family" in reason for reason in fit.inclusion_reasons)
 
 
+def test_salary_aware_ranking_records_quality_without_turning_unknown_into_fact() -> None:
+    role = candidate(compensation="$45-$55/hour")
+    profile = CandidateProfile(
+        preferred_locations=("new york",),
+        target_families=("data_analytics",),
+        preferred_companies=("Example",),
+        minimum_annual_compensation_usd=90_000,
+        skills=("python", "sql"),
+    )
+
+    fit = assess_fit(role, evidence(role), profile)
+
+    assert annualized_compensation_usd(role.compensation) == (93_600, 114_400)
+    assert fit.compensation_annual_min_usd == 93_600
+    assert dict(fit.score_components)["compensation_floor"] == 5
+    assert any("preferred company" in reason for reason in fit.inclusion_reasons)
+    assert fit.quality_gaps == ()
+    assert annualized_compensation_usd("competitive") is None
+
+    below = candidate(compensation="$30 an hour")
+    below_fit = assess_fit(below, evidence(below), profile)
+    assert below_fit.score < fit.score
+    assert dict(below_fit.score_components)["compensation_below_floor"] == -10
+    assert below_fit.quality_gaps == ("compensation below configured local floor",)
+
+
 def test_first_party_cache_prevents_duplicate_fetches(tmp_path) -> None:
     role = candidate()
 
@@ -426,7 +482,7 @@ def test_first_party_cache_prevents_duplicate_fetches(tmp_path) -> None:
 
     assert first == second
     assert delegate.calls == 1
-    cache_path = tmp_path / "verification" / f"{role.candidate_id}.v3.json"
+    cache_path = tmp_path / "verification" / f"{role.candidate_id}.v4.json"
     assert cache_path.stat().st_mode & 0o777 == 0o600
 
 
@@ -454,3 +510,33 @@ def test_role_resume_only_reorders_exact_source_claims() -> None:
     assert provenance["claims_rewritten"] is False
     assert provenance["claims_added"] is False
     assert provenance["line_order_changed"] is True
+
+
+def test_role_resume_strategy_changes_emphasis_without_changing_claims() -> None:
+    source = "\n".join(
+        (
+            "TEST CANDIDATE",
+            "EXPERIENCE",
+            "Example Labs",
+            "• Built Python analytics dashboards.",
+            "• Conducted customer research interviews.",
+        )
+    )
+
+    output, provenance = build_evidence_bound_resume(
+        source,
+        verified_job_text="Use Python analytics and customer research to guide product decisions.",
+        resume_strategy=ResumeStrategy(
+            priority_evidence_ids=("F02",),
+            priority_job_terms=("customer research",),
+        ),
+        evidence_by_id={"F02": "Conducted customer research interviews."},
+    )
+
+    assert output.splitlines()[-2:] == [
+        "• Conducted customer research interviews.",
+        "• Built Python analytics dashboards.",
+    ]
+    assert Counter(output.splitlines()) == Counter(source.splitlines())
+    assert provenance["line_multiset_preserved"] is True
+    assert provenance["resume_strategy"]["applied"] is True

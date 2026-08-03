@@ -197,5 +197,5 @@ def test_exact_portal_identity_upgrade_aliases_without_fuzzy_merge(tmp_path):
     store.record_observation("agg-1", resolved)
     snapshot = store.snapshot("agg-1")
     assert snapshot["candidate_count"] == 1
-    assert snapshot["jobs"][0]["advanceable"] is True
+    assert snapshot["jobs"][0]["advanceable"] is False
     assert snapshot["jobs"][0]["source_count"] == 1

@@ -175,6 +175,52 @@ def _opportunity_data_paths() -> tuple[Path, Path]:
     return data_dir / "opportunities.sqlite3", run_dir
 
 
+def _ensure_off_posting_research(*, parent_run_id: str) -> dict[str, Any]:
+    """Idempotently route an empty posted-job funnel into company-level research."""
+    from applypilot import config
+    from applypilot.observability.events import EventJournal
+    from applypilot.opportunities.models import OpportunitySignal
+    from applypilot.opportunities.research import build_research_request, write_research_mission
+    from applypilot.opportunities.store import OpportunityStore
+
+    route_digest = hashlib.sha256(parent_run_id.encode("utf-8")).hexdigest()[:24]
+    run_id = f"offpost-{route_digest}"
+    database_path, run_root = _opportunity_data_paths()
+    with OpportunityStore(database_path) as store:
+        try:
+            existing = store.run_status(run_id)
+        except KeyError:
+            run_dir = run_root / run_id
+            run_dir.mkdir(parents=True, exist_ok=False, mode=0o700)
+            request = build_research_request(
+                run_id=run_id,
+                signals=(
+                    OpportunitySignal.ACTIVELY_HIRING,
+                    OpportunitySignal.GENERAL_GROWTH,
+                ),
+                recent_days=45,
+                profile=config.load_profile(),
+            )
+            journal = EventJournal(run_dir / "events.ndjson", run_id=run_id)
+            request_path = write_research_mission(
+                run_dir=run_dir,
+                request=request,
+                journal=journal,
+            )
+            store.start_run(run_id, request.to_dict(), request_path=request_path)
+            existing = store.run_status(run_id)
+    return {
+        "route_run_id": run_id,
+        "status": str(existing["status"]),
+        "request_path": str(existing["request_path"]),
+        "route_priority": [
+            "general_interest_application",
+            "speculative_outreach",
+        ],
+        "external_contact_attempted": False,
+    }
+
+
 def _build_aggregation_sources(
     *,
     source_names: list[str],
@@ -589,14 +635,14 @@ def show_opportunity(
 @opportunities_app.command("draft")
 def draft_opportunity_outreach(
     lead_id: str = typer.Argument(...),
-    channel: str = typer.Option("email", "--channel"),
+    channel: str = typer.Option("auto", "--channel"),
     sender: str = typer.Option("sybatx@gmail.com", "--sender"),
 ) -> None:
     """Create a local evidence-bound inquiry draft; never access a mailbox or send."""
     _bootstrap_config_only()
     from applypilot import config
     from applypilot.observability.events import EventJournal
-    from applypilot.opportunities.models import OpportunityLead
+    from applypilot.opportunities.models import OpportunityLead, OpportunityRoute
     from applypilot.opportunities.outreach import build_outreach_draft, persist_draft
     from applypilot.opportunities.store import OpportunityStore
 
@@ -605,6 +651,14 @@ def draft_opportunity_outreach(
         with OpportunityStore(database_path) as store:
             record = store.get_lead(lead_id)
             lead = OpportunityLead.from_dict(record["lead"])
+            selected_channel = (
+                "contact_form"
+                if channel == "auto"
+                and lead.route is OpportunityRoute.GENERAL_INTEREST_APPLICATION
+                else "email"
+                if channel == "auto"
+                else channel
+            )
             run = store.run_status(str(record["run_id"]))
             run_dir = Path(str(run["request_path"])).parent.parent
             journal = EventJournal(
@@ -614,13 +668,13 @@ def draft_opportunity_outreach(
                 component="outreach",
                 phase="draft_started",
                 status="started",
-                source=channel,
+                source=selected_channel,
                 counts={"item_count": 1},
             )
             draft = build_outreach_draft(
                 lead,
                 profile=config.load_profile(),
-                channel=channel,
+                channel=selected_channel,
                 sender=sender,
             )
             draft_path = persist_draft(
@@ -631,14 +685,14 @@ def draft_opportunity_outreach(
                 component="outreach",
                 phase="draft_validated",
                 status="complete",
-                source=channel,
+                source=selected_channel,
                 counts={"word_count": len(draft.body.split())},
             )
             journal.emit(
                 component="outreach",
                 phase="awaiting_authorization",
                 status="blocked",
-                source=channel,
+                source=selected_channel,
                 counts={"item_count": 1},
             )
         console.print_json(
@@ -684,7 +738,7 @@ def authorize_opportunity_outreach(
         help="Repeat exact LEAD_ID:DRAFT_ID:DRAFT_SHA256 bindings (1-10).",
     ),
     sender: str = typer.Option("sybatx@gmail.com", "--sender"),
-    channel: str = typer.Option("email", "--channel"),
+    channel: str = typer.Option("auto", "--channel"),
 ) -> None:
     """Mint one exact local grant only after explicit user approval of this batch."""
     from applypilot.opportunities.outreach import OutreachDraft
@@ -724,8 +778,17 @@ def authorize_opportunity_outreach(
                         "body_sha256": hashlib.sha256(draft.body.encode()).hexdigest(),
                     }
                 )
+            selected_channels = {draft.channel for draft in drafts}
+            if channel == "auto":
+                if len(selected_channels) != 1:
+                    raise ValueError(
+                        "automatic authorization requires drafts with one shared channel"
+                    )
+                selected_channel = next(iter(selected_channels))
+            else:
+                selected_channel = channel
             authorization = build_outreach_authorization(
-                tuple(drafts), sender=sender, channel=channel
+                tuple(drafts), sender=sender, channel=selected_channel
             )
             data_dir = database_path.parent
             path = write_outreach_authorization(
@@ -1101,6 +1164,11 @@ def aggregate_status(
             "verified": 0,
             "draft_ready": 0,
             "sent": 0,
+            "posted_job_leads": 0,
+            "general_interest_application_leads": 0,
+            "general_interest_application_completed": 0,
+            "speculative_outreach_leads": 0,
+            "speculative_outreach_completed": 0,
         }
         if opportunity_database.is_file() and not opportunity_database.is_symlink():
             from applypilot.opportunities.store import OpportunityStore
@@ -1447,6 +1515,11 @@ def prepare_workflow(
                 profile=profile,
                 fact_digest=fact_digest,
             )
+        off_posting_route = (
+            _ensure_off_posting_research(parent_run_id=status["run_id"])
+            if result.get("status") == "no_eligible_verified_roles"
+            else None
+        )
         console.print_json(
             data={
                 "run_id": status["run_id"],
@@ -1454,6 +1527,7 @@ def prepare_workflow(
                 "candidate_counts": status["candidate_counts"],
                 "shortlist": status["shortlist"],
                 "pending_requests": result.get("pending_requests") or [],
+                "off_posting_route": off_posting_route,
             }
         )
     except Exception as exc:
@@ -2211,6 +2285,11 @@ def autonomy_import_response(
         "--input",
         help="File containing ChatGPT's natural-language discovery reply or strict material JSON.",
     ),
+    observed_model: str = typer.Option(
+        "unobserved",
+        "--observed-model",
+        help="Exact visible ChatGPT model/provider label; use unobserved when the UI does not show one.",
+    ),
 ) -> None:
     """Normalize, validate, and atomically import one ChatGPT Web response."""
     _bootstrap_config_only()
@@ -2220,6 +2299,7 @@ def autonomy_import_response(
         result = import_response_artifact(
             request_path=request,
             input_path=input_path,
+            observed_model=observed_model,
         )
     except Exception as exc:
         console.print(

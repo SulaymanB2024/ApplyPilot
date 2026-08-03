@@ -14,6 +14,7 @@ from applypilot.aggregation.snapshot import SnapshotDiscovery
 from applypilot.aggregation.store import AggregationStore
 from applypilot.autonomy.models import FreshnessEvidence
 from applypilot.autonomy.runner import advance_artifact_run, prepare_run
+from applypilot.employment import ApplicationSurface, OpportunityKind
 
 
 QUERY = "product analytics internships in Austin"
@@ -36,6 +37,7 @@ def _snapshot(tmp_path):
                 official_url="https://jobs.example.com/123",
                 discovery_url="https://jobs.example.com/123",
                 description="Entry-level product analytics internship using Python and SQL.",
+                salary="$45-$55/hour",
                 observed_at=datetime.now(timezone.utc),
                 posted_at="2026-08-01",
             )
@@ -108,6 +110,7 @@ def test_snapshot_discovery_returns_only_advanceable_candidates(tmp_path):
     candidates = adapter.find_roles(pack=None, query=QUERY, limit=30)
     assert len(candidates) == 1
     assert candidates[0].source == "aggregation_snapshot"
+    assert candidates[0].compensation == "$45-$55/hour"
     assert candidates[0].metadata["aggregation_run_id"] == "agg-1"
     assert adapter.find_roles(pack=None, query=QUERY, limit=0) == []
 
@@ -155,6 +158,9 @@ class _Verifier:
             posted_date=candidate.posted_date,
             status_code=200,
             evidence=("fixture first-party response",),
+            opportunity_kind=OpportunityKind.POSTED_EMPLOYMENT,
+            application_surface=ApplicationSurface.PROVIDER_REQUISITION,
+            requisition_id="official-1",
         )
 
 

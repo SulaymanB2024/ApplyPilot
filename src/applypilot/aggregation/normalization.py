@@ -13,6 +13,12 @@ from applypilot.aggregation.models import (
     SourceKind,
     VerificationState,
 )
+from applypilot.employment import (
+    ApplicationSurface,
+    OpportunityKind,
+    classify_opportunity,
+    infer_application_surface,
+)
 from applypilot.workflow import WorkflowError, canonicalize_url
 
 _PORTAL_HOST_SUFFIXES = ("joinhandshake.com", "joinrunway.io")
@@ -76,6 +82,26 @@ def normalize_job(raw: RawJob) -> JobObservation:
         for key, value in list(raw.metadata.items())[:30]
         if value is None or isinstance(value, (str, int, float, bool))
     }
+    surface_hint = infer_application_surface(official_url or application_url)
+    if raw.source in {SourceKind.DIRECT_ATS, SourceKind.WORKDAY} and official_url:
+        surface_hint = ApplicationSurface.PROVIDER_REQUISITION
+    elif str(metadata.get("structured_data_type") or "").casefold() == "jobposting":
+        surface_hint = ApplicationSurface.JOB_POSTING_STRUCTURED_DATA
+    classification = classify_opportunity(
+        title=title,
+        description=raw.description,
+        official_url=official_url or application_url,
+        application_surface=surface_hint,
+        requisition_id=(
+            source_job_id
+            if surface_hint is ApplicationSurface.PROVIDER_REQUISITION
+            else ""
+        ),
+    )
+    advanceable = bool(
+        verification_state is VerificationState.FIRST_PARTY_RESOLVED
+        and classification.kind is OpportunityKind.POSTED_EMPLOYMENT
+    )
     return JobObservation(
         canonical_key=canonical_key,
         source=raw.source,
@@ -91,7 +117,10 @@ def normalize_job(raw: RawJob) -> JobObservation:
         salary=raw.salary.strip()[:300],
         posted_at=raw.posted_at.strip()[:80],
         verification_state=verification_state,
-        advanceable=verification_state is VerificationState.FIRST_PARTY_RESOLVED,
+        advanceable=advanceable,
+        opportunity_kind=classification.kind,
+        application_surface=classification.application_surface,
+        routing_reasons=classification.reason_codes,
         metadata=metadata,
     )
 
@@ -103,6 +132,14 @@ def merge_observations(observations: Iterable[JobObservation]) -> CanonicalJob:
         raise ValueError("merge requires observations for one canonical key")
     freshest = ordered[-1]
     advanceable = any(item.advanceable for item in ordered)
+    strongest = next(
+        (
+            item
+            for item in reversed(ordered)
+            if item.opportunity_kind is OpportunityKind.POSTED_EMPLOYMENT
+        ),
+        freshest,
+    )
     return CanonicalJob(
         canonical_key=freshest.canonical_key,
         title=freshest.title,
@@ -119,5 +156,8 @@ def merge_observations(observations: Iterable[JobObservation]) -> CanonicalJob:
             VerificationState.FIRST_PARTY_RESOLVED if advanceable else freshest.verification_state
         ),
         advanceable=advanceable,
+        opportunity_kind=strongest.opportunity_kind,
+        application_surface=strongest.application_surface,
+        routing_reasons=strongest.routing_reasons,
         observations=ordered,
     )

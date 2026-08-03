@@ -29,17 +29,23 @@ def test_claude_backend_keeps_lightweight_default_model():
     assert settings.executor_model == "haiku"
 
 
-def test_codex_backend_defaults_to_gpt55_and_supervisor(monkeypatch):
+def test_codex_backend_defaults_to_terra_routes(monkeypatch):
     monkeypatch.delenv("APPLYPILOT_ALLOW_ACCOUNT_CREATION", raising=False)
     monkeypatch.delenv("APPLYPILOT_EXECUTOR_MODEL", raising=False)
+    monkeypatch.delenv("APPLYPILOT_EXECUTOR_EFFORT", raising=False)
     monkeypatch.delenv("APPLYPILOT_FIELD_MODEL_CALL_BUDGET", raising=False)
     monkeypatch.delenv("APPLYPILOT_SUPERVISOR_MODEL", raising=False)
+    monkeypatch.delenv("APPLYPILOT_SUPERVISOR_EFFORT", raising=False)
+    monkeypatch.delenv("APPLYPILOT_MODEL_SERVICE_TIER", raising=False)
 
     settings = load_settings(agent_backend="codex")
 
     assert settings.agent_backend == "codex"
-    assert settings.executor_model == "gpt-5.5"
-    assert settings.supervisor_model == "gpt-5.5"
+    assert settings.executor_model == "gpt-5.6-terra"
+    assert settings.executor_effort == "medium"
+    assert settings.supervisor_model == "gpt-5.6-terra"
+    assert settings.supervisor_effort == "high"
+    assert settings.model_service_tier == "default"
     assert settings.deterministic_controller is True
     assert settings.allow_account_creation is False
     assert settings.credential_provider == "google_password_manager"

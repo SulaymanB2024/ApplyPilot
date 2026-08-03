@@ -97,6 +97,7 @@ def test_handoff_event_lifecycle_is_ordered_and_content_free(tmp_path):
     import_response_artifact(
         request_path=pending.value.request_path,
         input_path=response_input,
+        observed_model="ChatGPT",
     )
     assert len(client.find_roles(pack=pack, query=query, limit=1)) == 1
 
@@ -110,6 +111,24 @@ def test_handoff_event_lifecycle_is_ordered_and_content_free(tmp_path):
         ("handoff_wait", "complete"),
     ]
     assert events[-1].detail["output_chars"] > 0
+    exchange = next(event for event in client.ledger.events if event.operation == "find_roles")
+    assert exchange.requested_model == ""
+    assert exchange.requested_effort == ""
+    assert exchange.observed_model == "ChatGPT"
+    assert exchange.routing_reason == ""
+    assert exchange.duration_ms >= 0
+    assert events[-1].counts == {
+        "artifacts": 0,
+        "browser_navigations": 1,
+        "discoveries": 0,
+        "external_calls": 1,
+        "first_party_verifications": 0,
+        "form_dry_runs": 0,
+        "material_packets": 0,
+        "model_calls": 1,
+        "retries": 0,
+    }
+    assert events[-1].detail["observed_model"] == "ChatGPT"
     assert not any(
         fragment in key.lower()
         for event in events
@@ -205,7 +224,7 @@ Summary: This internship connects AI workflow research with product operations.
     assert "AI workflow research" in candidate.description
 
 
-def test_discovery_normalizer_rejects_empty_placeholder_but_keeps_legacy_parser():
+def test_discovery_normalizer_accepts_an_empty_verified_result():
     response = json.dumps(
         {
             "schema_version": "applypilot.chatgpt_web.v1",
@@ -215,8 +234,7 @@ def test_discovery_normalizer_rejects_empty_placeholder_but_keeps_legacy_parser(
     )
 
     assert parse_chatgpt_json(response, expected_kind="role_candidates")["items"] == []
-    with pytest.raises(ChatGPTContractError, match="no role candidates"):
-        parse_chatgpt_response(response, expected_kind="role_candidates")
+    assert parse_chatgpt_response(response, expected_kind="role_candidates")["items"] == []
 
 
 def test_natural_discovery_response_requires_matching_reference_when_bound():
@@ -272,6 +290,18 @@ Why it fits: The listing mentions product analytics.
         role_candidates_from_payload(payload, limit=5)
 
 
+def test_natural_discovery_rejects_careers_homepage_url():
+    response = """1. Product Analytics Intern — Example Systems
+Location: Austin, TX
+Official posting: https://careers.examplesystems.com/
+Why it fits: The careers homepage may contain analytics internships.
+"""
+    payload = parse_chatgpt_response(response, expected_kind="role_candidates")
+
+    with pytest.raises(ChatGPTContractError, match="official_url is not job-specific"):
+        role_candidates_from_payload(payload, limit=5)
+
+
 def test_natural_discovery_uses_labeled_official_url_over_discovery_citation():
     response = """1. Product Analytics Intern — Example Systems
 Discovery lead: https://www.linkedin.com/jobs/view/123
@@ -312,7 +342,9 @@ def test_artifact_handoff_binds_natural_response_to_internal_json(tmp_path):
             limit=5,
         )
     request = json.loads(pending.value.request_path.read_text(encoding="utf-8"))
-    assert request["prompt_schema_version"] == "applypilot.chatgpt-prompt.v7"
+    assert request["prompt_schema_version"] == "applypilot.chatgpt-prompt.v9"
+    assert request["surface"] == "chatgpt_web"
+    assert "model_route" not in request
     assert request["response_format"] == "natural_language_role_list"
     assert not request["prompt"].lstrip().startswith("{")
 

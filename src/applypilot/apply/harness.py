@@ -12,12 +12,15 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from applypilot.apply.google_passwords import PROVIDER_NAME as GOOGLE_PASSWORD_MANAGER
 from applypilot.apply.onepassword import DEFAULT_EXTENSION_ID
+from applypilot.model_routing import APPLY_FIELD_ROUTE, APPLY_SUPERVISOR_ROUTE
 
 
 AgentBackend = Literal["claude", "codex"]
 CredentialProvider = Literal["google_password_manager", "onepassword", "none"]
+ReasoningEffort = Literal["low", "medium", "high", "xhigh", "max", "ultra"]
+ServiceTier = Literal["default", "priority"]
 DEFAULT_CLAUDE_MODEL = "haiku"
-DEFAULT_CODEX_MODEL = "gpt-5.5"
+DEFAULT_CODEX_MODEL = APPLY_FIELD_ROUTE.requested_model
 
 
 class HarnessSettings(BaseSettings):
@@ -30,7 +33,10 @@ class HarnessSettings(BaseSettings):
 
     agent_backend: AgentBackend = "codex"
     executor_model: str = DEFAULT_CODEX_MODEL
-    supervisor_model: str = DEFAULT_CODEX_MODEL
+    executor_effort: ReasoningEffort = APPLY_FIELD_ROUTE.requested_effort
+    supervisor_model: str = APPLY_SUPERVISOR_ROUTE.requested_model
+    supervisor_effort: ReasoningEffort = APPLY_SUPERVISOR_ROUTE.requested_effort
+    model_service_tier: ServiceTier = APPLY_FIELD_ROUTE.service_tier
     supervisor_poll_seconds: int = Field(default=60, ge=5)
     deterministic_mode: bool = True
     deterministic_controller: bool = True
@@ -87,7 +93,10 @@ def prompt_header(settings: HarnessSettings) -> str:
     return f"""== APPLY HARNESS CONTRACT ==
 Executor backend: {settings.agent_backend}
 Executor model: {settings.executor_model}
+Executor effort: {settings.executor_effort}
 Supervisor model: {settings.supervisor_model}
+Supervisor effort: {settings.supervisor_effort}
+Model service tier: {settings.model_service_tier}
 Supervisor wait policy: sleep/poll every {settings.supervisor_poll_seconds}s until executor finishes or times out.
 Deterministic mode: {str(settings.deterministic_mode).lower()}
 Deterministic controller: {str(settings.deterministic_controller).lower()}
@@ -132,7 +141,10 @@ def write_contract(
         "cdp_port": port,
         "agent_backend": settings.agent_backend,
         "executor_model": settings.executor_model,
+        "executor_effort": settings.executor_effort,
         "supervisor_model": settings.supervisor_model,
+        "supervisor_effort": settings.supervisor_effort,
+        "model_service_tier": settings.model_service_tier,
         "supervisor_poll_seconds": settings.supervisor_poll_seconds,
         "deterministic_mode": settings.deterministic_mode,
         "deterministic_controller": settings.deterministic_controller,

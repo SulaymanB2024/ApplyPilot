@@ -20,9 +20,11 @@ from applypilot.autonomy.models import (
     DateWindow,
     MaterialPacket,
     MaterialParagraph,
+    ResumeStrategy,
     RoleCandidate,
 )
 from applypilot.autonomy.telemetry import BudgetExceeded, UsageLedger
+from applypilot.employment import classify_opportunity
 
 SCHEMA_VERSION = "applypilot.chatgpt_web.v1"
 TOP_LEVEL_KEYS = {
@@ -34,6 +36,7 @@ TOP_LEVEL_KEYS = {
         "candidate_id",
         "paragraphs",
         "verification_gaps",
+        "resume_strategy",
     },
 }
 ROLE_ITEM_KEYS = {
@@ -42,6 +45,7 @@ ROLE_ITEM_KEYS = {
     "official_url",
     "location",
     "description",
+    "compensation",
     "required_experience_min",
     "required_experience_max",
     "posted_date",
@@ -51,6 +55,7 @@ ROLE_ITEM_KEYS = {
 }
 MATERIAL_PARAGRAPH_KEYS = {"text", "evidence_ids", "applicant_claims"}
 APPLICANT_CLAIM_KEYS = {"text", "evidence_ids"}
+RESUME_STRATEGY_KEYS = {"priority_evidence_ids", "priority_job_terms"}
 DISALLOWED_DISCOVERY_HOSTS = (
     "linkedin.com",
     "indeed.com",
@@ -61,6 +66,8 @@ DISALLOWED_DISCOVERY_HOSTS = (
 MAX_MATERIAL_PARAGRAPHS = 4
 MAX_MATERIAL_WORDS = 450
 MAX_MATERIAL_CLAIMS = 20
+MAX_RESUME_EVIDENCE_IDS = 12
+MAX_RESUME_JOB_TERMS = 16
 DISCOVERY_URL_RE = re.compile(r"https?://[^\s<>'\"\])}]+", re.IGNORECASE)
 DISCOVERY_ENTRY_RE = re.compile(
     r"^\s*(?:#{1,6}\s*)?(?:\d{1,3}[.)]\s+|(?:role|opportunity)\s+\d{1,3}\s*[:.)-]\s+)",
@@ -225,6 +232,7 @@ class ChatGPTWebClient:
                 duration_ms=int((time.monotonic() - started) * 1000),
                 status="error",
                 error_class=type(exc).__name__,
+                observed_model="unobserved",
             )
             raise
         self.ledger.record_model_exchange(
@@ -234,6 +242,7 @@ class ChatGPTWebClient:
             request=prompt,
             response=response,
             duration_ms=int((time.monotonic() - started) * 1000),
+            observed_model="unobserved",
         )
         return payload
 
@@ -299,6 +308,10 @@ def role_candidates_from_payload(
         parsed = urlparse(official_url)
         if parsed.scheme not in {"http", "https"} or not parsed.hostname:
             raise ChatGPTContractError(f"invalid official_url for {company}: {official_url}")
+        if not parsed.path.strip("/"):
+            raise ChatGPTContractError(
+                f"official_url is not job-specific for {company}: {official_url}"
+            )
         host = parsed.hostname.lower()
         if any(host == blocked or host.endswith(f".{blocked}") for blocked in DISALLOWED_DISCOVERY_HOSTS):
             raise ChatGPTContractError(f"disallowed discovery host for {company}: {host}")
@@ -308,6 +321,11 @@ def role_candidates_from_payload(
         evidence = raw.get("evidence") or []
         if not isinstance(evidence, list):
             raise ChatGPTContractError("role candidate evidence must be a list")
+        classification = classify_opportunity(
+            title=title,
+            description=str(raw.get("description") or "")[:800],
+            official_url=official_url,
+        )
         candidates.append(
             RoleCandidate(
                 company=company,
@@ -316,11 +334,14 @@ def role_candidates_from_payload(
                 source="chatgpt_web",
                 location=str(raw.get("location") or "")[:240],
                 description=str(raw.get("description") or "")[:800],
+                compensation=str(raw.get("compensation") or "")[:300],
                 required_experience_min=_optional_int(raw.get("required_experience_min")),
                 required_experience_max=_optional_int(raw.get("required_experience_max")),
                 posted_date=_parse_date(raw.get("posted_date")),
                 start_window=start_window,
                 evidence=tuple(str(item)[:300] for item in evidence[:6]),
+                opportunity_kind=classification.kind,
+                application_surface=classification.application_surface,
             )
         )
     return candidates
@@ -345,6 +366,11 @@ def material_packet_from_payload(
     if not isinstance(raw_gaps, list):
         raise ChatGPTContractError("material verification_gaps must be a list")
     allowed_ids = {item["id"] for item in pack.evidence} | {"JOB"}
+    resume_strategy = _resume_strategy_from_payload(
+        payload.get("resume_strategy"),
+        allowed_evidence_ids=allowed_ids - {"JOB"},
+        verified_job_text=verified_job_text,
+    )
     paragraphs: list[MaterialParagraph] = []
     claim_count = 0
     derived_claim_count = 0
@@ -435,10 +461,56 @@ def material_packet_from_payload(
         verification_gaps=tuple(
             str(item)[:400] for item in raw_gaps[:10]
         ),
+        resume_strategy=resume_strategy,
         derived_applicant_claim_count=derived_claim_count,
     )
     validate_material_provenance(packet, pack=pack, candidate=candidate, job_text=verified_job_text)
     return packet
+
+
+def _resume_strategy_from_payload(
+    raw: Any,
+    *,
+    allowed_evidence_ids: set[str],
+    verified_job_text: str,
+) -> ResumeStrategy:
+    """Validate model-selected emphasis against applicant facts and verified job text."""
+    if raw in (None, {}):
+        return ResumeStrategy()
+    if not isinstance(raw, dict):
+        raise ChatGPTContractError("material resume_strategy must be an object")
+    _reject_extra_keys(raw, RESUME_STRATEGY_KEYS, surface="resume strategy")
+    raw_ids = raw.get("priority_evidence_ids") or []
+    raw_terms = raw.get("priority_job_terms") or []
+    if not isinstance(raw_ids, list) or not isinstance(raw_terms, list):
+        raise ChatGPTContractError("resume strategy values must be lists")
+    if len(raw_ids) > MAX_RESUME_EVIDENCE_IDS or len(raw_terms) > MAX_RESUME_JOB_TERMS:
+        raise ChatGPTContractError("resume strategy exceeds bounded item limits")
+    evidence_ids = tuple(dict.fromkeys(str(item) for item in raw_ids))
+    if not set(evidence_ids).issubset(allowed_evidence_ids):
+        raise ChatGPTContractError("resume strategy cites an unknown applicant fact")
+    normalized_job = _normalized_role_phrase(verified_job_text)
+    terms: list[str] = []
+    for item in raw_terms:
+        term = re.sub(r"\s+", " ", str(item)).strip()
+        normalized_term = _normalized_role_phrase(term)
+        if not 2 <= len(term) <= 80 or not normalized_term:
+            raise ChatGPTContractError("resume strategy contains an invalid job term")
+        if not re.search(
+            rf"(?<![a-z0-9+#]){re.escape(normalized_term)}(?![a-z0-9+#])",
+            normalized_job,
+        ):
+            raise ChatGPTContractError("resume strategy term is absent from verified job text")
+        if term.lower() not in {existing.lower() for existing in terms}:
+            terms.append(term)
+    return ResumeStrategy(
+        priority_evidence_ids=evidence_ids,
+        priority_job_terms=tuple(terms),
+    )
+
+
+def _normalized_role_phrase(value: str) -> str:
+    return re.sub(r"[^a-z0-9+#.-]+", " ", value.lower()).strip()
 
 
 def temporary_chat_is_active(page: Any) -> bool:
@@ -489,11 +561,6 @@ def parse_chatgpt_response(
         items = payload.get("items")
         if not isinstance(items, list):
             raise ChatGPTContractError("role_candidates.items must be a list")
-        if not items:
-            raise ChatGPTContractError(
-                "discovery response contained no role candidates; "
-                "return useful verified roles instead of an empty placeholder"
-            )
     return payload
 
 
@@ -517,7 +584,7 @@ def _parse_natural_discovery_response(text: str) -> dict[str, Any]:
         seen_urls.add(normalized_url)
         if len(items) >= 100:
             break
-    if not items:
+    if not items and not _explicit_empty_discovery(text):
         raise ChatGPTContractError(
             "could not identify any role title, company, and official URL "
             "from the natural-language discovery response"
@@ -538,6 +605,19 @@ def _parse_natural_discovery_response(text: str) -> dict[str, Any]:
     if reference:
         payload["request_id"] = reference.group(1)
     return payload
+
+
+def _explicit_empty_discovery(text: str) -> bool:
+    normalized = re.sub(r"\s+", " ", text).casefold()
+    return any(
+        marker in normalized
+        for marker in (
+            "no qualifying postings were found",
+            "no qualifying roles were found",
+            "no matching open roles were found",
+            "no verified roles were found",
+        )
+    )
 
 
 def _discovery_response_blocks(text: str) -> list[str]:
@@ -639,6 +719,7 @@ def _natural_role_item(block: str, official_url: str) -> dict[str, Any] | None:
         return None
 
     location = _discovery_field(block, ("location", "where"))
+    compensation = _discovery_field(block, ("compensation", "salary", "pay"))
     fit = _discovery_field(
         block,
         (
@@ -673,6 +754,7 @@ def _natural_role_item(block: str, official_url: str) -> dict[str, Any] | None:
         "official_url": official_url,
         "location": location[:240],
         "description": description[:800],
+        "compensation": compensation[:300],
         "required_experience_min": experience_min,
         "required_experience_max": experience_max,
         "posted_date": posted_date,
