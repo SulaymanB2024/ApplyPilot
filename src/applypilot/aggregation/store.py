@@ -131,6 +131,21 @@ class AggregationStore:
         with self._lock:
             self.connection.close()
 
+    def get_request(self, run_id: str) -> AggregationRequest:
+        run_id = _safe_id(run_id, field_name="aggregation run id")
+        with self._lock:
+            row = self.connection.execute(
+                "SELECT request_json FROM aggregation_runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"unknown aggregation run: {run_id}")
+        payload = json.loads(str(row["request_json"]))
+        payload["query_terms"] = tuple(payload.get("query_terms") or ())
+        payload["locations"] = tuple(payload.get("locations") or ())
+        request = AggregationRequest(**payload)
+        request.validate()
+        return request
+
     def start_run(self, run_id: str, request: AggregationRequest) -> None:
         run_id = _safe_id(run_id, field_name="aggregation run id")
         request.validate()

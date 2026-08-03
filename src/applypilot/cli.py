@@ -190,6 +190,48 @@ def _build_aggregation_sources(
     return sources
 
 
+def _launch_jobspy_enrichment(*, run_id: str, data_dir: Path, run_directory: Path) -> int:
+    """Launch the durable JobSpy manager without inheriting credentials or proxy settings."""
+    import subprocess
+    import sys
+
+    stdout_path = run_directory / "jobspy-manager.stdout.log"
+    stderr_path = run_directory / "jobspy-manager.stderr.log"
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+    stdout_descriptor = os.open(stdout_path, flags, 0o600)
+    stderr_descriptor = os.open(stderr_path, flags, 0o600)
+    stdout_handle = os.fdopen(stdout_descriptor, "wb")
+    stderr_handle = os.fdopen(stderr_descriptor, "wb")
+    environment = {
+        "PATH": f"{Path(sys.executable).parent}:/usr/bin:/bin",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PYTHONNOUSERSITE": "1",
+        "APPLYPILOT_DIR": str(data_dir),
+    }
+    try:
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "applypilot.cli",
+                "aggregate-enrich-jobspy",
+                "--run-id",
+                run_id,
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=stdout_handle,
+            stderr=stderr_handle,
+            env=environment,
+            start_new_session=True,
+            close_fds=True,
+        )
+    finally:
+        stdout_handle.close()
+        stderr_handle.close()
+    return int(process.pid)
+
+
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
@@ -416,6 +458,30 @@ def aggregate_jobs(
 
         snapshot = asyncio.run(execute())
         snapshot_path, _ = store.get_snapshot(run_id, int(snapshot["revision"]))
+        enrichment_state: dict[str, str] = {}
+        if "jobspy" in pending:
+            try:
+                _launch_jobspy_enrichment(
+                    run_id=run_id,
+                    data_dir=database_path.parent,
+                    run_directory=run_directory,
+                )
+                enrichment_state["jobspy"] = "started"
+                journal.emit(
+                    component="aggregation",
+                    phase="enrichment",
+                    status="started",
+                    source="jobspy",
+                )
+            except Exception as exc:
+                enrichment_state["jobspy"] = "launch_failed"
+                journal.emit(
+                    component="aggregation",
+                    phase="enrichment",
+                    status="launch_failed",
+                    source="jobspy",
+                    detail={"error_class": type(exc).__name__},
+                )
         console.print_json(
             data={
                 "run_id": run_id,
@@ -425,6 +491,7 @@ def aggregate_jobs(
                 "snapshot_path": str(snapshot_path),
                 "events_path": str(event_path),
                 "pending_enrichment": snapshot["pending_enrichment"],
+                "enrichment_state": enrichment_state,
             }
         )
     except Exception as exc:
@@ -473,6 +540,58 @@ def aggregate_status(
         )
     except Exception as exc:
         console.print(f"[red]Aggregation status failed:[/red] {type(exc).__name__}: {str(exc)[:240]}")
+        raise typer.Exit(code=1) from exc
+    finally:
+        if store is not None:
+            store.close()
+
+
+@app.command("aggregate-enrich-jobspy", hidden=True)
+def aggregate_enrich_jobspy(
+    run_id: str = typer.Option(..., "--run-id", help="Exact aggregation run ID."),
+) -> None:
+    """Run a previously declared JobSpy enrichment in a detached local manager."""
+    import asyncio
+
+    from applypilot.aggregation.sources.jobspy import enrich_jobspy_run
+    from applypilot.aggregation.store import AggregationStore
+    from applypilot.observability.events import EventJournal
+
+    store: Optional[AggregationStore] = None
+    try:
+        database_path, aggregation_runs, _ = _aggregation_data_paths()
+        run_directory = (aggregation_runs / run_id).resolve(strict=True)
+        if run_directory.parent != aggregation_runs.resolve() or run_directory.is_symlink():
+            raise ValueError("aggregation run directory is invalid")
+        store = AggregationStore(database_path, run_dir=aggregation_runs)
+        revision = store.latest_revision(run_id)
+        if revision < 1:
+            raise ValueError("JobSpy enrichment requires a published fast snapshot")
+        _, latest = store.get_snapshot(run_id, revision)
+        if "jobspy" not in (latest.get("pending_enrichment") or []):
+            raise ValueError("JobSpy enrichment is not pending for this run")
+        journal = EventJournal(run_directory / "events.ndjson", run_id=run_id)
+        snapshot = asyncio.run(
+            enrich_jobspy_run(
+                store=store,
+                journal=journal,
+                run_id=run_id,
+                request=store.get_request(run_id),
+                work_dir=run_directory / "jobspy",
+            )
+        )
+        console.print_json(
+            data={
+                "run_id": run_id,
+                "status": snapshot["status"],
+                "snapshot_revision": snapshot["revision"],
+                "candidate_count": snapshot["candidate_count"],
+            }
+        )
+    except Exception as exc:
+        console.print(
+            f"[red]JobSpy enrichment failed:[/red] {type(exc).__name__}: {str(exc)[:240]}"
+        )
         raise typer.Exit(code=1) from exc
     finally:
         if store is not None:

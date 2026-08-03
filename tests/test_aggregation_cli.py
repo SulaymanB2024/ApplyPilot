@@ -90,6 +90,7 @@ def test_aggregate_records_enrichment_without_delaying_revision_one(monkeypatch,
         "applypilot.cli._build_aggregation_sources",
         lambda **kwargs: [OneJobSource()],
     )
+    monkeypatch.setattr("applypilot.cli._launch_jobspy_enrichment", lambda **kwargs: 12345)
     result = runner.invoke(
         app,
         [
@@ -112,3 +113,4 @@ def test_aggregate_records_enrichment_without_delaying_revision_one(monkeypatch,
     assert payload["status"] == "partial"
     assert payload["snapshot_revision"] == 1
     assert payload["pending_enrichment"] == ["handshake", "jobspy"]
+    assert payload["enrichment_state"] == {"jobspy": "started"}

@@ -37,7 +37,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=7.0", "pytest-httpx>=0.35", "ruff>=0.1"]
 discovery = [
-    "python-jobspy>=1.1.82",
+    "python-jobspy==1.1.82",
     "markdownify>=0.11",
     "regex>=2023.0",
     "requests>=2.31",
