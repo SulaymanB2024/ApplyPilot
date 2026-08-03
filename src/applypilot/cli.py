@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -581,6 +582,249 @@ def show_opportunity(
     except Exception as exc:
         console.print(
             f"[red]Opportunity show failed:[/red] {type(exc).__name__}: {str(exc)[:240]}"
+        )
+        raise typer.Exit(code=1) from exc
+
+
+@opportunities_app.command("draft")
+def draft_opportunity_outreach(
+    lead_id: str = typer.Argument(...),
+    channel: str = typer.Option("email", "--channel"),
+    sender: str = typer.Option("sybatx@gmail.com", "--sender"),
+) -> None:
+    """Create a local evidence-bound inquiry draft; never access a mailbox or send."""
+    _bootstrap_config_only()
+    from applypilot import config
+    from applypilot.observability.events import EventJournal
+    from applypilot.opportunities.models import OpportunityLead
+    from applypilot.opportunities.outreach import build_outreach_draft, persist_draft
+    from applypilot.opportunities.store import OpportunityStore
+
+    database_path, _ = _opportunity_data_paths()
+    try:
+        with OpportunityStore(database_path) as store:
+            record = store.get_lead(lead_id)
+            lead = OpportunityLead.from_dict(record["lead"])
+            run = store.run_status(str(record["run_id"]))
+            run_dir = Path(str(run["request_path"])).parent.parent
+            journal = EventJournal(
+                run_dir / "events.ndjson", run_id=str(record["run_id"])
+            )
+            journal.emit(
+                component="outreach",
+                phase="draft_started",
+                status="started",
+                source=channel,
+                counts={"item_count": 1},
+            )
+            draft = build_outreach_draft(
+                lead,
+                profile=config.load_profile(),
+                channel=channel,
+                sender=sender,
+            )
+            draft_path = persist_draft(
+                run_dir / "outreach" / f"{draft.draft_id}.json", draft
+            )
+            store.persist_draft(draft, artifact_path=draft_path)
+            journal.emit(
+                component="outreach",
+                phase="draft_validated",
+                status="complete",
+                source=channel,
+                counts={"word_count": len(draft.body.split())},
+            )
+            journal.emit(
+                component="outreach",
+                phase="awaiting_authorization",
+                status="blocked",
+                source=channel,
+                counts={"item_count": 1},
+            )
+        console.print_json(
+            data={
+                "draft_id": draft.draft_id,
+                "lead_id": draft.lead_id,
+                "status": "draft_ready",
+                "draft_sha256": draft.sha256,
+                "draft_path": str(draft_path),
+                "external_contact_attempted": False,
+                "next_action": "review_exact_draft",
+            }
+        )
+    except Exception as exc:
+        console.print(
+            f"[red]Opportunity draft failed:[/red] {type(exc).__name__}: {str(exc)[:240]}"
+        )
+        raise typer.Exit(code=1) from exc
+
+
+@opportunities_app.command("review-draft")
+def review_opportunity_draft(draft_id: str = typer.Argument(...)) -> None:
+    """Print the exact local draft and all digest bindings for user review."""
+    from applypilot.opportunities.store import OpportunityStore
+
+    database_path, _ = _opportunity_data_paths()
+    try:
+        with OpportunityStore(database_path) as store:
+            record = store.get_draft(draft_id)
+        console.print_json(data=record)
+    except Exception as exc:
+        console.print(
+            f"[red]Draft review failed:[/red] {type(exc).__name__}: {str(exc)[:240]}"
+        )
+        raise typer.Exit(code=1) from exc
+
+
+@opportunities_app.command("authorize-outreach")
+def authorize_opportunity_outreach(
+    item: list[str] = typer.Option(
+        ...,
+        "--item",
+        help="Repeat exact LEAD_ID:DRAFT_ID:DRAFT_SHA256 bindings (1-10).",
+    ),
+    sender: str = typer.Option("sybatx@gmail.com", "--sender"),
+    channel: str = typer.Option("email", "--channel"),
+) -> None:
+    """Mint one exact local grant only after explicit user approval of this batch."""
+    from applypilot.opportunities.outreach import OutreachDraft
+    from applypilot.opportunities.send_handoff import (
+        build_outreach_authorization,
+        write_outreach_authorization,
+    )
+    from applypilot.opportunities.store import OpportunityStore
+
+    database_path, _ = _opportunity_data_paths()
+    try:
+        if not 1 <= len(item) <= 10:
+            raise ValueError("authorize-outreach requires 1 to 10 exact items")
+        bindings: list[tuple[str, str, str]] = []
+        for value in item:
+            parts = value.split(":")
+            if len(parts) != 3:
+                raise ValueError("each --item must be LEAD_ID:DRAFT_ID:DRAFT_SHA256")
+            bindings.append((parts[0], parts[1], parts[2]))
+        with OpportunityStore(database_path) as store:
+            drafts: list[OutreachDraft] = []
+            preview: list[dict[str, Any]] = []
+            for lead_id, draft_id, draft_sha256 in bindings:
+                record = store.get_draft(draft_id)
+                draft = OutreachDraft.from_dict(record["draft"])
+                if draft.lead_id != lead_id or draft.sha256 != draft_sha256:
+                    raise ValueError("exact outreach item differs from the stored draft")
+                drafts.append(draft)
+                preview.append(
+                    {
+                        "lead_id": lead_id,
+                        "draft_id": draft_id,
+                        "draft_sha256": draft.sha256,
+                        "recipient_display": draft.recipient,
+                        "subject": draft.subject,
+                        "attachment_digests": list(draft.attachment_digests),
+                        "body_sha256": hashlib.sha256(draft.body.encode()).hexdigest(),
+                    }
+                )
+            authorization = build_outreach_authorization(
+                tuple(drafts), sender=sender, channel=channel
+            )
+            data_dir = database_path.parent
+            path = write_outreach_authorization(
+                data_dir
+                / "outreach-authorizations"
+                / f"{authorization.authorization_id}.json",
+                authorization,
+            )
+            store.record_authorization(authorization, artifact_path=path)
+        console.print_json(
+            data={
+                "authorization_id": authorization.authorization_id,
+                "authorization_path": str(path),
+                "authorization_sha256": authorization.sha256,
+                "sender": authorization.sender,
+                "channel": authorization.channel,
+                "expires_at": authorization.expires_at,
+                "items": preview,
+                "status": "authorized_not_sent",
+                "external_contact_attempted": False,
+            }
+        )
+    except Exception as exc:
+        console.print(
+            f"[red]Outreach authorization failed:[/red] {type(exc).__name__}: {str(exc)[:240]}"
+        )
+        raise typer.Exit(code=1) from exc
+
+
+@opportunities_app.command("send")
+def queue_opportunity_send(
+    authorization: Path = typer.Option(..., "--authorization"),
+) -> None:
+    """Consume one exact grant and create a send handoff; this command has no provider adapter."""
+    from applypilot.observability.events import EventJournal
+    from applypilot.opportunities.send_handoff import (
+        load_outreach_authorization,
+        queue_send_handoff,
+    )
+    from applypilot.opportunities.store import OpportunityStore
+
+    database_path, _ = _opportunity_data_paths()
+    try:
+        grant = load_outreach_authorization(authorization)
+        run_dir = database_path.parent / "outreach-send-runs" / grant.authorization_id
+        journal = EventJournal(
+            run_dir / "events.ndjson", run_id=grant.authorization_id
+        )
+        with OpportunityStore(database_path) as store:
+            request_path = queue_send_handoff(
+                authorization_path=authorization,
+                store=store,
+                run_dir=run_dir,
+                journal=journal,
+            )
+        console.print_json(
+            data={
+                "authorization_id": grant.authorization_id,
+                "status": "send_handoff_queued",
+                "request_path": str(request_path),
+                "provider_call_performed": False,
+                "next_action": "service_exact_authenticated_outreach_handoff",
+            }
+        )
+    except Exception as exc:
+        console.print(
+            f"[red]Outreach send queue failed:[/red] {type(exc).__name__}: {str(exc)[:240]}"
+        )
+        raise typer.Exit(code=1) from exc
+
+
+@opportunities_app.command("send-import")
+def import_opportunity_send_result(
+    authorization_id: str = typer.Argument(...),
+    response: Optional[Path] = typer.Option(None, "--response"),
+) -> None:
+    """Import and record per-item provider outcomes without inferring delivery or reply."""
+    from applypilot.autonomy.handoff import import_response_artifact
+    from applypilot.observability.events import EventJournal
+    from applypilot.opportunities.send_handoff import consume_send_response
+    from applypilot.opportunities.store import OpportunityStore
+
+    database_path, _ = _opportunity_data_paths()
+    run_dir = database_path.parent / "outreach-send-runs" / authorization_id
+    request_path = run_dir / "handoff" / f"{authorization_id}.request.json"
+    try:
+        if response is not None:
+            import_response_artifact(request_path=request_path, input_path=response)
+        journal = EventJournal(run_dir / "events.ndjson", run_id=authorization_id)
+        with OpportunityStore(database_path) as store:
+            result = consume_send_response(
+                request_path=request_path,
+                store=store,
+                journal=journal,
+            )
+        console.print_json(data=result)
+    except Exception as exc:
+        console.print(
+            f"[red]Outreach send import failed:[/red] {type(exc).__name__}: {str(exc)[:240]}"
         )
         raise typer.Exit(code=1) from exc
 

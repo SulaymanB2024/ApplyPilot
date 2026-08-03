@@ -181,6 +181,7 @@ def _active_handoffs_unlocked(
         ("portal_discovery", "handshake_job_observations"): "browser_tool",
         ("portal_discovery", "runway_job_observations"): "browser_tool",
         ("opportunity_research", "startup_opportunities"): "browser_tool",
+        ("outreach", "outreach_send"): "browser_tool",
     }
     for request_path in sorted(handoff_dir.glob("*.request.json")):
         if request_path.is_symlink() or not request_path.is_file():
@@ -208,6 +209,7 @@ def _active_handoffs_unlocked(
             "handshake_job_observations",
             "runway_job_observations",
             "startup_opportunities",
+            "outreach_send",
         }
         if kind in candidate_free_kinds and candidate_id:
             raise ValueError("run-level handoff cannot bind a candidate")
@@ -221,6 +223,9 @@ def _active_handoffs_unlocked(
         }:
             if resource_lock != "authenticated_browser":
                 raise ValueError("browser mission is missing the authenticated browser lock")
+        elif kind == "outreach_send":
+            if resource_lock != "outbound_communication":
+                raise ValueError("outreach handoff is missing its outbound resource lock")
         elif resource_lock:
             raise ValueError("handoff resource lock is not supported for this kind")
         raw_response_path = run_dir / str(request.get("response_path") or "")
@@ -921,6 +926,10 @@ def import_response_artifact(*, request_path: Path, input_path: Path) -> dict[st
                 from applypilot.opportunities.research import validate_research_response
 
                 payload = validate_research_response(json.loads(text), request=request)
+            elif expected_kind == "outreach_send":
+                from applypilot.opportunities.send_handoff import validate_send_response
+
+                payload = validate_send_response(json.loads(text), request=request)
             else:
                 raise ValueError(f"unsupported handoff response kind: {expected_kind}")
             if expected_kind == "role_candidates":

@@ -29,9 +29,14 @@ class OpportunityStatus(StrEnum):
     DRAFT_READY = "draft_ready"
     AWAITING_AUTHORIZATION = "awaiting_authorization"
     AUTHORIZED = "authorized"
+    QUEUED = "queued"
     SEND_ATTEMPTED = "send_attempted"
+    PROVIDER_ACCEPTED = "provider_accepted"
+    SUBMITTED = "submitted"
+    SEND_STATE_UNKNOWN = "send_state_unknown"
     SENT = "sent"
     DELIVERED = "delivered"
+    BOUNCED = "bounced"
     REPLIED = "replied"
 
 
@@ -68,6 +73,7 @@ class OpportunityLead:
     open_role_count: int | None = None
     fit_hypothesis: str = ""
     contact_route: str = ""
+    contact_evidence: tuple[OpportunityEvidence, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -120,6 +126,9 @@ class OpportunityLead:
             ),
             fit_hypothesis=str(payload.get("fit_hypothesis") or ""),
             contact_route=str(payload.get("contact_route") or ""),
+            contact_evidence=tuple(
+                OpportunityEvidence(**item) for item in (payload.get("contact_evidence") or [])
+            ),
         )
 
 

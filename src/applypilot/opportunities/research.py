@@ -516,9 +516,14 @@ def validate_research_response(payload: Any, *, request: dict[str, Any]) -> dict
             raise ValueError("opportunity response company domain conflicts with its URL")
         if len(lead.evidence) > 12:
             raise ValueError("opportunity response has too much evidence")
+        if len(lead.contact_evidence) > 5:
+            raise ValueError("opportunity response has too much contact evidence")
         for evidence in lead.evidence:
             if not _valid_evidence(evidence):
                 raise ValueError("opportunity response evidence is invalid")
+        for evidence in lead.contact_evidence:
+            if not _valid_evidence(evidence):
+                raise ValueError("opportunity response contact evidence is invalid")
         expected_id = opportunity_lead_id(domain, lead.signal)
         lead = replace(
             lead,
