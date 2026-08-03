@@ -459,6 +459,21 @@ def aggregate_jobs(
         snapshot = asyncio.run(execute())
         snapshot_path, _ = store.get_snapshot(run_id, int(snapshot["revision"]))
         enrichment_state: dict[str, str] = {}
+        browser_handoff_request = ""
+        if portals:
+            from applypilot.aggregation.portal_handoff import initialize_portal_queue
+
+            active_request = initialize_portal_queue(
+                store=store,
+                journal=journal,
+                run_dir=run_directory,
+                run_id=run_id,
+                aggregation_request=request,
+                portals=tuple(portals),
+            )
+            browser_handoff_request = str(active_request or "")
+            for row in store.portal_missions(run_id):
+                enrichment_state[str(row["portal"])] = str(row["status"])
         if "jobspy" in pending:
             try:
                 _launch_jobspy_enrichment(
@@ -492,6 +507,7 @@ def aggregate_jobs(
                 "events_path": str(event_path),
                 "pending_enrichment": snapshot["pending_enrichment"],
                 "enrichment_state": enrichment_state,
+                "browser_handoff_request": browser_handoff_request,
             }
         )
     except Exception as exc:
@@ -520,6 +536,24 @@ def aggregate_status(
         else:
             snapshot = store.snapshot(run_id)
             snapshot["revision"] = 0
+        missions = store.portal_missions(run_id)
+        active_portals = [row for row in missions if row["status"] == "awaiting_response"]
+        checkpoint: dict[str, Any] = {}
+        if active_portals:
+            request_path = Path(str(active_portals[0]["request_path"]))
+            checkpoint_path = request_path.with_name(
+                request_path.name.replace(".request.json", ".checkpoint.json")
+            )
+            if checkpoint_path.is_file() and not checkpoint_path.is_symlink():
+                checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+        snapshot["browser_queue"] = {
+            "active": str(active_portals[0]["portal"]) if active_portals else "",
+            "queued": [str(row["portal"]) for row in missions if row["status"] == "queued"],
+            "state": str(checkpoint.get("state") or (active_portals[0]["status"] if active_portals else "idle")),
+            "navigation_count": int(checkpoint.get("navigation_count") or 0),
+            "result_count": int(checkpoint.get("result_count") or 0),
+            "checkpoint_sequence": int(checkpoint.get("sequence") or 0),
+        }
         if as_json:
             console.print_json(data=snapshot)
             return
@@ -540,6 +574,74 @@ def aggregate_status(
         )
     except Exception as exc:
         console.print(f"[red]Aggregation status failed:[/red] {type(exc).__name__}: {str(exc)[:240]}")
+        raise typer.Exit(code=1) from exc
+    finally:
+        if store is not None:
+            store.close()
+
+
+@app.command("aggregate-portal-checkpoint")
+def aggregate_portal_checkpoint(
+    run_id: str = typer.Option(..., "--run-id", help="Exact aggregation run ID."),
+    portal: str = typer.Option(..., "--portal", help="handshake or runway."),
+    state: str = typer.Option(..., "--state", help="Safe browser mission lifecycle state."),
+    sequence: int = typer.Option(..., "--sequence", min=1),
+    navigation_count: int = typer.Option(0, "--navigation-count", min=0),
+    result_count: int = typer.Option(0, "--result-count", min=0),
+    elapsed_seconds: int = typer.Option(0, "--elapsed-seconds", min=0),
+    safe_hostname: str = typer.Option("", "--safe-hostname"),
+) -> None:
+    """Persist one privacy-bounded liveness checkpoint from the model pilot."""
+    from applypilot.aggregation.portal_handoff import write_portal_checkpoint
+    from applypilot.aggregation.store import AggregationStore
+    from applypilot.observability.events import EventJournal
+
+    store: Optional[AggregationStore] = None
+    try:
+        database_path, aggregation_runs, _ = _aggregation_data_paths()
+        run_directory = (aggregation_runs / run_id).resolve(strict=True)
+        store = AggregationStore(database_path, run_dir=aggregation_runs)
+        active = [
+            row
+            for row in store.portal_missions(run_id)
+            if row["status"] == "awaiting_response" and row["portal"] == portal
+        ]
+        if len(active) != 1:
+            raise ValueError("portal is not the active authenticated-browser mission")
+        checkpoint_path = write_portal_checkpoint(
+            request_path=Path(str(active[0]["request_path"])),
+            state=state,
+            sequence=sequence,
+            navigation_count=navigation_count,
+            result_count=result_count,
+            elapsed_seconds=elapsed_seconds,
+            safe_hostname=safe_hostname,
+        )
+        EventJournal(run_directory / "events.ndjson", run_id=run_id).emit(
+            component="browser_mission",
+            phase="mission",
+            status=state,
+            source=portal,
+            counts={
+                "navigations": navigation_count,
+                "observed": result_count,
+                "elapsed_seconds": elapsed_seconds,
+            },
+            detail={"safe_hostname": safe_hostname},
+        )
+        console.print_json(
+            data={
+                "run_id": run_id,
+                "portal": portal,
+                "state": state,
+                "sequence": sequence,
+                "checkpoint_path": str(checkpoint_path),
+            }
+        )
+    except Exception as exc:
+        console.print(
+            f"[red]Portal checkpoint failed:[/red] {type(exc).__name__}: {str(exc)[:240]}"
+        )
         raise typer.Exit(code=1) from exc
     finally:
         if store is not None:
@@ -591,6 +693,65 @@ def aggregate_enrich_jobspy(
     except Exception as exc:
         console.print(
             f"[red]JobSpy enrichment failed:[/red] {type(exc).__name__}: {str(exc)[:240]}"
+        )
+        raise typer.Exit(code=1) from exc
+    finally:
+        if store is not None:
+            store.close()
+
+
+@app.command("aggregate-portal-import")
+def aggregate_portal_import(
+    run_id: str = typer.Option(..., "--run-id", help="Exact aggregation run ID."),
+    response: Path = typer.Option(..., "--response", help="Validated browser mission response JSON."),
+) -> None:
+    """Import one active Handshake or Runway response and publish a later revision."""
+    from applypilot.aggregation.portal_handoff import consume_portal_response
+    from applypilot.aggregation.store import AggregationStore
+    from applypilot.autonomy.handoff import import_response_artifact
+    from applypilot.observability.events import EventJournal
+
+    store: Optional[AggregationStore] = None
+    try:
+        database_path, aggregation_runs, _ = _aggregation_data_paths()
+        run_directory = (aggregation_runs / run_id).resolve(strict=True)
+        if run_directory.parent != aggregation_runs.resolve() or run_directory.is_symlink():
+            raise ValueError("aggregation run directory is invalid")
+        store = AggregationStore(database_path, run_dir=aggregation_runs)
+        active = [
+            row
+            for row in store.portal_missions(run_id)
+            if row["status"] in {"awaiting_response", "response_ready"}
+        ]
+        if len(active) != 1:
+            raise ValueError("aggregation run does not have one active portal mission")
+        request_path = Path(str(active[0]["request_path"])).resolve(strict=True)
+        import_response_artifact(request_path=request_path, input_path=response.resolve(strict=True))
+        snapshot = consume_portal_response(
+            store=store,
+            journal=EventJournal(run_directory / "events.ndjson", run_id=run_id),
+            run_dir=run_directory,
+            run_id=run_id,
+            request_path=request_path,
+        )
+        next_active = [
+            row for row in store.portal_missions(run_id) if row["status"] == "awaiting_response"
+        ]
+        console.print_json(
+            data={
+                "run_id": run_id,
+                "status": snapshot["status"],
+                "snapshot_revision": snapshot["revision"],
+                "candidate_count": snapshot["candidate_count"],
+                "pending_enrichment": snapshot["pending_enrichment"],
+                "next_request": (
+                    str(next_active[0]["request_path"]) if next_active else ""
+                ),
+            }
+        )
+    except Exception as exc:
+        console.print(
+            f"[red]Portal import failed:[/red] {type(exc).__name__}: {str(exc)[:240]}"
         )
         raise typer.Exit(code=1) from exc
     finally:

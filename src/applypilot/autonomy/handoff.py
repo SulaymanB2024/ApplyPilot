@@ -140,6 +140,7 @@ class ActiveHandoff:
     kind: str
     request_id: str
     candidate_id: str
+    resource_lock: str
     request_path: Path
     response_path: Path
     receipt_path: Path
@@ -176,6 +177,9 @@ def _active_handoffs_unlocked(
         ("discovery", "role_candidates"): "chatgpt_web",
         ("materials", "material_packet"): "chatgpt_web",
         ("form_review", "form_review"): "browser_tool",
+        ("portal_discovery", "handshake_job_observations"): "browser_tool",
+        ("portal_discovery", "runway_job_observations"): "browser_tool",
+        ("opportunity_research", "startup_opportunities"): "browser_tool",
     }
     for request_path in sorted(handoff_dir.glob("*.request.json")):
         if request_path.is_symlink() or not request_path.is_file():
@@ -198,10 +202,22 @@ def _active_handoffs_unlocked(
         if len(request_id) != 64 or any(character not in "0123456789abcdef" for character in request_id):
             raise ValueError("handoff request id is invalid")
         candidate_id = str(request.get("candidate_id") or "")
-        if kind == "role_candidates" and candidate_id:
-            raise ValueError("discovery handoff cannot bind a candidate")
-        if kind != "role_candidates" and not candidate_id:
+        candidate_free_kinds = {
+            "role_candidates",
+            "handshake_job_observations",
+            "runway_job_observations",
+            "startup_opportunities",
+        }
+        if kind in candidate_free_kinds and candidate_id:
+            raise ValueError("run-level handoff cannot bind a candidate")
+        if kind not in candidate_free_kinds and not candidate_id:
             raise ValueError("candidate handoff is missing its candidate binding")
+        resource_lock = str(request.get("resource_lock") or "")
+        if kind in {"handshake_job_observations", "runway_job_observations"}:
+            if resource_lock != "authenticated_browser":
+                raise ValueError("portal handoff is missing the authenticated browser lock")
+        elif resource_lock:
+            raise ValueError("handoff resource lock is not supported for this kind")
         raw_response_path = run_dir / str(request.get("response_path") or "")
         if raw_response_path.is_symlink():
             raise ValueError("handoff response must not be a symbolic link")
@@ -234,6 +250,7 @@ def _active_handoffs_unlocked(
                 kind=kind,
                 request_id=request_id,
                 candidate_id=candidate_id,
+                resource_lock=resource_lock,
                 request_path=request_path.resolve(),
                 response_path=response_path,
                 receipt_path=receipt_path,
@@ -842,6 +859,13 @@ def import_response_artifact(*, request_path: Path, input_path: Path) -> dict[st
                 from applypilot.autonomy.form_handoff import validate_form_review_response
 
                 payload = validate_form_review_response(json.loads(text), request=request)
+            elif expected_kind in {
+                "handshake_job_observations",
+                "runway_job_observations",
+            }:
+                from applypilot.aggregation.portal_handoff import validate_portal_response
+
+                payload = validate_portal_response(json.loads(text), request=request).to_dict()
             else:
                 raise ValueError(f"unsupported handoff response kind: {expected_kind}")
             if expected_kind == "role_candidates":
@@ -885,8 +909,23 @@ def _write_immutable_json(path: Path, payload: dict[str, Any]) -> None:
 def _atomic_write_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    temporary.write_text(text, encoding="utf-8")
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(temporary, flags, 0o600)
+    try:
+        encoded = text.encode("utf-8")
+        view = memoryview(encoded)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError("handoff artifact write made no progress")
+            view = view[written:]
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
     os.replace(temporary, path)
+    os.chmod(path, 0o600)
 
 
 def _quarantine_rejected_response(path: Path, text: str) -> Path:

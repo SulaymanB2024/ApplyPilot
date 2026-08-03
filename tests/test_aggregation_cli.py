@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
+from pathlib import Path
 
 from typer.testing import CliRunner
 
 from applypilot.aggregation.models import RawJob, SourceCapability, SourceKind
+from applypilot.aggregation.portal_handoff import PortalMissionRequest
 from applypilot.cli import app
 
 runner = CliRunner()
@@ -113,4 +115,69 @@ def test_aggregate_records_enrichment_without_delaying_revision_one(monkeypatch,
     assert payload["status"] == "partial"
     assert payload["snapshot_revision"] == 1
     assert payload["pending_enrichment"] == ["handshake", "jobspy"]
-    assert payload["enrichment_state"] == {"jobspy": "started"}
+    assert payload["enrichment_state"] == {
+        "handshake": "awaiting_response",
+        "jobspy": "started",
+    }
+
+
+def test_portal_import_publishes_later_revision(monkeypatch, tmp_path):
+    monkeypatch.setenv("APPLYPILOT_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        "applypilot.cli._build_aggregation_sources",
+        lambda **kwargs: [OneJobSource()],
+    )
+    started = runner.invoke(
+        app,
+        [
+            "aggregate",
+            "--query",
+            "product internships",
+            "--term",
+            "product intern",
+            "--source",
+            "cache",
+            "--portal",
+            "handshake",
+            "--no-watch",
+        ],
+    )
+    assert started.exit_code == 0, started.stdout
+    initial = json.loads(started.stdout)
+    request_path = Path(initial["browser_handoff_request"])
+    mission = PortalMissionRequest.from_dict(
+        json.loads(request_path.read_text(encoding="utf-8"))["mission"]
+    )
+    response_path = tmp_path / "handshake-response.json"
+    response_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "applypilot.portal-mission-response.v1",
+                "run_id": mission.run_id,
+                "request_id": mission.request_id,
+                "request_sha256": mission.sha256,
+                "query_digest": mission.query_digest,
+                "portal": "handshake",
+                "status": "complete",
+                "navigation_count": 2,
+                "elapsed_seconds": 8,
+                "safe_hostname": "app.joinhandshake.com",
+                "observations": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    imported = runner.invoke(
+        app,
+        [
+            "aggregate-portal-import",
+            "--run-id",
+            initial["run_id"],
+            "--response",
+            str(response_path),
+        ],
+    )
+    assert imported.exit_code == 0, imported.stdout
+    payload = json.loads(imported.stdout)
+    assert payload["snapshot_revision"] == 2
+    assert payload["pending_enrichment"] == []

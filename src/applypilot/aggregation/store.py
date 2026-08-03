@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import hashlib
+import fcntl
 import json
 import os
 import re
 import sqlite3
 import threading
+from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -87,6 +89,23 @@ CREATE TABLE IF NOT EXISTS aggregation_snapshots (
     UNIQUE (sha256),
     FOREIGN KEY (run_id) REFERENCES aggregation_runs(run_id)
 );
+CREATE TABLE IF NOT EXISTS aggregation_portal_missions (
+    run_id TEXT NOT NULL,
+    portal TEXT NOT NULL,
+    ordinal INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    request_id TEXT NOT NULL DEFAULT '',
+    request_path TEXT NOT NULL DEFAULT '',
+    response_path TEXT NOT NULL DEFAULT '',
+    result_count INTEGER NOT NULL DEFAULT 0,
+    error_class TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    started_at TEXT NOT NULL DEFAULT '',
+    completed_at TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (run_id, portal),
+    UNIQUE (run_id, ordinal),
+    FOREIGN KEY (run_id) REFERENCES aggregation_runs(run_id)
+);
 """
 
 
@@ -130,6 +149,18 @@ class AggregationStore:
     def close(self) -> None:
         with self._lock:
             self.connection.close()
+
+    @contextmanager
+    def _snapshot_file_lock(self, run_id: str):
+        lock_dir = self.run_dir / run_id
+        lock_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        descriptor = os.open(lock_dir / ".snapshot.lock", os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            yield
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
 
     def get_request(self, run_id: str) -> AggregationRequest:
         run_id = _safe_id(run_id, field_name="aggregation run id")
@@ -180,6 +211,23 @@ class AggregationStore:
         stable_id = _safe_id(source_id or observation.source.value, field_name="aggregation source id")
         payload = json.dumps(asdict(observation), sort_keys=True)
         with self._lock, self.connection:
+            if observation.advanceable:
+                prior_rows = self.connection.execute(
+                    "SELECT DISTINCT canonical_key FROM job_observations "
+                    "WHERE run_id = ? AND source = ? AND source_job_id = ?",
+                    (run_id, observation.source.value, observation.source_job_id),
+                ).fetchall()
+                for row in prior_rows:
+                    old_key = str(row["canonical_key"])
+                    if old_key != observation.canonical_key:
+                        self.connection.execute(
+                            "INSERT INTO canonical_key_aliases("
+                            "run_id, old_key, canonical_key, reason, created_at) "
+                            "VALUES(?, ?, ?, 'exact_source_identity', ?) "
+                            "ON CONFLICT(run_id, old_key) DO UPDATE SET "
+                            "canonical_key=excluded.canonical_key, reason=excluded.reason",
+                            (run_id, old_key, observation.canonical_key, _now()),
+                        )
             cursor = self.connection.execute(
                 "INSERT OR IGNORE INTO job_observations("
                 "run_id, canonical_key, source, source_job_id, source_id, payload_json, observed_at"
@@ -340,7 +388,7 @@ class AggregationStore:
         if status not in {"complete", "partial"}:
             raise ValueError("published snapshot must be complete or partial")
         run_id = _safe_id(run_id, field_name="aggregation run id")
-        with self._lock:
+        with self._lock, self._snapshot_file_lock(run_id):
             base = self.snapshot(run_id)
             previous = self.connection.execute(
                 "SELECT revision, sha256 FROM aggregation_snapshots WHERE run_id = ? "
@@ -402,6 +450,99 @@ class AggregationStore:
                     ),
                 )
             return payload
+
+    def queue_portal_missions(self, run_id: str, portals: tuple[str, ...]) -> None:
+        run_id = _safe_id(run_id, field_name="aggregation run id")
+        if not portals or len(set(portals)) != len(portals):
+            raise ValueError("portal mission queue must be unique and non-empty")
+        if not set(portals) <= {"handshake", "runway"}:
+            raise ValueError("portal mission queue contains an unsupported portal")
+        with self._lock, self.connection:
+            existing = self.connection.execute(
+                "SELECT COUNT(*) FROM aggregation_portal_missions WHERE run_id = ?", (run_id,)
+            ).fetchone()[0]
+            if existing:
+                raise ValueError("portal mission queue already exists")
+            for ordinal, portal in enumerate(portals, 1):
+                self.connection.execute(
+                    "INSERT INTO aggregation_portal_missions("
+                    "run_id, portal, ordinal, status, created_at) VALUES(?, ?, ?, 'queued', ?)",
+                    (run_id, portal, ordinal, _now()),
+                )
+
+    def portal_missions(self, run_id: str) -> list[dict[str, Any]]:
+        run_id = _safe_id(run_id, field_name="aggregation run id")
+        with self._lock:
+            return [
+                dict(row)
+                for row in self.connection.execute(
+                    "SELECT portal, ordinal, status, request_id, request_path, response_path, "
+                    "result_count, error_class, created_at, started_at, completed_at "
+                    "FROM aggregation_portal_missions WHERE run_id = ? ORDER BY ordinal",
+                    (run_id,),
+                ).fetchall()
+            ]
+
+    def activate_portal_mission(
+        self,
+        run_id: str,
+        *,
+        portal: str,
+        request_id: str,
+        request_path: Path,
+        response_path: Path,
+    ) -> None:
+        run_id = _safe_id(run_id, field_name="aggregation run id")
+        if portal not in {"handshake", "runway"}:
+            raise ValueError("unsupported portal mission")
+        if not re.fullmatch(r"[0-9a-f]{64}", request_id):
+            raise ValueError("portal request id is invalid")
+        with self._lock, self.connection:
+            active = self.connection.execute(
+                "SELECT portal FROM aggregation_portal_missions "
+                "WHERE run_id = ? AND status IN ('awaiting_response', 'response_ready')",
+                (run_id,),
+            ).fetchall()
+            if active:
+                raise ValueError("authenticated browser resource is already locked")
+            cursor = self.connection.execute(
+                "UPDATE aggregation_portal_missions SET status='awaiting_response', "
+                "request_id=?, request_path=?, response_path=?, started_at=? "
+                "WHERE run_id=? AND portal=? AND status='queued'",
+                (
+                    request_id,
+                    str(request_path.resolve()),
+                    str(response_path.resolve()),
+                    _now(),
+                    run_id,
+                    portal,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("portal mission is not queued")
+
+    def finish_portal_mission(
+        self,
+        run_id: str,
+        *,
+        portal: str,
+        status: str,
+        result_count: int,
+        error_class: str = "",
+    ) -> None:
+        allowed = {"complete", "partial", "auth_required", "blocked", "budget_exhausted"}
+        if status not in allowed or result_count < 0:
+            raise ValueError("portal mission terminal state is invalid")
+        run_id = _safe_id(run_id, field_name="aggregation run id")
+        with self._lock, self.connection:
+            cursor = self.connection.execute(
+                "UPDATE aggregation_portal_missions SET status=?, result_count=?, error_class=?, "
+                "completed_at=? WHERE run_id=? AND portal=? "
+                "AND status IN ('awaiting_response', 'response_ready')",
+                (status, result_count, error_class[:120], _now(), run_id, portal),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("portal mission is not active")
 
     def get_snapshot(self, run_id: str, revision: int) -> tuple[Path, dict[str, Any]]:
         run_id = _safe_id(run_id, field_name="aggregation run id")
