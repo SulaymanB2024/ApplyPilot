@@ -19,6 +19,7 @@ from applypilot.autonomy.handoff import (
 )
 from applypilot.autonomy.policy import FunnelBudget
 from applypilot.autonomy.telemetry import UsageLedger
+from applypilot.observability.events import EventJournal
 
 
 PROFILE = {
@@ -45,6 +46,106 @@ PROFILE = {
         "require_sponsorship": False,
     },
 }
+
+
+def _lifecycle_client(tmp_path):
+    run_dir = tmp_path / "run"
+    pack = build_context_pack(PROFILE, job_text="AI product analytics internship")
+    bindings = RunBindings(
+        run_id="handoff-lifecycle",
+        fact_digest="facts",
+        context_digest=pack.digest,
+        policy_digest="policy",
+    )
+    journal = EventJournal(run_dir / "events.ndjson", run_id=bindings.run_id)
+    client = ArtifactChatGPTClient(
+        run_dir=run_dir,
+        bindings=bindings,
+        ledger=UsageLedger(
+            run_id=bindings.run_id,
+            budget=FunnelBudget(),
+            journal=journal,
+        ),
+    )
+    return client, pack, journal
+
+
+def test_handoff_event_lifecycle_is_ordered_and_content_free(tmp_path):
+    client, pack, journal = _lifecycle_client(tmp_path)
+    query = "paid AI product internships"
+    with pytest.raises(ChatGPTArtifactPending) as pending:
+        client.find_roles(pack=pack, query=query, limit=1)
+    request = json.loads(pending.value.request_path.read_text(encoding="utf-8"))
+    response_input = tmp_path / "accepted.json"
+    response_input.write_text(
+        json.dumps(
+            {
+                "schema_version": "applypilot.chatgpt_web.v1",
+                "kind": "role_candidates",
+                "request_id": request["request_id"],
+                "items": [
+                    {
+                        "company": "Example Systems",
+                        "title": "AI Product Intern",
+                        "official_url": "https://careers.examplesystems.com/jobs/ai-intern",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    import_response_artifact(
+        request_path=pending.value.request_path,
+        input_path=response_input,
+    )
+    assert len(client.find_roles(pack=pack, query=query, limit=1)) == 1
+
+    events = journal.read()
+    assert [(event.phase, event.status) for event in events] == [
+        ("handoff_request", "created"),
+        ("handoff_wait", "started"),
+        ("handoff_response", "imported"),
+        ("handoff_validation", "started"),
+        ("handoff_validation", "complete"),
+        ("handoff_wait", "complete"),
+    ]
+    assert events[-1].detail["output_chars"] > 0
+    assert not any(
+        fragment in key.lower()
+        for event in events
+        for key in event.detail
+        for fragment in ("prompt", "response")
+    )
+
+
+def test_handoff_event_rejected_import_records_only_safe_error_metadata(tmp_path):
+    client, pack, journal = _lifecycle_client(tmp_path)
+    with pytest.raises(ChatGPTArtifactPending) as pending:
+        client.find_roles(pack=pack, query="paid AI product internships", limit=1)
+    rejected = tmp_path / "rejected.json"
+    rejected.write_text(
+        json.dumps(
+            {
+                "schema_version": "applypilot.chatgpt_web.v1",
+                "kind": "role_candidates",
+                "request_id": "0" * 64,
+                "items": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ChatGPTContractError, match="request_id mismatch"):
+        import_response_artifact(
+            request_path=pending.value.request_path,
+            input_path=rejected,
+        )
+
+    error = journal.read()[-1]
+    assert (error.phase, error.status) == ("handoff_validation", "error")
+    assert set(error.detail) == {"error_class", "output_chars"}
+    assert error.detail["error_class"] == "ChatGPTContractError"
+    assert error.detail["output_chars"] > 0
 
 
 def test_natural_discovery_response_is_normalized_semantically():

@@ -54,6 +54,7 @@ from applypilot.autonomy.supervisor import (
     runtime_semantic_state,
 )
 from applypilot.autonomy.telemetry import UsageLedger
+from applypilot.observability.events import EventJournal
 
 
 RUN_STATUS_SCHEMA_VERSION = "applypilot-autonomy-status-v1"
@@ -203,7 +204,11 @@ def prepare_run(
         request_path = ArtifactChatGPTClient(
             run_dir=run_dir,
             bindings=RunBindings.from_manifest(manifest),
-            ledger=UsageLedger(run_id=run_id, budget=active_policy.budget),
+            ledger=UsageLedger(
+                run_id=run_id,
+                budget=active_policy.budget,
+                journal=EventJournal(run_dir / "events.ndjson", run_id=run_id),
+            ),
         ).prepare_discovery_request(
             pack=context,
             query=query,
@@ -757,7 +762,11 @@ def advance_artifact_run(
     if not policy.review_only:
         raise ValueError("artifact handoff runner is review-only")
 
-    ledger = UsageLedger(run_id=bindings.run_id, budget=policy.budget)
+    ledger = UsageLedger(
+        run_id=bindings.run_id,
+        budget=policy.budget,
+        journal=EventJournal(run_dir / "events.ndjson", run_id=bindings.run_id),
+    )
     _restore_artifact_usage(ledger, run_dir)
     web = ArtifactChatGPTClient(
         run_dir=run_dir,
@@ -862,9 +871,13 @@ def run_with_cdp(
     )
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     run_id = f"{stamp}-{fact_ledger.digest[:10]}"
-    ledger = UsageLedger(run_id=run_id, budget=active_policy.budget)
     run_dir = output_dir / run_id
     run_dir.mkdir(parents=True, exist_ok=False)
+    ledger = UsageLedger(
+        run_id=run_id,
+        budget=active_policy.budget,
+        journal=EventJournal(run_dir / "events.ndjson", run_id=run_id),
+    )
     for _ in range(4):
         ledger.reserve("artifacts")
     _write_json(run_dir / "fact_ledger.json", fact_ledger.to_dict())

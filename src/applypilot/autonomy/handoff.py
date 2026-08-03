@@ -32,6 +32,7 @@ from applypilot.autonomy.context import (
 )
 from applypilot.autonomy.models import MaterialPacket, RoleCandidate
 from applypilot.autonomy.telemetry import BudgetExceeded, UsageLedger
+from applypilot.observability.events import EventJournal
 
 HANDOFF_SCHEMA_VERSION = "applypilot.handoff.v1"
 HANDOFF_RECONCILIATION_SCHEMA_VERSION = "applypilot.handoff-reconciliation.v1"
@@ -576,6 +577,7 @@ class ArtifactChatGPTClient:
             ),
             "raw_transcript_required": False,
         }
+        created = False
         with _handoff_queue_lock(self.run_dir):
             if request_path.exists():
                 self._validate_request_bindings(
@@ -610,6 +612,20 @@ class ArtifactChatGPTClient:
             if current:
                 raise _pending_for_active(current[0])
             _write_immutable_json(request_path, envelope)
+            created = True
+        if created:
+            self.ledger.lifecycle(
+                phase="handoff_request",
+                status="created",
+                surface="chatgpt_web_artifact",
+                detail={"kind": kind, "input_chars": len(prompt)},
+            )
+            self.ledger.lifecycle(
+                phase="handoff_wait",
+                status="started",
+                surface="chatgpt_web_artifact",
+                detail={"kind": kind},
+            )
         return request_path, response_path
 
     def _validate_request_bindings(
@@ -788,6 +804,17 @@ class ArtifactChatGPTClient:
                 response=response,
                 duration_ms=0,
             )
+        if not had_receipt:
+            self.ledger.lifecycle(
+                phase="handoff_wait",
+                status="complete",
+                surface="chatgpt_web_artifact",
+                detail={
+                    "kind": kind,
+                    "output_chars": len(response),
+                    "wait_ms": _request_wait_ms(request_path),
+                },
+            )
         return validated
 
 
@@ -838,6 +865,26 @@ def import_response_artifact(*, request_path: Path, input_path: Path) -> dict[st
             )
         ):
             raise ValueError("handoff request is missing its run bindings")
+        journal = EventJournal(run_dir / "events.ndjson", run_id=bindings.run_id)
+        surface = (
+            "chatgpt_web_artifact"
+            if expected_kind in {"role_candidates", "material_packet"}
+            else "browser_tool_artifact"
+        )
+        journal.emit(
+            component="model_or_browser",
+            phase="handoff_response",
+            status="imported",
+            source=surface,
+            detail={"kind": expected_kind, "output_chars": len(text)},
+        )
+        journal.emit(
+            component="model_or_browser",
+            phase="handoff_validation",
+            status="started",
+            source=surface,
+            detail={"kind": expected_kind},
+        )
         if not target.exists():
             current = _active_handoffs_unlocked(run_dir=run_dir, bindings=bindings)
             if len(current) != 1 or current[0].request_path != request_path:
@@ -877,9 +924,24 @@ def import_response_artifact(*, request_path: Path, input_path: Path) -> dict[st
                 candidate_id = str(request.get("candidate_id") or "")
                 if not candidate_id or payload.get("candidate_id") != candidate_id:
                     raise ChatGPTContractError("material response candidate_id mismatch")
-        except Exception:
+        except Exception as exc:
+            journal.emit(
+                component="model_or_browser",
+                phase="handoff_validation",
+                status="error",
+                source=surface,
+                detail={"error_class": type(exc).__name__, "output_chars": len(text)},
+            )
             _record_rejected_import(target, text, kind=expected_kind)
             raise
+
+        journal.emit(
+            component="model_or_browser",
+            phase="handoff_validation",
+            status="complete",
+            source=surface,
+            detail={"kind": expected_kind, "output_chars": len(text)},
+        )
 
         canonical = json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True) + "\n"
         if target.exists():
@@ -894,6 +956,14 @@ def import_response_artifact(*, request_path: Path, input_path: Path) -> dict[st
             "response_path": str(target),
             "response_sha256": _sha256_text(canonical),
         }
+
+
+def _request_wait_ms(request_path: Path) -> int:
+    """Return a bounded wall-clock age for one immutable request artifact."""
+    stat_result = request_path.stat()
+    created_at = float(getattr(stat_result, "st_birthtime", stat_result.st_mtime))
+    now = datetime.now(timezone.utc).timestamp()
+    return max(0, min(int((now - created_at) * 1000), 2_147_483_647))
 
 
 def _write_immutable_json(path: Path, payload: dict[str, Any]) -> None:

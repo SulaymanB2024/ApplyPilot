@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from applypilot.autonomy.policy import FunnelBudget
+from applypilot.observability.events import EventJournal
 
 
 class BudgetExceeded(RuntimeError):
@@ -43,6 +44,7 @@ class UsageLedger:
 
     run_id: str
     budget: FunnelBudget
+    journal: EventJournal | None = None
     started_monotonic: float = field(default_factory=time.monotonic)
     counts: dict[str, int] = field(default_factory=dict)
     events: list[UsageEvent] = field(default_factory=list)
@@ -138,6 +140,32 @@ class UsageLedger:
                 error_class=error_class,
             )
         )
+
+    def lifecycle(
+        self,
+        *,
+        phase: str,
+        status: str,
+        surface: str,
+        detail: dict[str, str | int | float | bool | None] | None = None,
+    ) -> None:
+        """Project a privacy-bounded handoff boundary to usage and durable telemetry."""
+        safe_detail = detail or {}
+        self.record_event(
+            stage="handoff",
+            operation=phase,
+            surface=surface,
+            status=status,
+            error_class=str(safe_detail.get("error_class") or ""),
+        )
+        if self.journal is not None:
+            self.journal.emit(
+                component="model_or_browser",
+                phase=phase,
+                status=status,
+                source=surface,
+                detail=safe_detail,
+            )
 
     def record_cycle(self, *, material_progress: bool) -> None:
         if material_progress:
