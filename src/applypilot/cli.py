@@ -996,6 +996,7 @@ def aggregate_jobs(
 def aggregate_status(
     run_id: str = typer.Option(..., "--run-id", help="Exact aggregation run ID."),
     as_json: bool = typer.Option(False, "--json", help="Print machine-readable state."),
+    watch: bool = typer.Option(False, "--watch", help="Include the current telemetry cursor."),
 ) -> None:
     """Read persisted aggregation state without restarting any source."""
     from applypilot.aggregation.store import AggregationStore
@@ -1011,6 +1012,54 @@ def aggregate_status(
             snapshot = store.snapshot(run_id)
             snapshot["revision"] = 0
         missions = store.portal_missions(run_id)
+        event_path = aggregation_runs / run_id / "events.ndjson"
+        events = []
+        if event_path.is_file() and not event_path.is_symlink():
+            from applypilot.observability.events import EventJournal
+
+            events = EventJournal(event_path, run_id=run_id).read()
+        fast_elapsed_ms = next(
+            (
+                event.elapsed_ms
+                for event in events
+                if event.phase == "snapshot"
+                and event.status == "published"
+                and event.counts.get("revision") == 1
+            ),
+            0,
+        )
+        fast_snapshot: dict[str, Any] = {"revision": 0, "status": "pending", "elapsed_ms": 0}
+        if revision:
+            _, first = store.get_snapshot(run_id, 1)
+            fast_snapshot = {
+                "revision": 1,
+                "status": "ready",
+                "elapsed_ms": fast_elapsed_ms,
+                "candidate_count": int(first["candidate_count"]),
+                "sha256": str(first["sha256"]),
+            }
+        grouped_sources: dict[str, list[str]] = {}
+        for row in snapshot.get("sources") or []:
+            grouped_sources.setdefault(str(row["source"]), []).append(str(row["status"]))
+        latest_by_source = {event.source: event.status for event in events if event.source}
+        for pending in snapshot.get("pending_enrichment") or []:
+            source_name = "jobspy" if pending == "jobspy" else str(pending)
+            grouped_sources.setdefault(source_name, [])
+            if source_name in latest_by_source:
+                grouped_sources[source_name].append(latest_by_source[source_name])
+
+        def source_family_state(statuses: list[str]) -> str:
+            if any(status in {"started", "running", "heartbeat"} for status in statuses):
+                return "running"
+            for state in ("failed", "timed_out", "cancelled", "partial", "complete"):
+                if state in statuses:
+                    return state
+            return "pending"
+
+        source_projection = {
+            source_name: source_family_state(statuses)
+            for source_name, statuses in sorted(grouped_sources.items())
+        }
         active_portals = [row for row in missions if row["status"] == "awaiting_response"]
         checkpoint: dict[str, Any] = {}
         if active_portals:
@@ -1020,6 +1069,15 @@ def aggregate_status(
             )
             if checkpoint_path.is_file() and not checkpoint_path.is_symlink():
                 checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+        checkpoint_age = 0
+        if checkpoint.get("observed_at"):
+            observed = datetime.fromisoformat(
+                str(checkpoint["observed_at"]).replace("Z", "+00:00")
+            )
+            checkpoint_age = max(
+                0,
+                int((datetime.now(timezone.utc) - observed.astimezone(timezone.utc)).total_seconds()),
+            )
         snapshot["browser_queue"] = {
             "active": str(active_portals[0]["portal"]) if active_portals else "",
             "queued": [str(row["portal"]) for row in missions if row["status"] == "queued"],
@@ -1027,7 +1085,34 @@ def aggregate_status(
             "navigation_count": int(checkpoint.get("navigation_count") or 0),
             "result_count": int(checkpoint.get("result_count") or 0),
             "checkpoint_sequence": int(checkpoint.get("sequence") or 0),
+            "last_checkpoint_age_seconds": checkpoint_age,
         }
+        snapshot["fast_snapshot"] = fast_snapshot
+        snapshot["latest_snapshot"] = {
+            "revision": int(snapshot["revision"]),
+            "candidate_count": int(snapshot["candidate_count"]),
+            "advanceable_count": int(snapshot.get("advanceable_count") or 0),
+            "sha256": str(snapshot.get("sha256") or ""),
+        }
+        snapshot["source_states"] = source_projection
+        opportunity_database = database_path.parent / "opportunities.sqlite3"
+        opportunity_counts = {
+            "observed": 0,
+            "verified": 0,
+            "draft_ready": 0,
+            "sent": 0,
+        }
+        if opportunity_database.is_file() and not opportunity_database.is_symlink():
+            from applypilot.opportunities.store import OpportunityStore
+
+            with OpportunityStore(opportunity_database) as opportunity_store:
+                available_counts = opportunity_store.summary_counts()
+            opportunity_counts = {
+                key: int(available_counts.get(key) or 0) for key in opportunity_counts
+            }
+        snapshot["opportunities"] = opportunity_counts
+        snapshot["event_sequence"] = events[-1].sequence if events else 0
+        snapshot["watch_requested"] = watch
         if as_json:
             console.print_json(data=snapshot)
             return

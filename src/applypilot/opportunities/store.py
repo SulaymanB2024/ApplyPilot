@@ -347,6 +347,21 @@ class OpportunityStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def summary_counts(self) -> dict[str, int]:
+        """Return value-free operator counts across the separate opportunity ledger."""
+        with self._lock:
+            lead_rows = self.connection.execute(
+                "SELECT status,COUNT(*) AS count FROM opportunity_leads GROUP BY status"
+            ).fetchall()
+            draft_rows = self.connection.execute(
+                "SELECT status,COUNT(*) AS count FROM opportunity_draft_bindings GROUP BY status"
+            ).fetchall()
+        counts = {status.value: 0 for status in OpportunityStatus}
+        for row in (*lead_rows, *draft_rows):
+            counts[str(row["status"])] = counts.get(str(row["status"]), 0) + int(row["count"])
+        counts["sent"] = self.sent_count()
+        return counts
+
     def record_artifact(self, run_id: str, *, kind: str, path: Path, sha256: str) -> None:
         run_id = _safe_id(run_id, name="opportunity run id")
         if not _SAFE_ID.fullmatch(kind) or not re.fullmatch(r"[0-9a-f]{64}", sha256):

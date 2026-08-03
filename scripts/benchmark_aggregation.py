@@ -79,6 +79,7 @@ async def benchmark(output: Path) -> dict:
                 FixtureSource(SourceKind.DIRECT_ATS, 0.25),
                 FixtureSource(SourceKind.WORKDAY, 0.50),
             ],
+            pending_enrichment=("jobspy", "handshake", "runway"),
         ).run("benchmark", request)
     finally:
         store.close()
@@ -104,6 +105,7 @@ async def benchmark(output: Path) -> dict:
         "observation_count": snapshot["observation_count"],
         "event_count": len(events),
         "snapshot_revision": snapshot["revision"],
+        "pending_enrichment": snapshot["pending_enrichment"],
     }
     report["pass"] = (
         first_candidate_ms < 1000
@@ -112,6 +114,7 @@ async def benchmark(output: Path) -> dict:
         and report["candidate_count"] == 20
         and report["observation_count"] == 60
         and report["snapshot_revision"] == 1
+        and report["pending_enrichment"] == ["handshake", "jobspy", "runway"]
     )
     _write_private_json(output / "benchmark.json", report)
     return report
