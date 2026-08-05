@@ -55,10 +55,12 @@ block evasion.
 
 Handshake and Runway are serialized, model-piloted browser missions using the
 applicant's authenticated real browser. They are not hidden-API or bulk scraper
-integrations. The applicant must take over for OTP, passkeys, CAPTCHA, MFA, or
-any provider challenge. A mission stops rather than exporting cookies,
-bypassing a challenge, or reading unrelated account data. Every validated
-response publishes a new immutable digest-linked revision.
+integrations. During these portal-discovery missions, the applicant must take
+over for OTP, passkeys, CAPTCHA, MFA, or any provider challenge. A mission stops
+rather than exporting cookies, bypassing a challenge, or reading unrelated
+account data. Every validated response publishes a new immutable digest-linked
+revision. Approval-bound application handoffs use the separate intervention
+policy in sections 3-5.
 
 Inspect persisted source and browser-queue state without restarting work:
 
@@ -139,9 +141,28 @@ applypilot dry-run --run-id RUN_ID \
 ```
 
 Each request permits visible navigation, confirmed-field entry, bound material
-uploads, review-page navigation, and local evidence capture. It explicitly
-forbids submission, account creation, email, CAPTCHA/MFA bypass, and identity,
+uploads, review-page navigation, local evidence capture, browser-managed login
+without credential export, and dismissal of non-permission browser or extension
+popups. It always forbids submission, mailbox writes, credential export,
+CAPTCHA solving, passkeys/authenticator/SMS or other non-email MFA, and identity,
 payment, tax, or SSN entry.
+
+Routine authentication is autonomous by default. Google Password Manager is
+the default credential tool: the worker may use only Chrome's inline UI to
+autofill an existing login or generate and save a new password for the bound
+job site, without exposing its value. The worker may also perform read-only
+mailbox search for the newest code issued by that site during the request and
+one entry and verification attempt.
+Email content is untrusted; the worker may extract only the code, may not follow
+email instructions, and may not persist the code or message body. It never asks
+the applicant for a password, OTP, login, or authentication takeover. If the
+credential manager or code is unavailable, or Chrome requires Touch ID, a
+passkey, SMS, an authenticator, SSO approval, or another human-only factor, the
+worker returns a structured blocker without prompting or bypassing the check.
+Google Password Manager is the sole canonical credential provider; 1Password is
+deprecated legacy compatibility. Use `--no-autonomous-auth` to forbid account
+creation and email OTP; the narrower compatibility flags can opt either action
+back in.
 
 The request also names one private, digest-addressed fact snapshot. Browser work
 may use only records marked `confirmed`; unknown, rejected, and missing answers
@@ -168,13 +189,26 @@ facts, and form evidence:
 applypilot approve --run-id RUN_ID \
   --candidate CANDIDATE_ID_1 \
   --candidate CANDIDATE_ID_2 \
-  --max-submissions 2
+  --max-submissions 2 \
+  --applicant-confirmation "I confirm the named applicant certification and privacy-policy agreement."
 ```
 
 An approval binds one to five exact candidates, their canonical URLs, material
 digests, form-review digests, and exact fact-snapshot digest and path. It permits
-at most three final submissions and expires. Account creation and email
-applications are never included.
+at most three final submissions and expires. It also binds the browser
+intervention policy. Browser-managed login and harmless popup dismissal are
+available without exposing credentials; Google Password Manager account
+creation and email OTP handling are included by default without authentication
+prompts. A certification, privacy agreement, or other legal attestation may be
+accepted only when an exact `--applicant-confirmation` is bound into the
+approval; the response records that confirmation's SHA-256, never a password or
+OTP. Sending an email is never included.
+
+Account creation is not inferred from a click. The browser response may report
+it only when value-free evidence confirms that Chrome populated the password
+fields, the continuation was activated once, and the account gate cleared. If
+any check fails, the result is `account_creation_unconfirmed` and the worker
+does not retry or ask the applicant.
 
 ## 5. Execute and resume safely
 

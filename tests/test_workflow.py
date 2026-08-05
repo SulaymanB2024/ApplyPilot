@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from pathlib import Path
@@ -9,6 +10,7 @@ import pytest
 from applypilot.autonomy.facts import build_fact_ledger
 from applypilot.autonomy.first_party import CachedFirstPartyVerifier
 from applypilot.autonomy.models import RoleCandidate
+from applypilot.apply.browser_actions import BrowserInterventionPolicy
 from applypilot.workflow import (
     BROWSER_ACTION_SCHEMA_VERSION,
     WorkflowError,
@@ -64,19 +66,37 @@ def test_workflow_migrates_role_quality_log_columns(tmp_path: Path) -> None:
     path = tmp_path / "workflow.sqlite3"
     WorkflowStore(path).close()
     connection = sqlite3.connect(path)
-    for column in ("compensation", "quality_gaps_json", "score_components_json"):
+    for column in (
+        "compensation",
+        "quality_gaps_json",
+        "score_components_json",
+        "form_action_policy_json",
+    ):
         connection.execute(f"ALTER TABLE workflow_candidates DROP COLUMN {column}")
+    connection.execute(
+        "ALTER TABLE workflow_approvals DROP COLUMN action_policy_json"
+    )
     connection.commit()
     connection.close()
 
     reopened = WorkflowStore(path)
-    columns = {
+    candidate_columns = {
         row["name"]
         for row in reopened.connection.execute("PRAGMA table_info(workflow_candidates)")
     }
+    approval_columns = {
+        row["name"]
+        for row in reopened.connection.execute("PRAGMA table_info(workflow_approvals)")
+    }
     reopened.close()
 
-    assert {"compensation", "quality_gaps_json", "score_components_json"} <= columns
+    assert {
+        "compensation",
+        "quality_gaps_json",
+        "score_components_json",
+        "form_action_policy_json",
+    } <= candidate_columns
+    assert "action_policy_json" in approval_columns
 
 
 def prepared_store(tmp_path: Path) -> tuple[WorkflowStore, Path]:
@@ -649,6 +669,376 @@ def test_exact_approval_and_confirmation_are_durable_and_one_time(tmp_path: Path
                 form_fact_digest=FORM_FACT_DIGEST,
                 max_submissions=1,
             )
+    finally:
+        store.close()
+
+
+def test_submission_request_authorizes_only_approval_bound_model_interventions(
+    tmp_path: Path,
+) -> None:
+    store, run_dir = prepared_store(tmp_path)
+    try:
+        dry_run_candidate(store, run_dir, tmp_path)
+        confirmation = "I confirm the SMBC applicant certification and privacy-policy agreement."
+        policy = BrowserInterventionPolicy.create(
+            allow_account_creation=True,
+            allow_email_otp=True,
+            applicant_confirmations=(confirmation,),
+        )
+        approval = store.create_approval(
+            run_id=RUN_ID,
+            candidate_ids=[CANDIDATE_ID],
+            form_fact_digest=FORM_FACT_DIGEST,
+            max_submissions=1,
+            action_policy=policy,
+        )
+
+        request_path = store.create_submission_request(
+            approval_id=approval["approval_id"],
+            form_fact_digest=FORM_FACT_DIGEST,
+        )
+        assert request_path is not None
+        request = json.loads(request_path.read_text(encoding="utf-8"))
+
+        assert request["action_policy"] == policy.to_dict()
+        assert request["action_policy"]["credential_tool"] == {
+            "provider": "google_password_manager",
+            "interface": "chrome_inline_password_manager_ui",
+            "allowed_operations": [
+                "autofill_existing_login",
+                "generate_and_save_new_password",
+            ],
+            "secret_access": "browser_only_never_model_or_response",
+            "prompt_policy": "never_ask_applicant_for_authentication",
+            "unavailable_behavior": "return_structured_blocker_without_prompting",
+            "completion_evidence": (
+                "password_fields_populated_account_continuation_activated_and_gate_cleared"
+            ),
+        }
+        assert request["action_policy"]["authentication_prompt_policy"] == (
+            "never_ask_applicant"
+        )
+        assert request["action_policy"]["authentication_failure_policy"] == (
+            "return_structured_blocker"
+        )
+        assert "sign_in_with_browser_managed_credentials_without_export" in request["allowed_actions"]
+        assert "dismiss_non_permission_browser_or_extension_popups" in request["allowed_actions"]
+        assert "create_job_site_account_with_password_manager_generated_password_and_continue" in request["allowed_actions"]
+        assert "retrieve_current_job_site_email_otp_read_only" in request["allowed_actions"]
+        assert "enter_and_verify_current_job_site_email_otp_once" in request["allowed_actions"]
+        assert "accept_exactly_confirmed_certification_or_privacy_terms" in request["allowed_actions"]
+        assert "read_export_log_or_persist_credentials" in request["forbidden_actions"]
+        assert "complete_passkey_authenticator_sms_or_other_non_email_mfa" in request["forbidden_actions"]
+        assert "solve_captcha" in request["forbidden_actions"]
+        assert request["action_policy"]["applicant_confirmations"] == [
+            {
+                "text": confirmation,
+                "sha256": hashlib.sha256(confirmation.encode("utf-8")).hexdigest(),
+            }
+        ]
+        assert store.approval_status(approval["approval_id"])["action_policy"] == policy.to_dict()
+        policy.validate_response(
+            {
+                "performed_interventions": [
+                    "create_job_site_account_with_password_manager_generated_password_and_continue",
+                    "retrieve_current_job_site_email_otp_read_only",
+                    "enter_and_verify_current_job_site_email_otp_once",
+                    "accept_exactly_confirmed_certification_or_privacy_terms",
+                ],
+                "accepted_confirmation_sha256": [
+                    hashlib.sha256(confirmation.encode("utf-8")).hexdigest()
+                ],
+                "account_creation_evidence": {
+                    "provider": "google_password_manager",
+                    "password_fields_populated_without_reading": True,
+                    "account_continuation_activated": True,
+                    "account_gate_cleared": True,
+                },
+            },
+            mode="submit",
+        )
+    finally:
+        store.close()
+
+
+def test_application_handoff_defaults_to_noninteractive_google_auth() -> None:
+    policy = BrowserInterventionPolicy.for_application_handoff()
+
+    assert policy.account_creation is True
+    assert policy.email_otp is True
+    assert policy.credential_provider == "google_password_manager"
+    assert policy.credential_tool["allowed_operations"] == [
+        "autofill_existing_login",
+        "generate_and_save_new_password",
+    ]
+    assert "ask_applicant_for_password_otp_or_authentication_takeover" in (
+        policy.forbidden_actions(mode="dry_run")
+    )
+    assert any(
+        "Do not ask the applicant" in rule
+        for rule in policy.handling_rules(mode="dry_run")
+    )
+
+
+def test_application_handoff_auth_can_be_disabled_and_rejects_onepassword() -> None:
+    disabled = BrowserInterventionPolicy.for_application_handoff(
+        autonomous_auth=False
+    )
+    assert disabled.account_creation is False
+    assert disabled.email_otp is False
+    assert disabled.credential_tool["allowed_operations"] == [
+        "autofill_existing_login"
+    ]
+    with pytest.raises(ValueError, match="onepassword is deprecated"):
+        BrowserInterventionPolicy.for_application_handoff(
+            credential_provider="onepassword"
+        )
+
+
+def test_authentication_blocker_is_structured_and_never_a_prompt() -> None:
+    policy = BrowserInterventionPolicy.for_application_handoff()
+
+    policy.validate_response(
+        {
+            "status": "blocked",
+            "auth_blocker_code": "human_only_authentication_required",
+        },
+        mode="dry_run",
+    )
+    with pytest.raises(ValueError, match="invalid authentication blocker"):
+        policy.validate_response(
+            {"status": "blocked", "auth_blocker_code": "please_ask_the_user"},
+            mode="dry_run",
+        )
+
+
+def test_account_creation_cannot_be_reported_without_completion_evidence() -> None:
+    policy = BrowserInterventionPolicy.for_application_handoff()
+
+    with pytest.raises(ValueError, match="exact value-free evidence"):
+        policy.validate_response(
+            {
+                "status": "dry_run_verified",
+                "performed_interventions": [
+                    "create_job_site_account_with_password_manager_generated_password_and_continue"
+                ],
+            },
+            mode="dry_run",
+        )
+
+
+def test_default_submission_policy_keeps_unapproved_sensitive_gates_forbidden(
+    tmp_path: Path,
+) -> None:
+    store, run_dir = prepared_store(tmp_path)
+    try:
+        dry_run_candidate(store, run_dir, tmp_path)
+        approval = store.create_approval(
+            run_id=RUN_ID,
+            candidate_ids=[CANDIDATE_ID],
+            form_fact_digest=FORM_FACT_DIGEST,
+            max_submissions=1,
+        )
+        request_path = store.create_submission_request(
+            approval_id=approval["approval_id"],
+            form_fact_digest=FORM_FACT_DIGEST,
+        )
+        assert request_path is not None
+        request = json.loads(request_path.read_text(encoding="utf-8"))
+
+        assert "sign_in_with_browser_managed_credentials_without_export" in request["allowed_actions"]
+        assert "dismiss_non_permission_browser_or_extension_popups" in request["allowed_actions"]
+        assert "create_account" in request["forbidden_actions"]
+        assert "retrieve_or_enter_email_otp" in request["forbidden_actions"]
+        assert "accept_certification_privacy_or_other_legal_terms" in request["forbidden_actions"]
+        assert not request["action_policy"]["account_creation"]
+        assert not request["action_policy"]["email_otp"]
+        assert request["action_policy"]["applicant_confirmations"] == []
+    finally:
+        store.close()
+
+
+def test_dry_run_can_authorize_account_and_email_otp_without_submission(
+    tmp_path: Path,
+) -> None:
+    store, _run_dir = prepared_store(tmp_path)
+    try:
+        policy = BrowserInterventionPolicy.create(
+            allow_account_creation=True,
+            allow_email_otp=True,
+        )
+        request_path = store.create_dry_run_requests(
+            run_id=RUN_ID,
+            candidate_ids=[CANDIDATE_ID],
+            form_fact_digest=FORM_FACT_DIGEST,
+            action_policy=policy,
+        )[0]
+        request = json.loads(request_path.read_text(encoding="utf-8"))
+
+        assert request["action_policy"] == policy.to_dict()
+        assert "create_job_site_account_with_password_manager_generated_password_and_continue" in request["allowed_actions"]
+        assert "retrieve_current_job_site_email_otp_read_only" in request["allowed_actions"]
+        assert "submit_application" in request["forbidden_actions"]
+        assert "accept_certification_privacy_or_other_legal_terms" in request["forbidden_actions"]
+    finally:
+        store.close()
+
+
+def test_browser_response_rejects_an_unapproved_intervention(tmp_path: Path) -> None:
+    store, run_dir = prepared_store(tmp_path)
+    try:
+        dry_run_candidate(store, run_dir, tmp_path)
+        approval = store.create_approval(
+            run_id=RUN_ID,
+            candidate_ids=[CANDIDATE_ID],
+            form_fact_digest=FORM_FACT_DIGEST,
+            max_submissions=1,
+        )
+        request_path = store.create_submission_request(
+            approval_id=approval["approval_id"],
+            form_fact_digest=FORM_FACT_DIGEST,
+        )
+        assert request_path is not None
+        request = json.loads(request_path.read_text(encoding="utf-8"))
+        response_path = tmp_path / "unauthorized-intervention.response.json"
+        write_json(
+            response_path,
+            {
+                "schema_version": request["schema_version"],
+                "request_id": request["request_id"],
+                "run_id": RUN_ID,
+                "candidate_id": CANDIDATE_ID,
+                "mode": "submit",
+                "material_digest": request["material_digest"],
+                "form_fact_digest": FORM_FACT_DIGEST,
+                "status": "blocked",
+                "final_submission_performed": False,
+                "performed_interventions": [
+                    "enter_and_verify_current_job_site_email_otp_once"
+                ],
+                "evidence_artifacts": [],
+            },
+        )
+
+        with pytest.raises(WorkflowError, match="unapproved browser intervention"):
+            store.import_browser_response(
+                request_path=request_path,
+                input_path=response_path,
+            )
+    finally:
+        store.close()
+
+
+def test_browser_request_cannot_self_authorize_email_otp(tmp_path: Path) -> None:
+    store, _run_dir = prepared_store(tmp_path)
+    try:
+        request_path = store.create_dry_run_requests(
+            run_id=RUN_ID,
+            candidate_ids=[CANDIDATE_ID],
+            form_fact_digest=FORM_FACT_DIGEST,
+        )[0]
+        request = json.loads(request_path.read_text(encoding="utf-8"))
+        tampered_policy = BrowserInterventionPolicy.create(allow_email_otp=True)
+        request["action_policy"] = tampered_policy.to_dict()
+        request["allowed_actions"] = [
+            "navigate_visible_chrome",
+            "fill_confirmed_fields",
+            "upload_bound_materials",
+            "reach_review_page",
+            "capture_local_evidence",
+            *tampered_policy.allowed_interventions(mode="dry_run"),
+        ]
+        request["forbidden_actions"] = [
+            "submit_application",
+            *tampered_policy.forbidden_actions(mode="dry_run"),
+        ]
+        request["intervention_rules"] = list(
+            tampered_policy.handling_rules(mode="dry_run")
+        )
+        write_json(request_path, request)
+        response_path = tmp_path / "tampered-policy.response.json"
+        write_json(
+            response_path,
+            {
+                "schema_version": request["schema_version"],
+                "request_id": request["request_id"],
+                "run_id": RUN_ID,
+                "candidate_id": CANDIDATE_ID,
+                "mode": "dry_run",
+                "material_digest": request["material_digest"],
+                "form_fact_digest": FORM_FACT_DIGEST,
+                "status": "blocked",
+                "final_submission_performed": False,
+                "evidence_artifacts": [],
+            },
+        )
+
+        with pytest.raises(WorkflowError, match="action policy binding mismatch"):
+            store.import_browser_response(
+                request_path=request_path,
+                input_path=response_path,
+            )
+    finally:
+        store.close()
+
+
+def test_legacy_v1_browser_request_remains_importable(tmp_path: Path) -> None:
+    store, _run_dir = prepared_store(tmp_path)
+    try:
+        request_path = store.create_dry_run_requests(
+            run_id=RUN_ID,
+            candidate_ids=[CANDIDATE_ID],
+            form_fact_digest=FORM_FACT_DIGEST,
+        )[0]
+        request = json.loads(request_path.read_text(encoding="utf-8"))
+        request["schema_version"] = "applypilot-browser-action-v1"
+        for key in (
+            "action_policy",
+            "intervention_rules",
+            "response_requirements",
+        ):
+            request.pop(key)
+        request["allowed_actions"] = [
+            "navigate_visible_chrome",
+            "fill_confirmed_fields",
+            "upload_bound_materials",
+            "reach_review_page",
+            "capture_local_evidence",
+        ]
+        request["forbidden_actions"] = [
+            "submit_application",
+            "create_account",
+            "send_email",
+            "solve_captcha",
+            "complete_mfa",
+            "provide_identity_tax_payment_or_ssn_data",
+        ]
+        write_json(request_path, request)
+        evidence = tmp_path / "legacy-v1.png"
+        evidence.write_bytes(b"legacy evidence")
+        response_path = tmp_path / "legacy-v1.response.json"
+        write_json(
+            response_path,
+            {
+                "schema_version": "applypilot-browser-action-v1",
+                "request_id": request["request_id"],
+                "run_id": RUN_ID,
+                "candidate_id": CANDIDATE_ID,
+                "mode": "dry_run",
+                "material_digest": request["material_digest"],
+                "form_fact_digest": FORM_FACT_DIGEST,
+                "status": "dry_run_verified",
+                "final_submission_performed": False,
+                "review_page_reached": True,
+                "evidence_artifacts": [str(evidence)],
+            },
+        )
+
+        result = store.import_browser_response(
+            request_path=request_path,
+            input_path=response_path,
+        )
+        assert result["state"] == "dry_run_ready"
     finally:
         store.close()
 

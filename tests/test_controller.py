@@ -10,6 +10,7 @@ from applypilot.apply.controller import (
     is_email_only_posting,
 )
 from applypilot.apply.harness import load_settings
+from applypilot.apply.google_passwords import PasswordFormResult
 from applypilot.autonomy.facts import FactCorrection, FactState, build_fact_ledger
 from applypilot.apply.safety import PageInput, PageState
 from applypilot.apply.onepassword import OnePasswordLogin
@@ -79,6 +80,94 @@ def test_account_only_page_requires_explicit_account_permission(monkeypatch, tmp
     with pytest.raises(RuntimeError, match="account_required"):
         denied._credential_for_page(Page())
     assert allowed._credential_for_page(Page()) is None
+
+
+def test_google_password_manager_generation_activates_account_continuation(
+    monkeypatch,
+    tmp_path,
+):
+    class Body:
+        @staticmethod
+        def inner_text(**_kwargs):
+            return "Create account to continue"
+
+    class Page:
+        url = "https://jobs.example.com/register"
+
+        @staticmethod
+        def locator(_selector):
+            return Body()
+
+    monkeypatch.setattr(controller_mod.config, "load_profile", lambda: PROFILE)
+    controller = DeterministicApplyController(
+        job={"url": Page.url, "title": "Analyst"},
+        port=9222,
+        worker_dir=tmp_path,
+        settings=load_settings(allow_account_creation=True),
+    )
+    generated = {}
+    continued = {}
+
+    def fake_password_tool(_page, *, allow_generation):
+        generated["allow_generation"] = allow_generation
+        return PasswordFormResult("generated", 2)
+
+    monkeypatch.setattr(
+        controller_mod.google_passwords,
+        "satisfy_password_form_with_google_password_manager",
+        fake_password_tool,
+    )
+    monkeypatch.setattr(
+        controller,
+        "_fill_application_form",
+        lambda *_args, **_kwargs: 2,
+    )
+
+    def fake_click(_page, labels):
+        continued["labels"] = labels
+        return True
+
+    monkeypatch.setattr(controller, "_click_button_by_text", fake_click)
+
+    controller._fill_login_or_account(Page(), None)
+
+    assert generated == {"allow_generation": True}
+    assert "next" in continued["labels"]
+    assert "create account" in continued["labels"]
+    assert any("account creation continuation" in event for event in controller.events)
+
+
+def test_google_password_manager_account_creation_fails_if_generation_did_not_fill(
+    monkeypatch,
+    tmp_path,
+):
+    class Body:
+        @staticmethod
+        def inner_text(**_kwargs):
+            return "Create account to continue"
+
+    class Page:
+        url = "https://jobs.example.com/register"
+
+        @staticmethod
+        def locator(_selector):
+            return Body()
+
+    monkeypatch.setattr(controller_mod.config, "load_profile", lambda: PROFILE)
+    controller = DeterministicApplyController(
+        job={"url": Page.url, "title": "Analyst"},
+        port=9222,
+        worker_dir=tmp_path,
+        settings=load_settings(allow_account_creation=True),
+    )
+    monkeypatch.setattr(
+        controller_mod.google_passwords,
+        "satisfy_password_form_with_google_password_manager",
+        lambda *_args, **_kwargs: PasswordFormResult("unavailable", 2),
+    )
+
+    with pytest.raises(RuntimeError, match="google_password_generation_unavailable"):
+        controller._fill_login_or_account(Page(), None)
 
 
 def test_live_controller_requires_approved_clean_fact_ledger(monkeypatch, tmp_path):

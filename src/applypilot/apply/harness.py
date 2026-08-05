@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
@@ -51,7 +52,7 @@ class HarnessSettings(BaseSettings):
 
     @property
     def uses_onepassword(self) -> bool:
-        """Return whether legacy 1Password integration should be active."""
+        """Return whether deprecated legacy 1Password compatibility is active."""
         return self.credential_provider == "onepassword" or self.onepassword_enabled
 
     @property
@@ -83,6 +84,12 @@ def load_settings(
     if allow_account_creation is not None:
         overrides["allow_account_creation"] = allow_account_creation
     settings = HarnessSettings(**overrides)
+    if settings.uses_onepassword:
+        warnings.warn(
+            "1Password support is deprecated; use Google Password Manager",
+            DeprecationWarning,
+            stacklevel=2,
+        )
     if not executor_model and settings.agent_backend == "claude":
         settings = settings.model_copy(update={"executor_model": DEFAULT_CLAUDE_MODEL})
     return settings
@@ -104,13 +111,13 @@ Field model-call budget per job: {settings.field_model_call_budget}
 Account creation allowed: {str(settings.allow_account_creation).lower()}
 Credential provider for job-site auth: {settings.credential_provider}
 Google Password Manager/autofill enabled: {str(settings.uses_google_password_manager).lower()}
-1Password enabled for job-site logins: {str(settings.uses_onepassword).lower()}
+Deprecated 1Password compatibility enabled: {str(settings.uses_onepassword).lower()}
 
 Use deterministic checks before judgment. Prefer direct DOM inspection, fixed selectors, page URLs, explicit form values, saved files, and tool outputs over speculation. When a deterministic check can answer a question, run that check instead of asking the model to infer it.
 
 External communication boundary: never send outbound email or create external email drafts from this harness. If a job requires email submission, write a local email_application_draft.md artifact for user review and finish with RESULT:EMAIL_DRAFT.
 
-Credential boundary: Google Password Manager credentials stay inside Chrome. Do not export, print, or persist browser-saved passwords. If browser autofill cannot satisfy a required login/account password field, fail closed instead of inventing or storing a credential.
+Credential boundary: Google Password Manager credentials stay inside Chrome. Do not export, print, or persist browser-saved passwords. For approved account creation, use Chrome's inline generated-password UI and verify only populated state; fail closed if the account gate does not clear.
 
 Finish with exactly one RESULT line."""
 
@@ -158,6 +165,7 @@ def write_contract(
         },
         "onepassword": {
             "enabled": settings.uses_onepassword,
+            "deprecated": True,
             "vault_configured": bool(settings.onepassword_vault),
             "extension_id": settings.onepassword_extension_id,
         },
@@ -176,7 +184,7 @@ def write_contract(
             "training manifest records Workday, email draft, Runway, and board handoff coverage",
             "email-only applications write email_application_draft.md instead of sending",
             "Google Password Manager credentials stay in Chrome and are never exported into artifacts",
-            "new account creation fails closed unless the configured credential provider can safely satisfy required fields",
+            "new account creation uses Google Password Manager inline generation and fails closed unless password fields populate and the account gate clears",
             "SSO, passkey, MFA, email verification, unsafe permission, biometric, payment, and tax flows fail closed",
             "database status is updated by deterministic parser",
         ],

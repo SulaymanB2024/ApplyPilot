@@ -18,9 +18,15 @@ from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
+from applypilot.apply.browser_actions import BrowserInterventionPolicy
+
 
 WORKFLOW_SCHEMA_VERSION = "applypilot-workflow-v1"
-BROWSER_ACTION_SCHEMA_VERSION = "applypilot-browser-action-v1"
+LEGACY_BROWSER_ACTION_SCHEMA_VERSION = "applypilot-browser-action-v1"
+BROWSER_ACTION_SCHEMA_VERSION = "applypilot-browser-action-v2"
+SUPPORTED_BROWSER_ACTION_SCHEMA_VERSIONS = frozenset(
+    {LEGACY_BROWSER_ACTION_SCHEMA_VERSION, BROWSER_ACTION_SCHEMA_VERSION}
+)
 MAX_EVIDENCE_ARTIFACTS = 5
 MAX_EVIDENCE_BYTES = 25 * 1024 * 1024
 CAMPAIGN_SEASONS = frozenset({"summer_2027", "fall_2026"})
@@ -47,6 +53,49 @@ STATE_ORDER = {
     "submitted_confirmed": 10,
     "excluded": 10,
 }
+
+
+def _browser_action_contract(
+    *,
+    policy: BrowserInterventionPolicy,
+    mode: str,
+) -> dict[str, list[str]]:
+    """Render deterministic instructions for one visible-browser request."""
+    if mode == "dry_run":
+        base_allowed = [
+            "navigate_visible_chrome",
+            "fill_confirmed_fields",
+            "upload_bound_materials",
+            "reach_review_page",
+            "capture_local_evidence",
+        ]
+        base_forbidden = ["submit_application"]
+    elif mode == "submit":
+        base_allowed = [
+            "submit_application_once",
+            "capture_confirmation_evidence",
+        ]
+        base_forbidden = []
+    else:
+        raise WorkflowError("unknown browser action mode")
+    return {
+        "allowed_actions": [
+            *base_allowed,
+            *policy.allowed_interventions(mode=mode),
+        ],
+        "forbidden_actions": [
+            *base_forbidden,
+            *policy.forbidden_actions(mode=mode),
+        ],
+        "intervention_rules": list(policy.handling_rules(mode=mode)),
+        "response_requirements": [
+            "Report every performed intervention in performed_interventions using an allowed action name.",
+            "Report each accepted applicant confirmation digest in accepted_confirmation_sha256.",
+            "When account creation is reported, include exact account_creation_evidence proving Google Password Manager populated the fields without reading them, the continuation was activated once, and the account gate cleared.",
+            "Never ask the applicant for authentication input or takeover; if an allowed auth path cannot complete, return status blocked and one of these auth_blocker_code values: browser_managed_login_unavailable, credential_manager_unavailable, email_otp_unavailable, human_only_authentication_required, account_creation_unconfirmed.",
+            "Never include a password, OTP value, mailbox body, cookie, token, or other secret in the response or evidence.",
+        ],
+    }
 
 
 class WorkflowError(RuntimeError):
@@ -123,6 +172,7 @@ class WorkflowStore:
                 material_digest TEXT NOT NULL DEFAULT '',
                 form_review_json TEXT NOT NULL DEFAULT '{}',
                 form_review_digest TEXT NOT NULL DEFAULT '',
+                form_action_policy_json TEXT NOT NULL DEFAULT '{}',
                 outcome TEXT NOT NULL DEFAULT '',
                 evidence_path TEXT NOT NULL DEFAULT '',
                 last_error TEXT NOT NULL DEFAULT '',
@@ -148,6 +198,7 @@ class WorkflowStore:
                 status TEXT NOT NULL,
                 campaign_id TEXT NOT NULL DEFAULT '',
                 season TEXT NOT NULL DEFAULT '',
+                action_policy_json TEXT NOT NULL DEFAULT '{}',
                 FOREIGN KEY (run_id) REFERENCES workflow_runs(run_id)
             );
 
@@ -227,6 +278,7 @@ class WorkflowStore:
             "opportunity_kind": "TEXT NOT NULL DEFAULT 'unknown'",
             "application_surface": "TEXT NOT NULL DEFAULT 'unknown'",
             "requisition_id": "TEXT NOT NULL DEFAULT ''",
+            "form_action_policy_json": "TEXT NOT NULL DEFAULT '{}'",
         }
         for column, declaration in candidate_column_defaults.items():
             if column not in candidate_columns:
@@ -237,10 +289,15 @@ class WorkflowStore:
             str(row["name"])
             for row in self.connection.execute("PRAGMA table_info(workflow_approvals)").fetchall()
         }
-        for column in ("campaign_id", "season"):
+        approval_column_defaults = {
+            "campaign_id": "TEXT NOT NULL DEFAULT ''",
+            "season": "TEXT NOT NULL DEFAULT ''",
+            "action_policy_json": "TEXT NOT NULL DEFAULT '{}'",
+        }
+        for column, declaration in approval_column_defaults.items():
             if column not in approval_columns:
                 self.connection.execute(
-                    f"ALTER TABLE workflow_approvals ADD COLUMN {column} TEXT NOT NULL DEFAULT ''"
+                    f"ALTER TABLE workflow_approvals ADD COLUMN {column} {declaration}"
                 )
         registry_columns = {
             str(row["name"])
@@ -822,9 +879,13 @@ class WorkflowStore:
         run_id: str,
         candidate_ids: Iterable[str],
         form_fact_digest: str,
+        action_policy: BrowserInterventionPolicy | None = None,
     ) -> list[Path]:
         if len(form_fact_digest) != 64:
             raise WorkflowError("confirmed form fact digest is required")
+        policy = action_policy or BrowserInterventionPolicy.create()
+        policy_payload = policy.to_dict()
+        action_contract = _browser_action_contract(policy=policy, mode="dry_run")
         run_dir = self._run_dir(run_id)
         fact_snapshot_path = self._validated_fact_snapshot(run_id, form_fact_digest)
         request_dir = run_dir / "workflow-handoff"
@@ -856,23 +917,16 @@ class WorkflowStore:
                     "abstain_on_unknown_rejected_or_missing_answers",
                     "never_infer_screening_identity_tax_payment_or_ssn_answers",
                 ],
-                "allowed_actions": [
-                    "navigate_visible_chrome",
-                    "fill_confirmed_fields",
-                    "upload_bound_materials",
-                    "reach_review_page",
-                    "capture_local_evidence",
-                ],
-                "forbidden_actions": [
-                    "submit_application",
-                    "create_account",
-                    "send_email",
-                    "solve_captcha",
-                    "complete_mfa",
-                    "provide_identity_tax_payment_or_ssn_data",
-                ],
+                "action_policy": policy_payload,
+                **action_contract,
                 "response_path": str(response_path),
             }
+            with self.connection:
+                self._update_candidate_fields(
+                    run_id,
+                    candidate_id,
+                    form_action_policy_json=_json(policy_payload),
+                )
             _write_private_json(request_path, request)
             paths.append(request_path)
         return paths
@@ -896,6 +950,13 @@ class WorkflowStore:
             raise WorkflowError("browser response material binding mismatch")
         if response.get("form_fact_digest") != request.get("form_fact_digest"):
             raise WorkflowError("browser response form-fact binding mismatch")
+        if request.get("schema_version") == BROWSER_ACTION_SCHEMA_VERSION:
+            try:
+                BrowserInterventionPolicy.from_dict(
+                    request.get("action_policy")
+                ).validate_response(response, mode=mode)
+            except ValueError as exc:
+                raise WorkflowError(str(exc)) from exc
 
         status = str(response.get("status") or "")
         final_performed = response.get("final_submission_performed")
@@ -954,6 +1015,7 @@ class WorkflowStore:
         valid_hours: int = 24,
         campaign_id: str = "",
         season: str = "",
+        action_policy: BrowserInterventionPolicy | None = None,
     ) -> dict[str, Any]:
         ids = tuple(dict.fromkeys(str(value) for value in candidate_ids if str(value)))
         if not 1 <= len(ids) <= 5:
@@ -964,6 +1026,8 @@ class WorkflowStore:
             raise WorkflowError("approval validity must be between one and 72 hours")
         if len(form_fact_digest) != 64:
             raise WorkflowError("confirmed form fact digest is required")
+        policy = action_policy or BrowserInterventionPolicy.create()
+        policy_payload = policy.to_dict()
         if bool(campaign_id) != bool(season):
             raise WorkflowError("campaign approval requires both campaign id and season")
         if campaign_id:
@@ -1023,6 +1087,7 @@ class WorkflowStore:
             "status": "active",
             "campaign_id": campaign_id,
             "season": season,
+            "action_policy": policy_payload,
         }
         with self.connection:
             self.connection.execute(
@@ -1030,8 +1095,8 @@ class WorkflowStore:
                 INSERT INTO workflow_approvals(
                     approval_id, run_id, candidate_ids_json, bindings_json,
                     issued_at, expires_at, max_submissions, consumed_count, status,
-                    campaign_id, season
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, 0, 'active', ?, ?)
+                    campaign_id, season, action_policy_json
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, 0, 'active', ?, ?, ?)
                 """,
                 (
                     approval_id,
@@ -1043,6 +1108,7 @@ class WorkflowStore:
                     max_submissions,
                     campaign_id,
                     season,
+                    _json(policy_payload),
                 ),
             )
             if campaign_id:
@@ -1083,6 +1149,13 @@ class WorkflowStore:
             return None
 
         run_id = approval["run_id"]
+        try:
+            policy = BrowserInterventionPolicy.from_dict(
+                json.loads(str(approval["action_policy_json"] or "{}"))
+            )
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise WorkflowError("approval browser intervention policy is invalid") from exc
+        action_contract = _browser_action_contract(policy=policy, mode="submit")
         fact_snapshot_path = self._validated_fact_snapshot(run_id, form_fact_digest)
         candidate_ids = json.loads(approval["candidate_ids_json"])
         bindings = json.loads(approval["bindings_json"])
@@ -1144,15 +1217,8 @@ class WorkflowStore:
                     "abstain_on_unknown_rejected_or_missing_answers",
                     "never_infer_screening_identity_tax_payment_or_ssn_answers",
                 ],
-                "allowed_actions": ["submit_application_once", "capture_confirmation_evidence"],
-                "forbidden_actions": [
-                    "create_account",
-                    "send_email",
-                    "solve_captcha",
-                    "complete_mfa",
-                    "provide_identity_tax_payment_or_ssn_data",
-                    "retry_after_ambiguous_outcome",
-                ],
+                "action_policy": policy.to_dict(),
+                **action_contract,
                 "response_path": str(response_path),
             }
             if not resuming_reservation:
@@ -1185,6 +1251,12 @@ class WorkflowStore:
 
     def approval_status(self, approval_id: str) -> dict[str, Any]:
         row = self._approval(approval_id)
+        try:
+            action_policy = BrowserInterventionPolicy.from_dict(
+                json.loads(str(row["action_policy_json"] or "{}"))
+            ).to_dict()
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise WorkflowError("approval browser intervention policy is invalid") from exc
         return {
             "approval_id": row["approval_id"],
             "run_id": row["run_id"],
@@ -1193,6 +1265,7 @@ class WorkflowStore:
             "max_submissions": row["max_submissions"],
             "campaign_id": row["campaign_id"],
             "season": row["season"],
+            "action_policy": action_policy,
         }
 
     def _validate_browser_request(
@@ -1206,7 +1279,8 @@ class WorkflowStore:
         candidate_id = str(request.get("candidate_id") or "")
         mode = str(request.get("mode") or "")
         _safe_file_identifier(candidate_id, "candidate id")
-        if request.get("schema_version") != BROWSER_ACTION_SCHEMA_VERSION:
+        schema_version = request.get("schema_version")
+        if schema_version not in SUPPORTED_BROWSER_ACTION_SCHEMA_VERSIONS:
             raise WorkflowError("unsupported browser request schema")
         if run_id != row["run_id"] or candidate_id != row["candidate_id"]:
             raise WorkflowError("browser request candidate binding mismatch")
@@ -1224,6 +1298,24 @@ class WorkflowStore:
         if request.get("fact_snapshot_path") != str(fact_snapshot_path):
             raise WorkflowError("browser request fact snapshot binding mismatch")
 
+        policy: BrowserInterventionPolicy | None = None
+        if schema_version == BROWSER_ACTION_SCHEMA_VERSION:
+            try:
+                policy = BrowserInterventionPolicy.from_dict(
+                    request.get("action_policy")
+                )
+            except ValueError as exc:
+                raise WorkflowError("browser request action policy is invalid") from exc
+            expected_contract = _browser_action_contract(policy=policy, mode=mode)
+            for field in (
+                "allowed_actions",
+                "forbidden_actions",
+                "intervention_rules",
+                "response_requirements",
+            ):
+                if request.get(field) != expected_contract[field]:
+                    raise WorkflowError(f"browser request {field} binding mismatch")
+
         request_dir = (self._run_dir(run_id) / "workflow-handoff").resolve()
         request_path = request_path.resolve()
         if request_path.parent != request_dir:
@@ -1236,6 +1328,15 @@ class WorkflowStore:
                 "dry_run",
                 row["material_digest"],
             )
+            if schema_version == BROWSER_ACTION_SCHEMA_VERSION:
+                try:
+                    stored_policy = BrowserInterventionPolicy.from_dict(
+                        json.loads(str(row["form_action_policy_json"] or "{}"))
+                    )
+                except (json.JSONDecodeError, ValueError) as exc:
+                    raise WorkflowError("stored dry-run action policy is invalid") from exc
+                if policy != stored_policy:
+                    raise WorkflowError("browser request action policy binding mismatch")
         elif mode == "submit":
             approval_id = str(request.get("approval_id") or "")
             _safe_file_identifier(approval_id, "approval id")
@@ -1255,6 +1356,15 @@ class WorkflowStore:
                 or request.get("season") != approval["season"]
             ):
                 raise WorkflowError("browser request approval binding mismatch")
+            if schema_version == BROWSER_ACTION_SCHEMA_VERSION:
+                try:
+                    approved_policy = BrowserInterventionPolicy.from_dict(
+                        json.loads(str(approval["action_policy_json"] or "{}"))
+                    )
+                except (json.JSONDecodeError, ValueError) as exc:
+                    raise WorkflowError("approval browser intervention policy is invalid") from exc
+                if policy != approved_policy:
+                    raise WorkflowError("browser request action policy binding mismatch")
             expected_request = (
                 request_dir / f"submit.{candidate_id}.{approval_id}.request.json"
             )
@@ -1588,6 +1698,7 @@ class WorkflowStore:
             "material_digest",
             "form_review_json",
             "form_review_digest",
+            "form_action_policy_json",
             "outcome",
             "evidence_path",
             "last_error",

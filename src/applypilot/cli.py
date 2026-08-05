@@ -1643,10 +1643,26 @@ def dry_run_workflow(
         "--response",
         help="Browser dry-run response to validate and import.",
     ),
+    allow_account_creation: bool = typer.Option(
+        False,
+        "--allow-account-creation",
+        help="Allow the browser model to create the bound job-site account with a password-manager-generated password.",
+    ),
+    allow_email_otp: bool = typer.Option(
+        False,
+        "--allow-email-otp",
+        help="Allow email OTP when --no-autonomous-auth is selected.",
+    ),
+    autonomous_auth: bool = typer.Option(
+        True,
+        "--autonomous-auth/--no-autonomous-auth",
+        help="Handle saved login, account creation, and email OTP without asking the applicant; return a structured blocker if unavailable.",
+    ),
 ) -> None:
     """Create or import visible-Chrome form dry-runs; never submit."""
     _bootstrap_config_only()
     from applypilot import config
+    from applypilot.apply.browser_actions import BrowserInterventionPolicy
     from applypilot.workflow import WorkflowStore
 
     try:
@@ -1679,6 +1695,11 @@ def dry_run_workflow(
                 run_id=run_id,
                 candidate_ids=candidate_ids,
                 form_fact_digest=form_fact_digest,
+                action_policy=BrowserInterventionPolicy.for_application_handoff(
+                    autonomous_auth=autonomous_auth,
+                    allow_account_creation=allow_account_creation,
+                    allow_email_otp=allow_email_otp,
+                ),
             )
             console.print_json(
                 data={
@@ -1710,10 +1731,31 @@ def approve_workflow_batch(
     valid_hours: int = typer.Option(24, "--valid-hours", min=1, max=72),
     campaign_id: str = typer.Option("", "--campaign-id", help="Optional canonical campaign ledger."),
     season: str = typer.Option("", "--season", help="Campaign season: summer_2027 or fall_2026."),
+    allow_account_creation: bool = typer.Option(
+        False,
+        "--allow-account-creation",
+        help="Authorize account creation when --no-autonomous-auth is selected.",
+    ),
+    allow_email_otp: bool = typer.Option(
+        False,
+        "--allow-email-otp",
+        help="Authorize email OTP when --no-autonomous-auth is selected.",
+    ),
+    autonomous_auth: bool = typer.Option(
+        True,
+        "--autonomous-auth/--no-autonomous-auth",
+        help="Handle saved login, account creation, and email OTP without asking the applicant; return a structured blocker if unavailable.",
+    ),
+    applicant_confirmation: Optional[list[str]] = typer.Option(
+        None,
+        "--applicant-confirmation",
+        help="Exact applicant confirmation for a certification or privacy agreement; repeat when needed.",
+    ),
 ) -> None:
     """Authorize one exact, evidence-bound batch after candidate review."""
     _bootstrap_config_only()
     from applypilot import config
+    from applypilot.apply.browser_actions import BrowserInterventionPolicy
     from applypilot.workflow import WorkflowStore
 
     try:
@@ -1727,6 +1769,12 @@ def approve_workflow_batch(
                 valid_hours=valid_hours,
                 campaign_id=campaign_id,
                 season=season,
+                action_policy=BrowserInterventionPolicy.for_application_handoff(
+                    autonomous_auth=autonomous_auth,
+                    allow_account_creation=allow_account_creation,
+                    allow_email_otp=allow_email_otp,
+                    applicant_confirmations=applicant_confirmation or (),
+                ),
             )
             approval["candidates"] = [
                 item

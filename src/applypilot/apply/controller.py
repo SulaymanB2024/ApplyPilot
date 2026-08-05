@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from applypilot import config
-from applypilot.apply import onepassword
+from applypilot.apply import google_passwords, onepassword
 from applypilot.apply.field_resolver import (
     CodexResolver,
     FieldSpec,
@@ -270,13 +270,25 @@ class DeterministicApplyController:
                 )
 
             credential: onepassword.OnePasswordLogin | None = None
-            if has_login_form:
+            for _auth_step in range(4):
+                if not has_login_form:
+                    break
+                before_auth = self._authentication_signature(page)
                 credential = self._credential_for_page(page)
                 self._fill_login_or_account(page, credential)
                 try:
                     page.wait_for_load_state("domcontentloaded", timeout=10000)
                 except PlaywrightTimeoutError:
                     pass
+                page.wait_for_timeout(500)
+                has_login_form = self._has_login_or_account_form(page)
+                if not has_login_form:
+                    break
+                if self._authentication_signature(page) == before_auth:
+                    self._record("authentication page did not advance; refusing to retry")
+                    break
+
+            if has_login_form:
                 state = inspect_page_state(page)
                 verdict = classify_page_state_with_evidence(state)
                 if verdict:
@@ -415,17 +427,13 @@ class DeterministicApplyController:
 
     def _credential_for_page(self, page: Any) -> onepassword.OnePasswordLogin | None:
         if self.settings.uses_google_password_manager:
-            page_text = self._page_text(page).lower()
-            account_only = (
-                any(marker in page_text for marker in ("create account", "sign up"))
-                and not any(marker in page_text for marker in ("sign in", "log in"))
-            )
+            account_only = self._is_account_only_page(page)
             if account_only and not self.settings.allow_account_creation:
                 raise RuntimeError("account_required")
             domain = onepassword.domain_from_url(page.url)
             self._record(
-                f"using Google Password Manager browser autofill for {domain}; "
-                "no password values are read or generated"
+                f"using Google Password Manager inline credential UI for {domain}; "
+                "password values remain unread"
             )
             return None
         if not self.settings.allow_account_creation:
@@ -567,13 +575,51 @@ class DeterministicApplyController:
         return bool(desired and (desired == current or desired in current.split()))
 
     def _fill_login_or_account(self, page: Any, credential: onepassword.OnePasswordLogin | None) -> None:
+        account_only = self._is_account_only_page(page)
+        if self.settings.uses_google_password_manager:
+            password_result = (
+                google_passwords.satisfy_password_form_with_google_password_manager(
+                    page,
+                    allow_generation=(
+                        account_only and self.settings.allow_account_creation
+                    ),
+                )
+            )
+            if password_result.outcome == "unavailable":
+                reason = (
+                    "google_password_generation_unavailable"
+                    if account_only
+                    else "google_password_autofill_unavailable"
+                )
+                raise RuntimeError(reason)
+            self._record(
+                "Google Password Manager password form outcome="
+                f"{password_result.outcome} fields={password_result.visible_password_fields}"
+            )
         filled = self._fill_application_form(page, uploads={"resume": ""}, credential=credential)
         self._record(f"filled {filled} login/account field(s)")
         button_text = ["continue", "next", "sign in", "log in"]
         if self.settings.allow_account_creation:
             button_text.extend(["create account", "sign up"])
         if not self._click_button_by_text(page, tuple(button_text)):
+            if account_only:
+                raise RuntimeError("account_creation_continuation_unavailable")
             self._record("no login/account continuation button found")
+        elif account_only:
+            self._record("activated the job-site account creation continuation once")
+
+    def _is_account_only_page(self, page: Any) -> bool:
+        page_text = self._page_text(page).lower()
+        return (
+            any(marker in page_text for marker in ("create account", "sign up"))
+            and not any(marker in page_text for marker in ("sign in", "log in"))
+        )
+
+    def _authentication_signature(self, page: Any) -> tuple[str, str, int]:
+        """Return a value-free signature used to detect a new auth step."""
+        text = " ".join(self._page_text(page).lower().split())[:2_000]
+        password_count = page.locator('input[type="password"]:visible').count()
+        return str(getattr(page, "url", "")), text, password_count
 
     def _has_login_or_account_form(self, page: Any) -> bool:
         text = self._page_text(page).lower()
@@ -648,7 +694,9 @@ class DeterministicApplyController:
               name: el.getAttribute('name') || labels.id || '',
               label: [groupLabel, labels.label].filter(Boolean).join(' '),
               placeholder: el.getAttribute('placeholder') || '',
-              value: el.value || '',
+              value: (el.getAttribute('type') || '').toLowerCase() === 'password'
+                ? (el.value ? '__APPLYPILOT_SECRET_PRESENT__' : '')
+                : (el.value || ''),
               required: Boolean(el.required || el.getAttribute('aria-required') === 'true'),
               options,
               autocomplete: el.getAttribute('autocomplete') || '',

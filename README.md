@@ -39,7 +39,8 @@ applypilot aggregate --query "paid Summer 2027 product and analytics internships
 applypilot prepare --query "paid Summer 2027 product and analytics internships in Austin or Remote US" \
   --aggregation-snapshot AGGREGATION_RUN_ID@REVISION
 applypilot dry-run --run-id RUN_ID --candidate CANDIDATE_ID
-applypilot approve --run-id RUN_ID --candidate CANDIDATE_ID --max-submissions 1
+applypilot approve --run-id RUN_ID --candidate CANDIDATE_ID --max-submissions 1 \
+  --applicant-confirmation "I confirm the named applicant certification and privacy-policy agreement."
 applypilot execute --approval-id APPROVAL_ID
 ```
 
@@ -67,14 +68,29 @@ resumable candidate store.
 Progressive aggregation publishes a useful immutable first revision from cache
 and first-party sources without waiting for slower enrichment. JobSpy is bounded
 board discovery evidence; Handshake and Runway are serialized model-piloted
-missions in the user's authenticated browser, with user takeover for OTP,
-passkeys, CAPTCHA, MFA, and provider challenges. They are not hidden-API or bulk
-scraper integrations. Later validated results produce digest-linked revisions;
-the canonical workflow binds one exact `RUN_ID@REVISION`.
+discovery missions in the user's authenticated browser, with user takeover for
+OTP, passkeys, CAPTCHA, MFA, and provider challenges on those portal-discovery
+missions. They are not hidden-API or bulk scraper integrations. Later validated
+results produce digest-linked revisions; the canonical workflow binds one exact
+`RUN_ID@REVISION`. Approval-bound application handoffs use the separate email-OTP
+policy described below.
 
 Search configuration never counts as applicant consent to work in a location.
 Dry-run and submission packets bind one private confirmed-fact snapshot; missing
 screening answers abstain, and fact drift after review stops execution.
+
+Visible-browser application packets also bind a narrow intervention policy.
+Browser-managed login and dismissal of non-permission password-manager popups
+are model-actionable without exposing credentials. Routine authentication is
+non-interactive by default: the worker may use Google Password Manager's inline
+Chrome UI to autofill a saved login or generate and save a new site password,
+and may retrieve one current email OTP through read-only mailbox access. It must
+return a structured blocker instead of asking the applicant for authentication
+or takeover. Use `--no-autonomous-auth` to turn account creation and email OTP off.
+Certification and privacy acceptance still require exact applicant-confirmed
+text. Passwords and OTPs never enter response artifacts. CAPTCHA, passkeys,
+authenticator/SMS or other non-email MFA, identity verification, payment/tax
+data, mailbox writes, and ambiguous retries remain fail-closed.
 
 ### Legacy six-stage pipeline
 **Requires:** Python 3.11+ and a configured Gemini, OpenAI, or local endpoint for
@@ -123,7 +139,7 @@ Each stage is independent. Run them all or pick what you need.
 | Chrome/Chromium | Auto-apply | Auto-detected on most systems |
 | Codex CLI | Optional field fallback | Not required when `APPLYPILOT_FIELD_MODEL_CALL_BUDGET=0` (the default) |
 | Google Password Manager in Chrome | Codex auto-apply login flows | Uses the selected Chrome profile's browser-managed credentials/autofill |
-| 1Password CLI + Chrome extension | Legacy Codex account creation | Optional legacy provider when `APPLYPILOT_CREDENTIAL_PROVIDER=onepassword` |
+| 1Password CLI + Chrome extension | Deprecated legacy compatibility only | Canonical application handoffs use Google Password Manager exclusively |
 
 **Gemini API key is free.** Get one at [aistudio.google.com](https://aistudio.google.com). OpenAI and local models (Ollama/llama.cpp) are also supported.
 
@@ -194,7 +210,7 @@ overlay never silently expands all configured queries. Set
 employer-owned or ATS-native pages.
 
 ### `.env`
-API keys and runtime config: `GEMINI_API_KEY`, `LLM_MODEL`, plus harness overrides such as `APPLYPILOT_LLM_PROVIDER=chatgpt_web`, `APPLYPILOT_AGENT_BACKEND`, `APPLYPILOT_EXECUTOR_MODEL`, `APPLYPILOT_SUPERVISOR_MODEL`, `APPLYPILOT_DETERMINISTIC_CONTROLLER`, `APPLYPILOT_FIELD_MODEL_CALL_BUDGET`, `APPLYPILOT_CREDENTIAL_PROVIDER`, and `APPLYPILOT_CHROME_PROFILE_DIRECTORY`. Account creation is intentionally a per-run CLI permission rather than a persistent environment default. `APPLYPILOT_CREDENTIAL_PROVIDER` defaults to `google_password_manager`, which uses the selected Chrome profile's browser-managed credentials without exporting passwords. The field model-call budget defaults to zero, so deterministic auto-apply does not spawn a model subprocess. Legacy 1Password settings remain available with `APPLYPILOT_CREDENTIAL_PROVIDER=onepassword`. The self-improvement development harness uses separate optional settings: `APPLYPILOT_DEV_MODE`, `APPLYPILOT_DEV_WORKER_MODEL`, `APPLYPILOT_DEV_REVIEWER_MODEL`, and `APPLYPILOT_DEV_FORBIDDEN_MODELS`. API secret values can also be stored in the OS keyring.
+API keys and runtime config: `GEMINI_API_KEY`, `LLM_MODEL`, plus harness overrides such as `APPLYPILOT_LLM_PROVIDER=chatgpt_web`, `APPLYPILOT_AGENT_BACKEND`, `APPLYPILOT_EXECUTOR_MODEL`, `APPLYPILOT_SUPERVISOR_MODEL`, `APPLYPILOT_DETERMINISTIC_CONTROLLER`, `APPLYPILOT_FIELD_MODEL_CALL_BUDGET`, and `APPLYPILOT_CHROME_PROFILE_DIRECTORY`. Canonical account creation uses Google Password Manager exclusively. The field model-call budget defaults to zero, so deterministic auto-apply does not spawn a model subprocess. The old `APPLYPILOT_CREDENTIAL_PROVIDER=onepassword` path is deprecated and retained only for legacy compatibility. The self-improvement development harness uses separate optional settings: `APPLYPILOT_DEV_MODE`, `APPLYPILOT_DEV_WORKER_MODEL`, `APPLYPILOT_DEV_REVIEWER_MODEL`, and `APPLYPILOT_DEV_FORBIDDEN_MODELS`. API secret values can also be stored in the OS keyring.
 
 ### Package configs (shipped with ApplyPilot)
 - `config/employers.yaml` - Workday employer registry (48 preconfigured)
@@ -228,7 +244,7 @@ The legacy controller launches Chrome, writes a deterministic per-job harness co
 
 The compatibility apply path uses a deterministic Python/Playwright controller for navigation, form detection, uploads, submit gates, screenshots, and result parsing. Its model-call budget defaults to zero. If `APPLYPILOT_FIELD_MODEL_CALL_BUDGET` is explicitly raised, Codex is used once per page as a schema-constrained batch fallback for ambiguous required fields or screening questions that the controller cannot resolve from profile facts. The fallback explicitly uses Codex approval policy `never` inside a read-only sandbox, so it does not pause for permission or receive write authority. The legacy free-form Claude/Codex controller is disabled. CAPTCHA, MFA, SSO, payment/tax, and identity-verification surfaces fail closed instead of attempting bypass.
 
-By default, Codex apply runs use Google Password Manager through the selected Chrome profile. ApplyPilot never reads, exports, prints, or persists Google-stored passwords; it allows Chrome autofill to satisfy login fields and fails closed if a required password field is not already satisfied. New account creation is not treated as a credential-write API for Google Password Manager. The legacy 1Password path remains available with `APPLYPILOT_CREDENTIAL_PROVIDER=onepassword`, `op`, and the 1Password Chrome extension. API keys stay in `.env` or the OS keyring.
+By default, Codex apply runs use Google Password Manager through the selected Chrome profile. ApplyPilot never reads, exports, prints, or persists Google-stored passwords. For a permitted account-creation page, the controller focuses the password field, accepts Chrome's inline generated-password suggestion, verifies only that the password fields became populated, and activates the site's continuation once. It fails closed if Chrome does not fill the fields or the account gate does not advance. The old 1Password path is deprecated legacy compatibility. API keys stay in `.env` or the OS keyring.
 
 The apply queue stores canonical job IDs to avoid duplicate submissions, schedules retryable failures with capped full-jitter backoff, and opens a per-domain circuit breaker after repeated fail-closed outcomes such as CAPTCHA or SSO blocks. Each run records `deterministic_controller_plan.json`, `apply_harness_contract.json`, `apply_training_manifest.json`, screenshots, and a redacted `deterministic_controller_result.json` in the worker directory.
 
@@ -254,8 +270,8 @@ applypilot profile-cache                # Show value-free autofill cache complet
 applypilot doctor                       # Verify setup, diagnose missing requirements
 applypilot prepare --query QUERY        # Discover, verify, rank, and prepare
 applypilot workflow-status --run-id ID  # Inspect canonical state and shortlist
-applypilot dry-run --run-id ID           # Create/import visible form reviews
-applypilot approve --run-id ID --candidate CANDIDATE_ID
+applypilot dry-run --run-id ID [--no-autonomous-auth]
+applypilot approve --run-id ID --candidate CANDIDATE_ID [INTERVENTION OPTIONS]
 applypilot execute --approval-id ID      # Resume one approved submission at a time
 applypilot aggregate --query QUERY --term TERM --mode quick --watch
 applypilot aggregate-status --run-id ID --watch --json

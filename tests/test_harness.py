@@ -69,6 +69,25 @@ def test_account_creation_requires_explicit_settings_override(monkeypatch):
     assert load_settings(allow_account_creation=True).allow_account_creation is True
 
 
+def test_canonical_workflow_exposes_approval_bound_browser_interventions():
+    dry_run_help = runner.invoke(app, ["dry-run", "--help"], env={"COLUMNS": "200"})
+    approval_help = runner.invoke(app, ["approve", "--help"], env={"COLUMNS": "200"})
+
+    assert dry_run_help.exit_code == 0, dry_run_help.output
+    assert "--allow-account-creation" in dry_run_help.output
+    assert "--allow-email-otp" in dry_run_help.output
+    assert "--autonomous-auth" in dry_run_help.output
+    assert "--no-autonomous-auth" in dry_run_help.output
+    assert "--credential-provider" not in dry_run_help.output
+    assert approval_help.exit_code == 0, approval_help.output
+    assert "--allow-account-creation" in approval_help.output
+    assert "--allow-email-otp" in approval_help.output
+    assert "--autonomous-auth" in approval_help.output
+    assert "--no-autonomous-auth" in approval_help.output
+    assert "--credential-provider" not in approval_help.output
+    assert "--applicant-confirmation" in approval_help.output
+
+
 @pytest.mark.parametrize(
     ("extra_args", "expected_dry_run", "expected_account_creation"),
     [

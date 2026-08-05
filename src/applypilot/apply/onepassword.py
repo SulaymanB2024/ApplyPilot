@@ -1,4 +1,7 @@
-"""1Password integration for autonomous apply account credentials."""
+"""Deprecated 1Password compatibility for legacy apply runs.
+
+Canonical application handoffs use Google Password Manager exclusively.
+"""
 
 from __future__ import annotations
 
@@ -16,6 +19,7 @@ from applypilot import config
 
 DEFAULT_EXTENSION_ID = "aeblfdkhhhdcdjpifhhbdiojplfjncoa"
 APPLYPILOT_TAG = "applypilot"
+DEPRECATED = True
 
 
 class OnePasswordError(RuntimeError):

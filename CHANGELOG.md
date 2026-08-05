@@ -48,6 +48,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and tri-state submission verification for the deterministic apply controller.
 - **Apply runtime guards** - Added canonical job IDs, retry scheduling with full jitter,
   and per-domain circuit breakers for repeated fail-closed apply outcomes.
+- **Approval-bound browser interventions** - Added v2 visible-browser action packets that let
+  the model use browser-managed login, dismiss non-permission extension popups, and—only when
+  explicitly bound—create a password-manager-backed account, retrieve and enter one email OTP,
+  or accept an exact applicant-confirmed certification/privacy agreement without persisting
+  passwords, codes, or mailbox content.
+- **Value-free credential tool** - Added a Google Password Manager browser operation for inline
+  saved-login autofill and generated-password save. The controller verifies password-field
+  population without reading values, activates account continuation once, and requires the
+  account gate to clear before reporting creation. Canonical application authentication is
+  non-interactive by default and returns typed blockers instead of asking the applicant.
 - **Self-improvement harness** - Added `applypilot improve` plan, worker, and review
   commands for bounded artifact-first development loops with model and safety guardrails.
 - **Progressive knowledge packets** - Added compact knowledge indexes, full case cards,
@@ -60,8 +70,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Explicit submit boundary** - `applypilot apply` is now dry-run by default; live
   submission is one exact URL and requires a reviewed fact digest plus an expiring, one-time
   manifest bound to the candidate, material bytes, filled form, and apply policy.
-- **Explicit account boundary** - Job-site account creation is disabled by default and
-  requires the per-run `--allow-account-creation` flag.
+- **Application auth default** - Canonical dry-run and approval commands now authorize
+  request-bound account creation and one read-only email OTP by default. Use
+  `--no-autonomous-auth` to disable both; legal attestations remain separately confirmation-bound.
+- **1Password deprecation** - Canonical application handoffs now use Google Password Manager
+  exclusively. The 1Password implementation remains only as deprecated legacy compatibility.
 - **Discovery source policy** - The autonomy funnel uses ChatGPT Web first, treats the campaign
   query as an objective rather than an exact-title allowlist, searches adjacent early-career role
   families, and accepts only resolved official employer or ATS URLs. Prompt schema v7 describes
