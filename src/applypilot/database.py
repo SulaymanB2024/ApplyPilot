@@ -8,8 +8,10 @@ without migration ordering issues.
 import sqlite3
 import threading
 from datetime import datetime, timezone
+from hashlib import sha1
 from pathlib import Path
 
+from applypilot.apply.runtime import canonical_job_id, domain_from_job_url, normalized_url_value
 from applypilot.config import DB_PATH
 
 # Thread-local connection storage — each thread gets its own connection
@@ -66,14 +68,15 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
     so it won't destroy existing data.
 
     Schema columns by stage:
-      - Discovery:  url, title, salary, description, location, site, strategy, discovered_at
+      - Discovery:  url, title, salary, description, location, requisition, site, strategy, discovered_at
       - Enrichment: full_description, application_url, detail_scraped_at, detail_error
       - Scoring:    fit_score, score_reasoning, scored_at
       - Tailoring:  tailored_resume_path, tailored_at, tailor_attempts
       - Cover:      cover_letter_path, cover_letter_at, cover_attempts
       - Apply:      applied_at, apply_status, apply_error, apply_attempts,
                    agent_id, last_attempted_at, apply_duration_ms, apply_task_id,
-                   verification_confidence
+                   verification_confidence, canonical_job_id, apply_domain,
+                   next_apply_attempt_at, apply_error_class
 
     Args:
         db_path: Override the default DB_PATH.
@@ -95,6 +98,7 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
             salary                TEXT,
             description           TEXT,
             location              TEXT,
+            requisition           TEXT,
             site                  TEXT,
             strategy              TEXT,
             discovered_at         TEXT,
@@ -129,13 +133,18 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
             last_attempted_at     TEXT,
             apply_duration_ms     INTEGER,
             apply_task_id         TEXT,
-            verification_confidence TEXT
+            verification_confidence TEXT,
+            canonical_job_id      TEXT,
+            apply_domain          TEXT,
+            next_apply_attempt_at TEXT,
+            apply_error_class     TEXT
         )
     """)
     conn.commit()
 
     # Run migrations for any columns added after initial schema
     ensure_columns(conn)
+    ensure_runtime_indexes(conn)
 
     return conn
 
@@ -150,6 +159,7 @@ _ALL_COLUMNS: dict[str, str] = {
     "salary": "TEXT",
     "description": "TEXT",
     "location": "TEXT",
+    "requisition": "TEXT",
     "site": "TEXT",
     "strategy": "TEXT",
     "discovered_at": "TEXT",
@@ -180,6 +190,10 @@ _ALL_COLUMNS: dict[str, str] = {
     "apply_duration_ms": "INTEGER",
     "apply_task_id": "TEXT",
     "verification_confidence": "TEXT",
+    "canonical_job_id": "TEXT",
+    "apply_domain": "TEXT",
+    "next_apply_attempt_at": "TEXT",
+    "apply_error_class": "TEXT",
 }
 
 
@@ -216,7 +230,104 @@ def ensure_columns(conn: sqlite3.Connection | None = None) -> list[str]:
     if added:
         conn.commit()
 
+    backfill_runtime_columns(conn)
+    ensure_runtime_indexes(conn)
+
     return added
+
+
+def backfill_runtime_columns(conn: sqlite3.Connection | None = None) -> int:
+    """Populate canonical apply runtime columns for existing rows."""
+    if conn is None:
+        conn = get_connection()
+
+    rows = conn.execute("""
+        SELECT url, application_url, canonical_job_id, apply_domain
+        FROM jobs
+        WHERE canonical_job_id IS NULL OR canonical_job_id = ''
+           OR apply_domain IS NULL OR apply_domain = ''
+           OR LOWER(TRIM(COALESCE(application_url, ''))) IN ('none', 'null', 'nan', 'n/a', 'na', '')
+    """).fetchall()
+    updated = 0
+    for row in rows:
+        application_url = normalized_url_value(row["application_url"]) or None
+        canonical = row["canonical_job_id"] or canonical_job_id(row["url"], application_url)
+        canonical = _unique_canonical_job_id(conn, row["url"], application_url, canonical)
+        target_url = normalized_url_value(application_url) or normalized_url_value(row["url"])
+        domain = row["apply_domain"] or domain_from_job_url(target_url)
+        conn.execute(
+            "UPDATE jobs SET application_url = ?, canonical_job_id = ?, apply_domain = ? WHERE url = ?",
+            (application_url, canonical, domain, row["url"]),
+        )
+        updated += 1
+    if updated:
+        conn.commit()
+    return updated
+
+
+def _unique_canonical_job_id(
+    conn: sqlite3.Connection,
+    url: str,
+    application_url: str | None,
+    preferred: str,
+) -> str:
+    """Return a deterministic canonical ID that will not violate legacy DB indexes."""
+    if not preferred:
+        return ""
+
+    if not _canonical_exists_for_other_url(conn, preferred, url):
+        return preferred
+
+    fallback = canonical_job_id(url)
+    if fallback and not _canonical_exists_for_other_url(conn, fallback, url):
+        return fallback
+
+    digest = sha1(url.encode("utf-8")).hexdigest()[:12]
+    base = fallback or canonical_job_id(application_url) or "job"
+    return f"{base}#source-{digest}"
+
+
+def _canonical_exists_for_other_url(conn: sqlite3.Connection, canonical: str, url: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM jobs WHERE canonical_job_id = ? AND url != ? LIMIT 1",
+        (canonical, url),
+    ).fetchone()
+    return row is not None
+
+
+def ensure_runtime_indexes(conn: sqlite3.Connection | None = None) -> None:
+    """Create apply-stage indexes and circuit-breaker tables."""
+    if conn is None:
+        conn = get_connection()
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS apply_domain_circuit_breakers (
+            domain          TEXT PRIMARY KEY,
+            failure_count   INTEGER DEFAULT 0,
+            opened_until    TEXT,
+            last_reason     TEXT,
+            updated_at      TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_jobs_apply_queue
+        ON jobs(apply_status, next_apply_attempt_at, fit_score, discovered_at)
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_jobs_apply_domain
+        ON jobs(apply_domain)
+    """)
+    try:
+        conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_canonical_job_id_unique
+            ON jobs(canonical_job_id)
+            WHERE canonical_job_id IS NOT NULL AND canonical_job_id != ''
+        """)
+    except sqlite3.IntegrityError:
+        # Existing databases may already contain duplicate canonical postings.
+        # Fresh databases still get the fail-closed unique constraint.
+        pass
+    conn.commit()
 
 
 def get_stats(conn: sqlite3.Connection | None = None) -> dict:
@@ -348,11 +459,15 @@ def store_jobs(conn: sqlite3.Connection, jobs: list[dict],
         if not url:
             continue
         try:
+            canonical = canonical_job_id(url, job.get("application_url"))
+            target_url = normalized_url_value(job.get("application_url")) or normalized_url_value(url)
+            domain = domain_from_job_url(target_url)
             conn.execute(
-                "INSERT INTO jobs (url, title, salary, description, location, site, strategy, discovered_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO jobs (url, title, salary, description, location, site, strategy, discovered_at, "
+                "canonical_job_id, apply_domain) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (url, job.get("title"), job.get("salary"), job.get("description"),
-                 job.get("location"), site, strategy, now),
+                 job.get("location"), site, strategy, now, canonical, domain),
             )
             new += 1
         except sqlite3.IntegrityError:

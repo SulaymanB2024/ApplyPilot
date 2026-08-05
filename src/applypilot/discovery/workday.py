@@ -20,10 +20,27 @@ from html.parser import HTMLParser
 import yaml
 
 from applypilot import config
+from applypilot.apply.runtime import canonical_job_id, domain_from_job_url
 from applypilot.config import CONFIG_DIR
 from applypilot.database import get_connection, init_db
 
 log = logging.getLogger(__name__)
+
+STOPWORDS = {
+    "a",
+    "ai",
+    "and",
+    "for",
+    "ii",
+    "iii",
+    "intern",
+    "internship",
+    "new",
+    "of",
+    "the",
+    "to",
+    "grad",
+}
 
 
 # -- Employer registry from YAML --------------------------------------------
@@ -57,18 +74,67 @@ def _location_ok(location: str | None, accept: list[str], reject: list[str]) -> 
 
     loc = location.lower()
 
+    for r in reject:
+        if _location_pattern_matches(r, loc):
+            return False
+
     if any(r in loc for r in ("remote", "anywhere", "work from home", "wfh", "distributed")):
         return True
 
-    for r in reject:
-        if r.lower() in loc:
-            return False
-
     for a in accept:
-        if a.lower() in loc:
+        if _location_pattern_matches(a, loc):
             return True
 
     return False
+
+
+def _location_pattern_matches(pattern: str, loc: str) -> bool:
+    normalized = pattern.lower().strip()
+    if normalized in {"us", "u.s.", "usa", "u.s.a."}:
+        return bool(re.search(r"\b(u\.?s\.?a?|united states)\b", loc))
+    if len(normalized) <= 2:
+        return bool(re.search(rf"\b{re.escape(normalized)}\b", loc))
+    return normalized in loc
+
+
+def _search_terms(search_cfg: dict) -> list[set[str]]:
+    terms: list[set[str]] = []
+    max_tier = int(search_cfg.get("workday_max_tier", 2))
+    for query_cfg in search_cfg.get("queries", []) or []:
+        if int(query_cfg.get("tier", 99)) > max_tier:
+            continue
+        query = str(query_cfg.get("query", ""))
+        tokens = {
+            token
+            for token in re.findall(r"[a-z0-9]+", query.lower())
+            if len(token) > 1 and token not in STOPWORDS
+        }
+        if tokens:
+            terms.append(tokens)
+    return terms
+
+
+def _title_keywords(search_cfg: dict) -> list[str]:
+    configured = search_cfg.get("workday_title_keywords") or search_cfg.get("direct_ats_title_keywords")
+    if configured:
+        return [str(item).lower() for item in configured]
+    return ["intern", "internship", "new grad", "graduate", "early career", "analyst"]
+
+
+def _workday_title_ok(title: str | None, search_cfg: dict) -> bool:
+    """Check Workday titles after API search because Workday search is broad."""
+    normalized = (title or "").lower()
+    if not normalized:
+        return False
+    excludes = [str(item).lower() for item in search_cfg.get("exclude_titles", []) or []]
+    if any(exclude in normalized for exclude in excludes):
+        return False
+
+    if any(keyword in normalized for keyword in _title_keywords(search_cfg)):
+        return True
+
+    title_tokens = set(re.findall(r"[a-z0-9]+", normalized))
+    return any(tokens.issubset(title_tokens) for tokens in _search_terms(search_cfg))
 
 
 # -- HTML stripper -----------------------------------------------------------
@@ -191,9 +257,11 @@ def search_employer(
     employer: dict,
     search_text: str,
     location_filter: bool = True,
+    title_filter: bool = True,
     max_results: int = 0,
     accept_locs: list[str] | None = None,
     reject_locs: list[str] | None = None,
+    search_cfg: dict | None = None,
 ) -> list[dict]:
     """Search an employer, paginate through all results, optionally filter by location."""
     log.info("%s: searching \"%s\"...", employer["name"], search_text)
@@ -203,6 +271,8 @@ def search_employer(
     page_size = 20
     max_pages = 25  # Cap at 500 results
     total = None
+    if search_cfg is None:
+        search_cfg = config.load_search_config()
 
     while True:
         try:
@@ -220,6 +290,9 @@ def search_employer(
             break
 
         for j in postings:
+            if title_filter and not _workday_title_ok(j.get("title", ""), search_cfg):
+                continue
+
             loc = j.get("locationsText", "")
             if location_filter and accept_locs is not None and reject_locs is not None:
                 if not _location_ok(loc, accept_locs, reject_locs):
@@ -327,10 +400,12 @@ def store_results(conn: sqlite3.Connection, jobs: list[dict], employers: dict) -
         try:
             conn.execute(
                 "INSERT INTO jobs (url, title, salary, description, location, site, strategy, "
-                "discovered_at, full_description, application_url, detail_scraped_at, detail_error) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "discovered_at, full_description, application_url, detail_scraped_at, detail_error, "
+                "canonical_job_id, apply_domain) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (url, job.get("title"), None, short_desc, job.get("location"),
-                 site, strategy, now, full_description, url, detail_scraped_at, detail_error),
+                 site, strategy, now, full_description, url, detail_scraped_at, detail_error,
+                 canonical_job_id(url, url), domain_from_job_url(url)),
             )
             new += 1
         except sqlite3.IntegrityError:
@@ -345,8 +420,10 @@ def _process_one(
     employers: dict,
     search_text: str,
     location_filter: bool,
+    title_filter: bool,
     accept_locs: list[str],
     reject_locs: list[str],
+    search_cfg: dict,
 ) -> dict:
     """Search one employer, fetch details, store results."""
     emp = employers[employer_key]
@@ -355,8 +432,10 @@ def _process_one(
         jobs = search_employer(
             employer_key, emp, search_text,
             location_filter=location_filter,
+            title_filter=title_filter,
             accept_locs=accept_locs,
             reject_locs=reject_locs,
+            search_cfg=search_cfg,
         )
     except Exception as e:
         log.error("%s: ERROR searching '%s': %s", emp["name"], search_text, e)
@@ -387,9 +466,11 @@ def scrape_employers(
     employers: dict,
     employer_keys: list[str] | None = None,
     location_filter: bool = True,
+    title_filter: bool = True,
     max_results: int = 0,
     accept_locs: list[str] | None = None,
     reject_locs: list[str] | None = None,
+    search_cfg: dict | None = None,
     workers: int = 1,
 ) -> dict:
     """Run full scrape: search -> filter -> detail -> store.
@@ -404,6 +485,8 @@ def scrape_employers(
         accept_locs = []
     if reject_locs is None:
         reject_locs = []
+    if search_cfg is None:
+        search_cfg = config.load_search_config()
 
     # Ensure DB schema
     init_db()
@@ -423,7 +506,7 @@ def scrape_employers(
             futures = {
                 pool.submit(
                     _process_one, key, employers, search_text,
-                    location_filter, accept_locs, reject_locs,
+                    location_filter, title_filter, accept_locs, reject_locs, search_cfg,
                 ): key
                 for key in valid_keys
             }
@@ -446,7 +529,7 @@ def scrape_employers(
         for key in valid_keys:
             result = _process_one(
                 key, employers, search_text,
-                location_filter, accept_locs, reject_locs,
+                location_filter, title_filter, accept_locs, reject_locs, search_cfg,
             )
             completed += 1
             total_new += result["new"]
@@ -464,7 +547,13 @@ def scrape_employers(
     log.info("[%s] Done: %d found, %d new, %d dupes in %.0fs",
              search_text, total_found, total_new, total_existing, elapsed)
 
-    return {"found": total_found, "new": total_new, "existing": total_existing}
+    return {
+        "found": total_found,
+        "new": total_new,
+        "existing": total_existing,
+        "errors": errors,
+        "attempts": len(valid_keys),
+    }
 
 
 # -- Public entry point ------------------------------------------------------
@@ -488,7 +577,14 @@ def run_workday_discovery(employers: dict | None = None, workers: int = 1) -> di
 
     if not employers:
         log.warning("No employers configured. Create config/employers.yaml.")
-        return {"found": 0, "new": 0, "existing": 0, "queries": 0}
+        return {
+            "found": 0,
+            "new": 0,
+            "existing": 0,
+            "queries": 0,
+            "errors": 0,
+            "attempts": 0,
+        }
 
     search_cfg = config.load_search_config()
     queries_cfg = search_cfg.get("queries", [])
@@ -504,19 +600,29 @@ def run_workday_discovery(employers: dict | None = None, workers: int = 1) -> di
 
     if not queries:
         log.warning("No search queries configured in searches.yaml.")
-        return {"found": 0, "new": 0, "existing": 0, "queries": 0}
+        return {
+            "found": 0,
+            "new": 0,
+            "existing": 0,
+            "queries": 0,
+            "errors": 0,
+            "attempts": 0,
+        }
 
     proxy = search_cfg.get("proxy")
     if proxy:
         setup_proxy(proxy)
 
     location_filter = search_cfg.get("workday_location_filter", True)
+    title_filter = search_cfg.get("workday_title_filter", search_cfg.get("direct_ats_filter_titles", True))
 
     log.info("Workday crawl: %d queries x %d employers (workers=%d)", len(queries), len(employers), workers)
 
     grand_new = 0
     grand_existing = 0
     grand_found = 0
+    grand_errors = 0
+    grand_attempts = 0
 
     for i, query in enumerate(queries, 1):
         log.info("Query %d/%d: \"%s\"", i, len(queries), query)
@@ -524,13 +630,17 @@ def run_workday_discovery(employers: dict | None = None, workers: int = 1) -> di
             search_text=query,
             employers=employers,
             location_filter=location_filter,
+            title_filter=title_filter,
             accept_locs=accept_locs,
             reject_locs=reject_locs,
+            search_cfg=search_cfg,
             workers=workers,
         )
         grand_new += result["new"]
         grand_existing += result["existing"]
         grand_found += result["found"]
+        grand_errors += int(result.get("errors", 0))
+        grand_attempts += int(result.get("attempts", 0))
 
     log.info("Workday crawl done: %d found, %d new, %d existing across %d queries x %d employers",
              grand_found, grand_new, grand_existing, len(queries), len(employers))
@@ -540,4 +650,6 @@ def run_workday_discovery(employers: dict | None = None, workers: int = 1) -> di
         "new": grand_new,
         "existing": grand_existing,
         "queries": len(queries),
+        "errors": grand_errors,
+        "attempts": grand_attempts,
     }

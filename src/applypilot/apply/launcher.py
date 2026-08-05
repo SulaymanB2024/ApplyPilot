@@ -31,6 +31,14 @@ from applypilot.apply.chrome import (
     reset_worker_dir, cleanup_on_exit, _kill_process_tree,
     BASE_CDP_PORT,
 )
+from applypilot.apply.runtime import (
+    breaker_open_until,
+    canonical_job_id,
+    domain_from_job_url,
+    isoformat_utc,
+    next_retry_at,
+    should_open_breaker,
+)
 from applypilot.apply.dashboard import (
     init_worker, update_state, add_event, get_state,
     render_full, get_totals,
@@ -75,10 +83,6 @@ def _make_mcp_config(cdp_port: int) -> dict:
                     f"--viewport-size={config.DEFAULTS['viewport']}",
                 ],
             },
-            "gmail": {
-                "command": "npx",
-                "args": ["-y", "@gongrzhe/server-gmail-autoauth-mcp"],
-            },
         }
     }
 
@@ -102,22 +106,41 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
     conn = get_connection()
     try:
         conn.execute("BEGIN IMMEDIATE")
+        now = isoformat_utc()
 
         if target_url:
             like = f"%{target_url.split('?')[0].rstrip('/')}%"
+            canonical_target = canonical_job_id(target_url)
             row = conn.execute("""
-                SELECT url, title, site, application_url, tailored_resume_path,
-                       fit_score, location, full_description, cover_letter_path
+                SELECT jobs.url, jobs.title, jobs.site, jobs.application_url,
+                       jobs.tailored_resume_path, jobs.fit_score, jobs.location,
+                       jobs.full_description, jobs.cover_letter_path,
+                       jobs.canonical_job_id, jobs.apply_domain
                 FROM jobs
-                WHERE (url = ? OR application_url = ? OR application_url LIKE ? OR url LIKE ?)
-                  AND tailored_resume_path IS NOT NULL
-                  AND apply_status != 'in_progress'
+                LEFT JOIN apply_domain_circuit_breakers breaker
+                  ON breaker.domain = jobs.apply_domain
+                WHERE (jobs.url = ? OR jobs.application_url = ? OR jobs.application_url LIKE ? OR jobs.url LIKE ?
+                       OR jobs.canonical_job_id = ?)
+                  AND jobs.tailored_resume_path IS NOT NULL
+                  AND (jobs.apply_status IS NULL OR jobs.apply_status = 'failed')
+                  AND (jobs.apply_attempts IS NULL OR jobs.apply_attempts < ?)
+                  AND (jobs.next_apply_attempt_at IS NULL OR jobs.next_apply_attempt_at <= ?)
+                  AND (breaker.opened_until IS NULL OR breaker.opened_until <= ?)
                 LIMIT 1
-            """, (target_url, target_url, like, like)).fetchone()
+            """, (
+                target_url,
+                target_url,
+                like,
+                like,
+                canonical_target,
+                config.DEFAULTS["max_apply_attempts"],
+                now,
+                now,
+            )).fetchone()
         else:
             blocked_sites, blocked_patterns = _load_blocked()
             # Build parameterized filters to avoid SQL injection
-            params: list = [min_score]
+            params: list = [now, min_score]
             site_clause = ""
             if blocked_sites:
                 placeholders = ",".join("?" * len(blocked_sites))
@@ -128,18 +151,23 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                 url_clauses = " ".join("AND url NOT LIKE ?" for _ in blocked_patterns)
                 params.extend(blocked_patterns)
             row = conn.execute(f"""
-                SELECT url, title, site, application_url, tailored_resume_path,
-                       fit_score, location, full_description, cover_letter_path
+                SELECT jobs.url, jobs.title, jobs.site, jobs.application_url, jobs.tailored_resume_path,
+                       jobs.fit_score, jobs.location, jobs.full_description, jobs.cover_letter_path,
+                       jobs.canonical_job_id, jobs.apply_domain
                 FROM jobs
-                WHERE tailored_resume_path IS NOT NULL
-                  AND (apply_status IS NULL OR apply_status = 'failed')
-                  AND (apply_attempts IS NULL OR apply_attempts < ?)
-                  AND fit_score >= ?
+                LEFT JOIN apply_domain_circuit_breakers breaker
+                  ON breaker.domain = jobs.apply_domain
+                WHERE jobs.tailored_resume_path IS NOT NULL
+                  AND (jobs.apply_status IS NULL OR jobs.apply_status = 'failed')
+                  AND (jobs.apply_attempts IS NULL OR jobs.apply_attempts < ?)
+                  AND (jobs.next_apply_attempt_at IS NULL OR jobs.next_apply_attempt_at <= ?)
+                  AND (breaker.opened_until IS NULL OR breaker.opened_until <= ?)
+                  AND jobs.fit_score >= ?
                   {site_clause}
                   {url_clauses}
-                ORDER BY fit_score DESC, url
+                ORDER BY jobs.fit_score DESC, jobs.url
                 LIMIT 1
-            """, [config.DEFAULTS["max_apply_attempts"]] + params).fetchone()
+            """, [config.DEFAULTS["max_apply_attempts"], now] + params).fetchone()
 
         if not row:
             conn.rollback()
@@ -150,7 +178,8 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
         apply_url = row["application_url"] or row["url"]
         if is_manual_ats(apply_url):
             conn.execute(
-                "UPDATE jobs SET apply_status = 'manual', apply_error = 'manual ATS' WHERE url = ?",
+                "UPDATE jobs SET apply_status = 'manual', apply_error = 'manual ATS', "
+                "apply_error_class = 'permanent', next_apply_attempt_at = NULL WHERE url = ?",
                 (row["url"],),
             )
             conn.commit()
@@ -161,9 +190,17 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
         conn.execute("""
             UPDATE jobs SET apply_status = 'in_progress',
                            agent_id = ?,
-                           last_attempted_at = ?
+                           last_attempted_at = ?,
+                           canonical_job_id = COALESCE(NULLIF(canonical_job_id, ''), ?),
+                           apply_domain = COALESCE(NULLIF(apply_domain, ''), ?)
             WHERE url = ?
-        """, (f"worker-{worker_id}", now, row["url"]))
+        """, (
+            f"worker-{worker_id}",
+            now,
+            row["canonical_job_id"] or canonical_job_id(row["url"], row["application_url"]),
+            row["apply_domain"] or domain_from_job_url(row["application_url"] or row["url"]),
+            row["url"],
+        ))
         conn.commit()
 
         return dict(row)
@@ -174,25 +211,76 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
 
 def mark_result(url: str, status: str, error: str | None = None,
                 permanent: bool = False, duration_ms: int | None = None,
-                task_id: str | None = None) -> None:
+                task_id: str | None = None,
+                verification_confidence: str | None = None) -> None:
     """Update a job's apply status in the database."""
     conn = get_connection()
     now = datetime.now(timezone.utc).isoformat()
+    row = conn.execute(
+        "SELECT apply_attempts, application_url, apply_domain FROM jobs WHERE url = ?",
+        (url,),
+    ).fetchone()
+    attempts_before = int(row["apply_attempts"] or 0) if row else 0
+    attempts_after = attempts_before + (0 if status == "applied" else 1)
+    domain = (
+        (row["apply_domain"] if row else None)
+        or domain_from_job_url((row["application_url"] if row else None) or url)
+    )
     if status == "applied":
         conn.execute("""
             UPDATE jobs SET apply_status = 'applied', applied_at = ?,
                            apply_error = NULL, agent_id = NULL,
-                           apply_duration_ms = ?, apply_task_id = ?
+                           apply_duration_ms = ?, apply_task_id = ?,
+                           verification_confidence = ?,
+                           next_apply_attempt_at = NULL,
+                           apply_error_class = NULL
             WHERE url = ?
-        """, (now, duration_ms, task_id, url))
+        """, (now, duration_ms, task_id, verification_confidence, url))
+        _record_domain_success(conn, domain)
     else:
         attempts = 99 if permanent else "COALESCE(apply_attempts, 0) + 1"
+        retry_at = None if permanent else next_retry_at(attempts_after)
+        error_class = "permanent" if permanent else "retryable"
         conn.execute(f"""
             UPDATE jobs SET apply_status = ?, apply_error = ?,
                            apply_attempts = {attempts}, agent_id = NULL,
-                           apply_duration_ms = ?, apply_task_id = ?
+                           apply_duration_ms = ?, apply_task_id = ?,
+                           verification_confidence = ?,
+                           next_apply_attempt_at = ?,
+                           apply_error_class = ?
             WHERE url = ?
-        """, (status, error or "unknown", duration_ms, task_id, url))
+        """, (
+            status,
+            error or "unknown",
+            duration_ms,
+            task_id,
+            verification_confidence,
+            retry_at,
+            error_class,
+            url,
+        ))
+        if should_open_breaker(error or status):
+            _record_domain_failure(conn, domain, error or status)
+    conn.commit()
+
+
+def mark_dry_run_verified(url: str, duration_ms: int | None = None) -> None:
+    """Release an apply lock after a verified dry run without marking applied."""
+    conn = get_connection()
+    conn.execute("""
+        UPDATE jobs SET apply_status = NULL, apply_error = NULL,
+                       agent_id = NULL, apply_duration_ms = ?,
+                       verification_confidence = 'dry_run',
+                       next_apply_attempt_at = NULL,
+                       apply_error_class = NULL
+        WHERE url = ?
+    """, (duration_ms, url))
+    domain_row = conn.execute("SELECT apply_domain, application_url FROM jobs WHERE url = ?", (url,)).fetchone()
+    domain = (
+        (domain_row["apply_domain"] if domain_row else None)
+        or domain_from_job_url((domain_row["application_url"] if domain_row else None) or url)
+    )
+    _record_domain_success(conn, domain)
     conn.commit()
 
 
@@ -206,6 +294,39 @@ def release_lock(url: str) -> None:
     conn.commit()
 
 
+def _record_domain_failure(conn, domain: str, reason: str) -> None:
+    """Increment and possibly open a domain circuit breaker."""
+    if not domain:
+        return
+    now = isoformat_utc()
+    row = conn.execute(
+        "SELECT failure_count FROM apply_domain_circuit_breakers WHERE domain = ?",
+        (domain,),
+    ).fetchone()
+    failure_count = (int(row["failure_count"] or 0) if row else 0) + 1
+    opened_until = breaker_open_until() if failure_count >= 3 else None
+    conn.execute("""
+        INSERT INTO apply_domain_circuit_breakers
+            (domain, failure_count, opened_until, last_reason, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(domain) DO UPDATE SET
+            failure_count = excluded.failure_count,
+            opened_until = excluded.opened_until,
+            last_reason = excluded.last_reason,
+            updated_at = excluded.updated_at
+    """, (domain, failure_count, opened_until, reason, now))
+
+
+def _record_domain_success(conn, domain: str) -> None:
+    """Clear a domain breaker after a confirmed healthy apply path."""
+    if not domain:
+        return
+    conn.execute("""
+        DELETE FROM apply_domain_circuit_breakers
+        WHERE domain = ?
+    """, (domain,))
+
+
 # ---------------------------------------------------------------------------
 # Utility modes (--gen, --mark-applied, --mark-failed, --reset-failed)
 # ---------------------------------------------------------------------------
@@ -213,7 +334,8 @@ def release_lock(url: str) -> None:
 def gen_prompt(target_url: str, min_score: int = 7,
                model: str | None = None, worker_id: int = 0,
                agent_backend: str | None = None,
-               supervisor_model: str | None = None) -> Path | None:
+               supervisor_model: str | None = None,
+               dry_run: bool = True) -> Path | None:
     """Generate a prompt file and print the agent CLI command for manual debugging.
 
     Returns:
@@ -235,7 +357,7 @@ def gen_prompt(target_url: str, min_score: int = 7,
         executor_model=model,
         supervisor_model=supervisor_model,
     )
-    prompt = prompt_mod.build_prompt(job=job, tailored_resume=resume_text)
+    prompt = prompt_mod.build_prompt(job=job, tailored_resume=resume_text, dry_run=dry_run)
     prompt = f"{harness.prompt_header(settings)}\n\n{prompt}"
 
     # Release the lock so the job stays available
@@ -273,13 +395,19 @@ def mark_job(url: str, status: str, reason: str | None = None) -> None:
     if status == "applied":
         conn.execute("""
             UPDATE jobs SET apply_status = 'applied', applied_at = ?,
-                           apply_error = NULL, agent_id = NULL
+                           apply_error = NULL, agent_id = NULL,
+                           next_apply_attempt_at = NULL,
+                           apply_error_class = NULL,
+                           verification_confidence = 'manual'
             WHERE url = ?
         """, (now, url))
     else:
         conn.execute("""
             UPDATE jobs SET apply_status = 'failed', apply_error = ?,
-                           apply_attempts = 99, agent_id = NULL
+                           apply_attempts = 99, agent_id = NULL,
+                           next_apply_attempt_at = NULL,
+                           apply_error_class = 'permanent',
+                           verification_confidence = 'manual'
             WHERE url = ?
         """, (reason or "manual", url))
     conn.commit()
@@ -294,7 +422,9 @@ def reset_failed() -> int:
     conn = get_connection()
     cursor = conn.execute("""
         UPDATE jobs SET apply_status = NULL, apply_error = NULL,
-                       apply_attempts = 0, agent_id = NULL
+                       apply_attempts = 0, agent_id = NULL,
+                       next_apply_attempt_at = NULL,
+                       apply_error_class = NULL
         WHERE apply_status = 'failed'
           OR (apply_status IS NOT NULL AND apply_status != 'applied'
               AND apply_status != 'in_progress')
@@ -309,6 +439,7 @@ def _run_deterministic_job(
     worker_id: int,
     settings: harness.HarnessSettings,
     dry_run: bool,
+    fact_ledger=None,
 ) -> tuple[str, int]:
     """Run the code-first Codex apply controller for one job."""
     from applypilot.apply.controller import run_deterministic_controller
@@ -326,7 +457,9 @@ def _run_deterministic_job(
                 "dry_run": dry_run,
                 "job_url": job.get("application_url") or job.get("url"),
                 "account_creation_allowed": settings.allow_account_creation,
-                "onepassword_enabled": settings.onepassword_enabled,
+                "credential_provider": settings.credential_provider,
+                "google_password_manager": settings.uses_google_password_manager,
+                "onepassword_enabled": settings.uses_onepassword,
             },
             indent=2,
         ),
@@ -359,6 +492,7 @@ def _run_deterministic_job(
         worker_dir=worker_dir,
         settings=settings,
         dry_run=dry_run,
+        fact_ledger=fact_ledger,
     )
     elapsed = max(result.duration_ms // 1000, 0)
     status = result.launcher_status()
@@ -385,9 +519,12 @@ def _run_deterministic_job(
 # ---------------------------------------------------------------------------
 
 def run_job(job: dict, port: int, worker_id: int = 0,
-            model: str | None = None, dry_run: bool = False,
+            model: str | None = None, dry_run: bool = True,
             agent_backend: str | None = None,
-            supervisor_model: str | None = None) -> tuple[str, int]:
+            supervisor_model: str | None = None,
+            allow_account_creation: bool | None = None,
+            approved_fact_digest: str | None = None,
+            corrections_path: Path | None = None) -> tuple[str, int]:
     """Spawn an agent session for one job application.
 
     Returns:
@@ -399,15 +536,36 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         agent_backend=agent_backend,
         executor_model=model,
         supervisor_model=supervisor_model,
+        allow_account_creation=allow_account_creation,
     )
     if settings.agent_backend == "codex" and settings.deterministic_controller:
+        fact_ledger = None
+        if not dry_run:
+            if not approved_fact_digest:
+                raise RuntimeError("approved_fact_digest_required_for_submit")
+            from applypilot.autonomy.facts import build_fact_ledger, load_corrections
+            from applypilot.autonomy.runner import require_approved_fact_digest
+
+            resume_text = config.RESUME_PATH.read_text(encoding="utf-8")
+            corrections = load_corrections(corrections_path) if corrections_path else ()
+            fact_ledger = build_fact_ledger(
+                config.load_profile(),
+                resume_text=resume_text,
+                corrections=corrections,
+            )
+            require_approved_fact_digest(fact_ledger.digest, approved_fact_digest)
         return _run_deterministic_job(
             job=job,
             port=port,
             worker_id=worker_id,
             settings=settings,
             dry_run=dry_run,
+            fact_ledger=fact_ledger,
         )
+
+    raise RuntimeError(
+        "legacy_agent_controller_disabled: use the deterministic Codex controller"
+    )
 
     # Read tailored resume text
     resume_path = job.get("tailored_resume_path")
@@ -458,7 +616,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             "--model", settings.executor_model,
             "-p",
             "--mcp-config", str(mcp_config_path),
-            "--permission-mode", "bypassPermissions",
+            "--permission-mode", "default",
             "--no-session-persistence",
             "--disallowedTools", (
                 "mcp__gmail__send_email,mcp__gmail__reply_email,"
@@ -480,7 +638,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
             "codex",
             "exec",
             "--model", settings.executor_model,
-            "--sandbox", "danger-full-access",
+            "--sandbox", "read-only",
             "--ephemeral",
             "--cd", str(worker_dir),
             "--output-last-message", str(codex_output_path),
@@ -671,6 +829,8 @@ PERMANENT_FAILURES: set[str] = {
     "unsafe_verification", "sso_required",
     "mfa_required", "payment_or_tax_info",
     "site_blocked", "cloudflare_blocked", "blocked_by_cloudflare",
+    "required_field_unresolved", "submitted_unconfirmed",
+    "no_fillable_form", "submit_button_not_found",
 }
 
 PERMANENT_PREFIXES: tuple[str, ...] = ("site_blocked", "cloudflare", "blocked_by")
@@ -693,9 +853,12 @@ def _is_permanent_failure(result: str) -> bool:
 def worker_loop(worker_id: int = 0, limit: int = 1,
                 target_url: str | None = None,
                 min_score: int = 7, headless: bool = False,
-                model: str | None = None, dry_run: bool = False,
+                model: str | None = None, dry_run: bool = True,
                 agent_backend: str | None = None,
-                supervisor_model: str | None = None) -> tuple[int, int]:
+                supervisor_model: str | None = None,
+                allow_account_creation: bool | None = None,
+                approved_fact_digest: str | None = None,
+                corrections_path: Path | None = None) -> tuple[int, int]:
     """Run jobs sequentially until limit is reached or queue is empty.
 
     Args:
@@ -708,6 +871,7 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
         dry_run: Don't click Submit.
         agent_backend: Agent runner backend.
         supervisor_model: Optional supervisor model label for the harness contract.
+        allow_account_creation: Whether this invocation may create a job-site account.
 
     Returns:
         Tuple of (applied_count, failed_count).
@@ -752,12 +916,13 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                 agent_backend=agent_backend,
                 executor_model=model,
                 supervisor_model=supervisor_model,
+                allow_account_creation=allow_account_creation,
             )
             if (
                 headless
                 and worker_settings.agent_backend == "codex"
                 and worker_settings.deterministic_controller
-                and worker_settings.onepassword_enabled
+                and worker_settings.uses_onepassword
                 and worker_settings.allow_account_creation
             ):
                 raise RuntimeError("headless_not_supported_with_1password_account_creation")
@@ -766,34 +931,60 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                 port=port,
                 headless=headless,
                 profile_directory=os.environ.get("APPLYPILOT_CHROME_PROFILE_DIRECTORY"),
+                credential_provider=(
+                    "onepassword" if worker_settings.uses_onepassword else worker_settings.credential_provider
+                ),
                 onepassword_extension_id=worker_settings.onepassword_extension_id,
             )
 
             result, duration_ms = run_job(job, port=port, worker_id=worker_id,
                                             model=model, dry_run=dry_run,
                                             agent_backend=agent_backend,
-                                            supervisor_model=supervisor_model)
+                                            supervisor_model=supervisor_model,
+                                            allow_account_creation=allow_account_creation,
+                                            approved_fact_digest=approved_fact_digest,
+                                            corrections_path=corrections_path)
 
             if result == "skipped":
                 release_lock(job["url"])
                 add_event(f"[W{worker_id}] Skipped: {job['title'][:30]}")
                 continue
             elif result == "applied":
-                mark_result(job["url"], "applied", duration_ms=duration_ms)
+                mark_result(
+                    job["url"],
+                    "applied",
+                    duration_ms=duration_ms,
+                    verification_confidence="confirmed",
+                )
                 applied += 1
                 update_state(worker_id, jobs_applied=applied,
                              jobs_done=applied + failed)
+            elif result == "dry_run_verified":
+                mark_dry_run_verified(job["url"], duration_ms=duration_ms)
+                add_event(f"[W{worker_id}] DRY RUN VERIFIED: {job['title'][:30]}")
+                update_state(worker_id, jobs_done=applied + failed)
             elif result == "email_draft":
                 mark_result(job["url"], "email_draft", "email draft required",
-                            permanent=True, duration_ms=duration_ms)
+                            permanent=True, duration_ms=duration_ms,
+                            verification_confidence="failed_closed")
+                failed += 1
+                update_state(worker_id, jobs_failed=failed,
+                             jobs_done=applied + failed)
+            elif result == "submitted_unconfirmed":
+                mark_result(job["url"], "submitted_unconfirmed", "submitted_unconfirmed",
+                            permanent=True, duration_ms=duration_ms,
+                            verification_confidence="unconfirmed")
                 failed += 1
                 update_state(worker_id, jobs_failed=failed,
                              jobs_done=applied + failed)
             else:
                 reason = result.split(":", 1)[-1] if ":" in result else result
-                mark_result(job["url"], "failed", reason,
+                confidence = "unconfirmed" if reason == "submitted_unconfirmed" else "failed_closed"
+                status = "submitted_unconfirmed" if reason == "submitted_unconfirmed" else "failed"
+                mark_result(job["url"], status, reason,
                             permanent=_is_permanent_failure(result),
-                            duration_ms=duration_ms)
+                            duration_ms=duration_ms,
+                            verification_confidence=confidence)
                 failed += 1
                 update_state(worker_id, jobs_failed=failed,
                              jobs_done=applied + failed)
@@ -828,10 +1019,13 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
 
 def main(limit: int = 1, target_url: str | None = None,
          min_score: int = 7, headless: bool = False, model: str | None = None,
-         dry_run: bool = False, continuous: bool = False,
+         dry_run: bool = True, continuous: bool = False,
          poll_interval: int = 60, workers: int = 1,
          agent_backend: str | None = None,
-         supervisor_model: str | None = None) -> None:
+         supervisor_model: str | None = None,
+         allow_account_creation: bool | None = None,
+         approved_fact_digest: str | None = None,
+         corrections_path: Path | None = None) -> None:
     """Launch the apply pipeline.
 
     Args:
@@ -846,6 +1040,7 @@ def main(limit: int = 1, target_url: str | None = None,
         workers: Number of parallel workers (default 1).
         agent_backend: Agent runner backend.
         supervisor_model: Optional supervisor model label for harness contracts.
+        allow_account_creation: Whether this invocation may create a job-site account.
     """
     global POLL_INTERVAL
     POLL_INTERVAL = poll_interval
@@ -919,6 +1114,9 @@ def main(limit: int = 1, target_url: str | None = None,
                     dry_run=dry_run,
                     agent_backend=agent_backend,
                     supervisor_model=supervisor_model,
+                    allow_account_creation=allow_account_creation,
+                    approved_fact_digest=approved_fact_digest,
+                    corrections_path=corrections_path,
                 )
             else:
                 # Multi-worker — distribute limit across workers
@@ -944,6 +1142,9 @@ def main(limit: int = 1, target_url: str | None = None,
                             dry_run=dry_run,
                             agent_backend=agent_backend,
                             supervisor_model=supervisor_model,
+                            allow_account_creation=allow_account_creation,
+                            approved_fact_digest=approved_fact_digest,
+                            corrections_path=corrections_path,
                         ): i
                         for i in range(workers)
                     }

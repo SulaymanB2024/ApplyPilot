@@ -8,106 +8,71 @@ required fields that deterministic mapping cannot answer.
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 import shutil
-import subprocess
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urljoin
 
 from applypilot import config
 from applypilot.apply import onepassword
+from applypilot.apply.field_resolver import (
+    CodexResolver,
+    FieldSpec,
+    ResolvedField,
+    detect_ats,
+    field_value_for,
+    needs_llm_fallback,
+    split_name,
+)
 from applypilot.apply.harness import HarnessSettings
-
-
-STOP_PATTERNS: dict[str, tuple[str, ...]] = {
-    "sso_required": (
-        "login.microsoftonline.com",
-        "accounts.google.com",
-        "okta.com",
-        "saml",
-        "single sign-on",
-        "single sign on",
-        "sign in with google",
-        "sign in with microsoft",
-    ),
-    "unsafe_permissions": (
-        "allow camera",
-        "allow microphone",
-        "screen sharing",
-        "share your screen",
-        "enable location",
-    ),
-    "unsafe_verification": (
-        "video interview",
-        "record a video",
-        "selfie",
-        "face verification",
-        "government id",
-        "identity verification",
-        "biometric",
-    ),
-    "payment_or_tax_info": (
-        "social security number",
-        "ssn",
-        "bank account",
-        "routing number",
-        "credit card",
-        "payment information",
-    ),
-    "mfa_required": (
-        "multi-factor",
-        "two-factor",
-        "2fa",
-        "verification code",
-        "check your email",
-        "email verification",
-        "passkey",
-    ),
-}
-
-SUCCESS_PATTERNS = (
-    "application submitted",
-    "application received",
-    "thank you for applying",
-    "thanks for applying",
-    "we received your application",
-    "your application has been submitted",
+from applypilot.apply.safety import (
+    classify_page_state,
+    classify_page_state_with_evidence,
+    inspect_page_state,
+)
+from applypilot.apply.submission import is_probable_submit_response, verify_submission
+from applypilot.autonomy.facts import (
+    FactLedger,
+    require_confirmed_facts,
+    validate_artifact_against_ledger,
 )
 
 EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
 
 
-@dataclass(frozen=True)
-class FieldSpec:
-    """A browser form field discovered by the controller."""
-
-    selector: str
-    tag: str
-    type: str
-    name: str = ""
-    label: str = ""
-    placeholder: str = ""
-    value: str = ""
-    required: bool = False
-    options: tuple[str, ...] = ()
-
-    @property
-    def haystack(self) -> str:
-        return " ".join(
-            [self.name, self.label, self.placeholder, self.type, " ".join(self.options)]
-        ).lower()
+__all__ = [
+    "CodexResolver",
+    "ControllerResult",
+    "DeterministicApplyController",
+    "FieldSpec",
+    "ResolvedField",
+    "classify_page_state",
+    "file_upload_for_field",
+    "field_value_for",
+    "first_email",
+    "is_email_only_posting",
+    "run_deterministic_controller",
+    "split_name",
+]
 
 
-@dataclass(frozen=True)
-class ResolvedField:
-    """A deterministic value for a field."""
+def file_upload_for_field(spec: FieldSpec, uploads: dict[str, str]) -> str | None:
+    """Resolve a file input only when its document purpose is explicit."""
+    field_text = f" {spec.haystack} "
+    if "cover" in field_text:
+        return uploads.get("cover_letter")
+    if any(token in field_text for token in ("resume", "résumé", "curriculum vitae", " cv ")):
+        return uploads.get("resume")
+    return None
 
-    value: str | bool
-    sensitive: bool = False
-    source: str = "deterministic"
+
+class RequiredFieldUnresolved(RuntimeError):
+    """Raised when a required field cannot be safely resolved."""
 
 
 @dataclass
@@ -119,24 +84,12 @@ class ControllerResult:
     reason: str = ""
     artifacts: dict[str, str] = field(default_factory=dict)
     evidence: list[str] = field(default_factory=list)
+    verification_confidence: str = ""
 
     def launcher_status(self) -> str:
         if self.status == "failed" and self.reason:
             return f"failed:{self.reason}"
         return self.status
-
-
-def classify_page_state(url: str, text: str) -> str | None:
-    """Return a fail-closed result reason for known unsafe page states."""
-    combined = f"{url}\n{text}".lower()
-    for reason, patterns in STOP_PATTERNS.items():
-        if any(pattern in combined for pattern in patterns):
-            return reason
-    if "captcha" in combined or "cloudflare" in combined:
-        return "captcha"
-    if "job is no longer available" in combined or "no longer accepting applications" in combined:
-        return "expired"
-    return None
 
 
 def is_email_only_posting(text: str) -> bool:
@@ -160,158 +113,6 @@ def first_email(text: str) -> str:
     return match.group(0) if match else ""
 
 
-def split_name(full_name: str) -> tuple[str, str]:
-    """Split a full name into first and last for form filling."""
-    parts = [p for p in full_name.split() if p]
-    if not parts:
-        return "", ""
-    if len(parts) == 1:
-        return parts[0], ""
-    return parts[0], parts[-1]
-
-
-def field_value_for(
-    spec: FieldSpec,
-    *,
-    profile: dict,
-    job: dict,
-    credential: onepassword.OnePasswordLogin | None = None,
-) -> ResolvedField | None:
-    """Resolve a form field from profile/job/credential facts."""
-    personal = profile.get("personal", {})
-    work_auth = profile.get("work_authorization", {})
-    compensation = profile.get("compensation", {})
-    availability = profile.get("availability", {})
-    eeo = profile.get("eeo_voluntary", {})
-    first, last = split_name(str(personal.get("full_name", "")))
-    h = spec.haystack
-
-    if spec.type in {"hidden", "submit", "button", "reset", "image"}:
-        return None
-    if "password" in h or spec.type == "password":
-        if credential and credential.password:
-            return ResolvedField(credential.password, sensitive=True, source="1password")
-        return None
-    if "email" in h:
-        return ResolvedField(str(personal.get("email", "")))
-    if "first" in h or "given" in h:
-        return ResolvedField(first)
-    if "last" in h or "surname" in h or "family" in h:
-        return ResolvedField(last)
-    if "full name" in h or h.strip() in {"name", "your name"}:
-        return ResolvedField(str(personal.get("full_name", "")))
-    if "phone" in h or "mobile" in h:
-        return ResolvedField(str(personal.get("phone", "")))
-    if "street" in h or "address" in h:
-        return ResolvedField(str(personal.get("address", "")))
-    if "city" in h:
-        return ResolvedField(str(personal.get("city", "")))
-    if "state" in h or "province" in h:
-        return ResolvedField(str(personal.get("province_state", "")))
-    if "zip" in h or "postal" in h:
-        return ResolvedField(str(personal.get("postal_code", "")))
-    if "country" in h:
-        return ResolvedField(str(personal.get("country", "")))
-    if "linkedin" in h:
-        return ResolvedField(str(personal.get("linkedin_url", "")))
-    if "github" in h:
-        return ResolvedField(str(personal.get("github_url", "")))
-    if "portfolio" in h:
-        return ResolvedField(str(personal.get("portfolio_url", "")))
-    if "website" in h:
-        return ResolvedField(str(personal.get("website_url", "")))
-    if "salary" in h or "compensation" in h or "pay expectation" in h:
-        return ResolvedField(str(compensation.get("salary_expectation", "")))
-    if "start date" in h or "available" in h:
-        return ResolvedField(str(availability.get("earliest_start_date", "Immediately")))
-    if "authorized" in h and "work" in h:
-        return ResolvedField("Yes" if work_auth.get("legally_authorized_to_work") else "No")
-    if "sponsor" in h or "visa" in h:
-        return ResolvedField("Yes" if work_auth.get("require_sponsorship") else "No")
-    if "gender" in h:
-        return ResolvedField(str(eeo.get("gender", "Decline to self-identify")))
-    if "race" in h or "ethnicity" in h:
-        return ResolvedField(str(eeo.get("race_ethnicity", "Decline to self-identify")))
-    if "veteran" in h:
-        return ResolvedField(str(eeo.get("veteran_status", "Decline to self-identify")))
-    if "disability" in h:
-        return ResolvedField(str(eeo.get("disability_status", "Decline to self-identify")))
-    if "position" in h or "role" in h:
-        return ResolvedField(str(job.get("title", "")))
-    if spec.type == "checkbox":
-        if any(word in h for word in ("privacy", "terms", "certify", "agree", "consent")):
-            return ResolvedField(True)
-        return None
-    return None
-
-
-class CodexResolver:
-    """Narrow Codex fallback for ambiguous required fields."""
-
-    def __init__(self, *, model: str, worker_dir: Path) -> None:
-        self.model = model
-        self.worker_dir = worker_dir
-
-    def resolve_field(self, spec: FieldSpec, *, profile: dict, job: dict) -> ResolvedField | None:
-        """Ask Codex for one field value and parse a small JSON response."""
-        prompt = {
-            "task": "Resolve one job application field using only provided facts. Return JSON only.",
-            "field": asdict(spec),
-            "job": {
-                "title": job.get("title"),
-                "site": job.get("site"),
-                "url": job.get("application_url") or job.get("url"),
-            },
-            "profile_facts": {
-                "personal": profile.get("personal", {}),
-                "work_authorization": profile.get("work_authorization", {}),
-                "compensation": profile.get("compensation", {}),
-                "availability": profile.get("availability", {}),
-                "eeo_voluntary": profile.get("eeo_voluntary", {}),
-            },
-            "rules": [
-                "Do not invent facts.",
-                "For EEO questions, prefer decline/self-identify answers.",
-                "If the answer cannot be determined, return null.",
-            ],
-            "response_schema": {"value": "string or boolean or null"},
-        }
-        cmd = [
-            "codex",
-            "exec",
-            "--model",
-            self.model,
-            "--sandbox",
-            "read-only",
-            "--ephemeral",
-            "--skip-git-repo-check",
-            "--cd",
-            str(self.worker_dir),
-            "-",
-        ]
-        result = subprocess.run(
-            cmd,
-            input=json.dumps(prompt),
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-        if result.returncode != 0:
-            return None
-        for line in reversed(result.stdout.splitlines()):
-            line = line.strip()
-            if not line.startswith("{"):
-                continue
-            try:
-                payload = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            value = payload.get("value")
-            if isinstance(value, str | bool):
-                return ResolvedField(value, source="codex")
-        return None
-
-
 class DeterministicApplyController:
     """Run one job application using deterministic browser automation."""
 
@@ -324,20 +125,35 @@ class DeterministicApplyController:
         settings: HarnessSettings,
         dry_run: bool = False,
         onepassword_client: onepassword.OnePasswordClient | None = None,
+        fact_ledger: FactLedger | None = None,
     ) -> None:
         self.job = job
         self.port = port
         self.worker_dir = worker_dir
         self.settings = settings
         self.dry_run = dry_run
+        self.fact_ledger = fact_ledger
         self.profile = config.load_profile()
         self.events: list[str] = []
         self.artifacts: dict[str, str] = {}
         self._secrets: list[str] = []
-        self._op = onepassword_client or onepassword.OnePasswordClient(
-            vault=settings.onepassword_vault
+        self._op = (
+            onepassword_client
+            or (
+                onepassword.OnePasswordClient(vault=settings.onepassword_vault)
+                if settings.uses_onepassword
+                else None
+            )
         )
-        self._resolver = CodexResolver(model=settings.executor_model, worker_dir=worker_dir)
+        self._resolver = (
+            CodexResolver(
+                model=settings.executor_model,
+                worker_dir=worker_dir,
+                max_calls=settings.field_model_call_budget,
+            )
+            if settings.field_model_call_budget > 0
+            else None
+        )
 
     def run(self) -> ControllerResult:
         """Execute the deterministic apply flow."""
@@ -346,13 +162,62 @@ class DeterministicApplyController:
             self._preflight()
             uploads = self._prepare_uploads()
             return self._run_browser(uploads=uploads, start=start)
+        except RequiredFieldUnresolved:
+            return self._finish(
+                "failed",
+                start,
+                reason="required_field_unresolved",
+                verification_confidence="failed_closed",
+            )
         except Exception as exc:
             self._record(f"controller error: {exc}")
-            return self._finish("failed", start, reason=str(exc)[:80])
+            return self._finish(
+                "failed",
+                start,
+                reason=str(exc)[:80],
+                verification_confidence="failed_closed",
+            )
 
     def _preflight(self) -> None:
-        if self.settings.onepassword_enabled and self.settings.allow_account_creation:
+        if not self.dry_run:
+            if self.fact_ledger is None:
+                raise RuntimeError("approved_fact_ledger_required")
+            required_facts = (
+                "profile.personal.full_name",
+                "profile.personal.email",
+                "profile.personal.phone",
+                "profile.personal.city",
+                "profile.personal.country",
+                "profile.work_authorization.legally_authorized_to_work",
+                "profile.work_authorization.require_sponsorship",
+                "profile.availability.earliest_start_date",
+            )
+            fact_blockers = require_confirmed_facts(self.fact_ledger, required_facts)
+            if fact_blockers:
+                raise RuntimeError("required_facts_unconfirmed:" + ",".join(fact_blockers))
+            for path_key in ("tailored_resume_path", "cover_letter_path"):
+                artifact_path = self.job.get(path_key)
+                if not artifact_path:
+                    continue
+                text_path = Path(artifact_path).with_suffix(".txt")
+                if not text_path.exists():
+                    raise RuntimeError(f"reviewable_text_artifact_missing:{path_key}")
+                blockers = validate_artifact_against_ledger(
+                    text_path.read_text(encoding="utf-8"),
+                    self.fact_ledger,
+                )
+                if blockers:
+                    raise RuntimeError(
+                        f"artifact_fact_validation_failed:{path_key}:" + ",".join(blockers)
+                    )
+        if self.settings.uses_onepassword and self.settings.allow_account_creation:
+            if self._op is None:
+                raise RuntimeError("onepassword_required_for_account_creation")
             self._op.require_ready()
+        if self.settings.uses_google_password_manager:
+            self._record(
+                "using Google Password Manager via Chrome profile; credentials are browser-managed"
+            )
 
     def _run_browser(self, *, uploads: dict[str, str], start: float) -> ControllerResult:
         try:
@@ -370,60 +235,156 @@ class DeterministicApplyController:
             context = browser.contexts[0] if browser.contexts else browser.new_context()
             page = context.pages[0] if context.pages else context.new_page()
             page.goto(target_url, wait_until="domcontentloaded", timeout=45000)
-            page.wait_for_timeout(1000)
+            self._wait_for_page_ready(page)
+            self._dismiss_cookie_banner(page)
 
-            text = self._page_text(page)
-            stop_reason = classify_page_state(page.url, text)
-            if stop_reason:
+            state = inspect_page_state(page)
+            has_login_form = self._has_login_or_account_form(page)
+            verdict = classify_page_state_with_evidence(
+                state,
+                allow_password=has_login_form,
+            )
+            if verdict:
+                self._record(f"stop gate {verdict.reason}: {verdict.evidence}")
                 self._capture(page, "blocked")
-                return self._finish("failed", start, reason=stop_reason)
+                return self._finish(
+                    "failed",
+                    start,
+                    reason=verdict.reason,
+                    verification_confidence="failed_closed",
+                )
 
-            if is_email_only_posting(text):
-                self._write_email_draft(text, uploads)
+            if is_email_only_posting(state.text):
+                self._write_email_draft(state.text, uploads)
                 self._capture(page, "email-draft")
-                return self._finish("email_draft", start, reason="email_only")
+                return self._finish(
+                    "email_draft",
+                    start,
+                    reason="email_only",
+                    verification_confidence="failed_closed",
+                )
+
+            if self._application_form_scope(page) is None and self._click_application_entry(page):
+                self._wait_for_page_ready(page)
+                self._dismiss_cookie_banner(page)
+                if self._click_button_by_text(page, ("apply manually",)):
+                    self._wait_for_page_ready(page)
+                state = inspect_page_state(page)
+                verdict = classify_page_state_with_evidence(state)
+                if verdict:
+                    self._record(f"stop gate {verdict.reason}: {verdict.evidence}")
+                    self._capture(page, "apply-entry-blocked")
+                    return self._finish(
+                        "failed",
+                        start,
+                        reason=verdict.reason,
+                        verification_confidence="failed_closed",
+                    )
 
             credential: onepassword.OnePasswordLogin | None = None
-            if self._has_login_or_account_form(page):
+            if has_login_form:
                 credential = self._credential_for_page(page)
                 self._fill_login_or_account(page, credential)
                 try:
                     page.wait_for_load_state("domcontentloaded", timeout=10000)
                 except PlaywrightTimeoutError:
                     pass
-                text = self._page_text(page)
-                stop_reason = classify_page_state(page.url, text)
-                if stop_reason:
+                self._wait_for_page_ready(page)
+                state = inspect_page_state(page)
+                verdict = classify_page_state_with_evidence(state)
+                if verdict:
+                    self._record(f"stop gate {verdict.reason}: {verdict.evidence}")
                     self._capture(page, "login-blocked")
-                    return self._finish("failed", start, reason=stop_reason)
+                    return self._finish(
+                        "failed",
+                        start,
+                        reason=verdict.reason,
+                        verification_confidence="failed_closed",
+                    )
 
-            filled = self._fill_application_form(page, uploads=uploads, credential=credential)
-            self._record(f"filled {filled} deterministic field(s)")
-            self._capture(page, "review")
+            filled, submit_ready = self._fill_application_steps(
+                page,
+                uploads=uploads,
+                credential=credential,
+            )
+            self._record(f"filled {filled} deterministic field(s) across application steps")
             if filled == 0:
-                return self._finish("failed", start, reason="no_fillable_form")
+                return self._finish(
+                    "failed",
+                    start,
+                    reason="no_fillable_form",
+                    verification_confidence="failed_closed",
+                )
+
+            if not submit_ready:
+                return self._finish(
+                    "failed",
+                    start,
+                    reason="submit_button_not_found",
+                    verification_confidence="failed_closed",
+                )
 
             if self.dry_run:
-                return self._finish("applied", start, reason="dry_run_verified")
+                return self._finish(
+                    "dry_run_verified",
+                    start,
+                    reason="dry_run_verified",
+                    verification_confidence="dry_run",
+                )
 
-            if not self._click_submit(page):
-                return self._finish("failed", start, reason="submit_button_not_found")
+            before_submit_url = page.url
+            clicked, response = self._click_submit_and_capture_response(page)
+            if not clicked:
+                return self._finish(
+                    "failed",
+                    start,
+                    reason="submit_button_not_found",
+                    verification_confidence="failed_closed",
+                )
             try:
                 page.wait_for_load_state("domcontentloaded", timeout=15000)
             except PlaywrightTimeoutError:
                 pass
             page.wait_for_timeout(2000)
-            text = self._page_text(page)
-            stop_reason = classify_page_state(page.url, text)
-            if stop_reason:
+            state = inspect_page_state(page)
+            verdict = classify_page_state_with_evidence(state)
+            if verdict:
+                self._record(f"stop gate {verdict.reason}: {verdict.evidence}")
                 self._capture(page, "submit-blocked")
-                return self._finish("failed", start, reason=stop_reason)
+                return self._finish(
+                    "failed",
+                    start,
+                    reason=verdict.reason,
+                    verification_confidence="failed_closed",
+                )
             self._capture(page, "submitted")
-            if any(pattern in text.lower() for pattern in SUCCESS_PATTERNS):
-                if credential and credential.pending:
+            verification = verify_submission(page, response=response, before_url=before_submit_url)
+            self._record(
+                f"submission verification {verification.status}: "
+                f"{verification.reason}; evidence={list(verification.evidence)}"
+            )
+            if verification.status == "submitted_confirmed":
+                if credential and credential.pending and self._op:
                     self._op.mark_created(credential.item_id)
-                return self._finish("applied", start, reason="confirmation_detected")
-            return self._finish("failed", start, reason="no_confirmation")
+                return self._finish(
+                    "applied",
+                    start,
+                    reason="submitted_confirmed",
+                    verification_confidence=verification.confidence,
+                )
+            if verification.status == "submitted_unconfirmed":
+                return self._finish(
+                    "submitted_unconfirmed",
+                    start,
+                    reason="submitted_unconfirmed",
+                    verification_confidence=verification.confidence,
+                )
+            return self._finish(
+                "failed",
+                start,
+                reason=verification.reason,
+                verification_confidence=verification.confidence,
+            )
 
     def _prepare_uploads(self) -> dict[str, str]:
         personal = self.profile.get("personal", {})
@@ -437,6 +398,8 @@ class DeterministicApplyController:
         resume_out = self.worker_dir / f"{name_slug}_Resume.pdf"
         shutil.copy2(resume_pdf, resume_out)
         uploads = {"resume": str(resume_out)}
+        self.artifacts["uploaded_resume"] = str(resume_out)
+        self.artifacts["uploaded_resume_sha256"] = self._sha256(resume_out)
 
         cover_path = self.job.get("cover_letter_path")
         if cover_path:
@@ -445,13 +408,37 @@ class DeterministicApplyController:
                 cover_out = self.worker_dir / f"{name_slug}_Cover_Letter.pdf"
                 shutil.copy2(cover_pdf, cover_out)
                 uploads["cover_letter"] = str(cover_out)
+                self.artifacts["uploaded_cover_letter"] = str(cover_out)
+                self.artifacts["uploaded_cover_letter_sha256"] = self._sha256(cover_out)
         return uploads
 
-    def _credential_for_page(self, page: Any) -> onepassword.OnePasswordLogin:
+    @staticmethod
+    def _sha256(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def _credential_for_page(self, page: Any) -> onepassword.OnePasswordLogin | None:
+        if self.settings.uses_google_password_manager:
+            page_text = self._page_text(page).lower()
+            account_only = (
+                any(marker in page_text for marker in ("create account", "sign up"))
+                and not any(marker in page_text for marker in ("sign in", "log in"))
+            )
+            if account_only and not self.settings.allow_account_creation:
+                raise RuntimeError("account_required")
+            domain = onepassword.domain_from_url(page.url)
+            self._record(
+                f"using Google Password Manager browser autofill for {domain}; "
+                "no password values are read or generated"
+            )
+            return None
         if not self.settings.allow_account_creation:
             raise RuntimeError("account_required")
-        if not self.settings.onepassword_enabled:
-            raise RuntimeError("onepassword_required_for_account_creation")
+        if not self.settings.uses_onepassword or self._op is None:
+            raise RuntimeError("credential_provider_required_for_account_creation")
 
         email = str(self.profile.get("personal", {}).get("email", ""))
         domain = onepassword.domain_from_url(page.url)
@@ -479,6 +466,59 @@ class DeterministicApplyController:
         self._record(f"created pending 1Password login for {domain}")
         return login
 
+    def _fill_application_steps(
+        self,
+        page: Any,
+        *,
+        uploads: dict[str, str],
+        credential: onepassword.OnePasswordLogin | None,
+        max_steps: int = 8,
+    ) -> tuple[int, bool]:
+        """Fill application pages until an exact final-submit control is visible."""
+        total_filled = 0
+        for step in range(1, max_steps + 1):
+            state = inspect_page_state(page)
+            verdict = classify_page_state_with_evidence(state)
+            if verdict:
+                self._record(f"stop gate {verdict.reason}: {verdict.evidence}")
+                self._capture(page, f"step-{step}-blocked")
+                raise RequiredFieldUnresolved(verdict.reason)
+
+            try:
+                filled = self._fill_application_form(
+                    page,
+                    uploads=uploads,
+                    credential=credential,
+                )
+            except RequiredFieldUnresolved:
+                self._capture(page, f"step-{step}-required-unresolved")
+                raise
+            total_filled += filled
+            self._record(f"step {step}: filled {filled} deterministic field(s)")
+            self._capture(page, f"step-{step}-review")
+
+            if self._submit_locator(page) is not None:
+                return total_filled, True
+
+            progress = self._progress_locator(page)
+            if progress is None:
+                return total_filled, False
+
+            before_url = page.url
+            progress.click(timeout=5000)
+            self._wait_for_page_ready(page)
+            page.wait_for_timeout(750)
+            if self._has_validation_errors(page):
+                self._record(f"step {step}: validation errors after progress action")
+                self._capture(page, f"step-{step}-validation-error")
+                raise RequiredFieldUnresolved("validation errors after progress")
+            self._record(
+                f"advanced application step {step}; url_changed={page.url != before_url}"
+            )
+
+        self._record(f"application exceeded maximum step count ({max_steps})")
+        return total_filled, False
+
     def _fill_application_form(
         self,
         page: Any,
@@ -487,47 +527,129 @@ class DeterministicApplyController:
         credential: onepassword.OnePasswordLogin | None,
     ) -> int:
         count = 0
-        for spec in self._collect_fields(page):
-            if spec.type == "file":
-                path = uploads["cover_letter"] if "cover" in spec.haystack and "cover_letter" in uploads else uploads["resume"]
+        for _ in range(3):
+            filled_this_pass = 0
+            specs = self._collect_fields(page)
+            deterministic: dict[str, ResolvedField] = {}
+            fallback_specs: list[FieldSpec] = []
+            for spec in specs:
+                if self._field_already_satisfied(spec) or spec.type == "file":
+                    continue
+                resolved = field_value_for(
+                    spec,
+                    profile=self.profile,
+                    job=self.job,
+                    credential=credential,
+                )
+                if resolved is not None:
+                    deterministic[spec.selector] = resolved
+                elif needs_llm_fallback(spec):
+                    fallback_specs.append(spec)
+
+            fallback: dict[str, ResolvedField] = {}
+            if fallback_specs and self._resolver is not None:
+                fallback = self._resolver.resolve_fields(
+                    fallback_specs,
+                    profile=self.profile,
+                    job=self.job,
+                )
+
+            for spec in specs:
+                if self._field_already_satisfied(spec):
+                    continue
+                if spec.role.lower() == "combobox" and spec.tag != "select":
+                    self._record(
+                        "custom combobox unsupported: "
+                        f"selector={spec.selector} label={spec.accessible_name!r}"
+                    )
+                    if spec.required:
+                        raise RequiredFieldUnresolved("required custom combobox unsupported")
+                    continue
+                if spec.type == "file":
+                    path = file_upload_for_field(spec, uploads)
+                    if not path:
+                        self._record(
+                            "file field unresolved: "
+                            f"selector={spec.selector} label={spec.accessible_name!r}"
+                        )
+                        if spec.required:
+                            raise RequiredFieldUnresolved("required file purpose unresolved")
+                        continue
+                    try:
+                        page.locator(spec.selector).set_input_files(path, timeout=5000)
+                        count += 1
+                        filled_this_pass += 1
+                    except Exception:
+                        self._record(f"file upload failed for {spec.selector}")
+                        if spec.required:
+                            raise RequiredFieldUnresolved("required file upload failed")
+                    continue
+
+                resolved = deterministic.get(spec.selector) or fallback.get(spec.selector)
+                if resolved is None or resolved.value in ("", None):
+                    if spec.required:
+                        self._record(
+                            "required field unresolved: "
+                            f"selector={spec.selector} name={spec.name!r} label={spec.accessible_name!r}"
+                        )
+                        raise RequiredFieldUnresolved("required field unresolved")
+                    continue
+
                 try:
-                    page.locator(spec.selector).set_input_files(path, timeout=5000)
+                    locator = page.locator(spec.selector)
+                    if spec.type == "checkbox" and isinstance(resolved.value, bool):
+                        locator.set_checked(resolved.value, timeout=5000)
+                    elif spec.type == "radio":
+                        if not self._radio_matches(spec, str(resolved.value)):
+                            continue
+                        locator.set_checked(True, timeout=5000)
+                    elif spec.tag == "select":
+                        locator.select_option(label=str(resolved.value), timeout=5000)
+                    else:
+                        locator.fill(str(resolved.value), timeout=5000)
+                    if resolved.sensitive:
+                        self._secrets.append(str(resolved.value))
+                    self._record(
+                        f"filled {spec.selector} from {resolved.source} "
+                        f"confidence={resolved.confidence:.2f}"
+                    )
                     count += 1
+                    filled_this_pass += 1
                 except Exception:
-                    self._record(f"file upload failed for {spec.selector}")
-                continue
-
-            resolved = field_value_for(spec, profile=self.profile, job=self.job, credential=credential)
-            if resolved is None and spec.required:
-                resolved = self._resolver.resolve_field(spec, profile=self.profile, job=self.job)
-            if resolved is None or resolved.value in ("", None):
-                continue
-
-            try:
-                locator = page.locator(spec.selector)
-                if spec.type == "checkbox" and isinstance(resolved.value, bool):
-                    locator.set_checked(resolved.value, timeout=5000)
-                elif spec.tag == "select":
-                    locator.select_option(label=str(resolved.value), timeout=5000)
-                else:
-                    locator.fill(str(resolved.value), timeout=5000)
-                if resolved.sensitive:
-                    self._secrets.append(str(resolved.value))
-                count += 1
-            except Exception:
-                self._record(f"fill failed for {spec.selector}")
+                    self._record(f"fill failed for {spec.selector}")
+                    if spec.required:
+                        raise RequiredFieldUnresolved("required field fill failed")
+            if filled_this_pass == 0:
+                break
         return count
 
-    def _fill_login_or_account(self, page: Any, credential: onepassword.OnePasswordLogin) -> None:
+    def _field_already_satisfied(self, spec: FieldSpec) -> bool:
+        if spec.type in {"checkbox", "radio", "file"} or spec.tag == "select":
+            return False
+        return bool(spec.value and spec.value.strip())
+
+    @staticmethod
+    def _radio_matches(spec: FieldSpec, value: str) -> bool:
+        desired = re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
+        current = re.sub(
+            r"[^a-z0-9]+",
+            " ",
+            " ".join([spec.value, spec.label, spec.accessible_name]).lower(),
+        ).strip()
+        return bool(desired and (desired == current or desired in current.split()))
+
+    def _fill_login_or_account(self, page: Any, credential: onepassword.OnePasswordLogin | None) -> None:
         filled = self._fill_application_form(page, uploads={"resume": ""}, credential=credential)
         self._record(f"filled {filled} login/account field(s)")
-        if not self._click_button_by_text(page, ("continue", "next", "sign in", "log in", "create account", "sign up")):
+        button_text = ["continue", "next", "sign in", "log in"]
+        if self.settings.allow_account_creation:
+            button_text.extend(["create account", "sign up"])
+        if not self._click_button_by_text(page, tuple(button_text)):
             self._record("no login/account continuation button found")
 
     def _has_login_or_account_form(self, page: Any) -> bool:
-        text = self._page_text(page).lower()
-        if any(word in text for word in ("sign in", "log in", "create account", "sign up")):
-            return True
+        # Job-detail pages often include utility/header links named "Sign In".
+        # Treat only an actual password control as a login/account surface.
         return page.locator('input[type="password"]').count() > 0
 
     def _collect_fields(self, page: Any) -> list[FieldSpec]:
@@ -539,37 +661,83 @@ class DeterministicApplyController:
             const rect = el.getBoundingClientRect();
             return style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0;
           });
-          return visible.map((el, idx) => {
-            el.setAttribute('data-applypilot-field', String(idx));
+          const labelFor = (el) => {
             const id = el.getAttribute('id') || '';
+            let ariaLabelledbyText = '';
+            const labelledBy = el.getAttribute('aria-labelledby') || '';
+            if (labelledBy) {
+              ariaLabelledbyText = labelledBy.split(/\\s+/).map((part) => {
+                const ref = document.getElementById(part);
+                return ref ? (ref.innerText || ref.textContent || '') : '';
+              }).join(' ').trim();
+            }
+            const ariaLabel = el.getAttribute('aria-label') || '';
             let label = '';
             if (id) {
               const labelEl = document.querySelector(`label[for="${CSS.escape(id)}"]`);
-              if (labelEl) label = labelEl.innerText || '';
+              if (labelEl) label = labelEl.innerText || labelEl.textContent || '';
             }
             if (!label) {
               const parentLabel = el.closest('label');
-              if (parentLabel) label = parentLabel.innerText || '';
+              if (parentLabel) label = parentLabel.innerText || parentLabel.textContent || '';
             }
+            return {id, ariaLabelledbyText, ariaLabel, label};
+          };
+          const groupLabelFor = (el) => {
+            const fieldset = el.closest('fieldset');
+            if (fieldset) {
+              const legend = fieldset.querySelector('legend');
+              if (legend) return legend.innerText || legend.textContent || '';
+            }
+            const group = el.closest('[role="radiogroup"]');
+            if (group) return group.getAttribute('aria-label') || group.innerText || '';
+            return '';
+          };
+          return visible.map((el, idx) => {
+            el.setAttribute('data-applypilot-field', String(idx));
+            const labels = labelFor(el);
+            const groupLabel = groupLabelFor(el);
             const options = el.tagName.toLowerCase() === 'select'
               ? Array.from(el.options).map((o) => o.text || o.value)
-              : [];
+              : ((el.getAttribute('type') || '').toLowerCase() === 'radio' && el.getAttribute('name')
+                ? Array.from(document.querySelectorAll(`input[type="radio"][name="${CSS.escape(el.getAttribute('name'))}"]`))
+                    .map((radio) => {
+                      const radioLabels = labelFor(radio);
+                      return radioLabels.label || radio.getAttribute('value') || '';
+                    })
+                : []);
+            const attributes = {};
+            for (const attr of el.attributes) {
+              if (attr.name.startsWith('data-') || ['min', 'max', 'pattern', 'maxlength'].includes(attr.name)) {
+                attributes[attr.name] = attr.value;
+              }
+            }
             return {
               selector: `[data-applypilot-field="${idx}"]`,
               tag: el.tagName.toLowerCase(),
               type: (el.getAttribute('type') || el.tagName).toLowerCase(),
-              name: el.getAttribute('name') || id || '',
-              label,
+              name: el.getAttribute('name') || labels.id || '',
+              label: [groupLabel, labels.label].filter(Boolean).join(' '),
               placeholder: el.getAttribute('placeholder') || '',
               value: el.value || '',
               required: Boolean(el.required || el.getAttribute('aria-required') === 'true'),
               options,
+              autocomplete: el.getAttribute('autocomplete') || '',
+              inputmode: el.getAttribute('inputmode') || '',
+              role: el.getAttribute('role') || '',
+              aria_label: labels.ariaLabel,
+              aria_labelledby_text: labels.ariaLabelledbyText,
+              title: el.getAttribute('title') || '',
+              accept: el.getAttribute('accept') || '',
+              data_automation_id: el.getAttribute('data-automation-id') || '',
+              attributes,
             };
           });
         }
         """
         raw_fields = page.evaluate(script)
         specs: list[FieldSpec] = []
+        ats = detect_ats(str(self.job.get("application_url") or self.job.get("url") or getattr(page, "url", "")))
         for item in raw_fields:
             if not isinstance(item, dict):
                 continue
@@ -584,29 +752,162 @@ class DeterministicApplyController:
                     value=str(item.get("value") or ""),
                     required=bool(item.get("required")),
                     options=tuple(str(opt) for opt in item.get("options", [])),
+                    autocomplete=str(item.get("autocomplete") or ""),
+                    inputmode=str(item.get("inputmode") or ""),
+                    role=str(item.get("role") or ""),
+                    aria_label=str(item.get("aria_label") or ""),
+                    aria_labelledby_text=str(item.get("aria_labelledby_text") or ""),
+                    title=str(item.get("title") or ""),
+                    accept=str(item.get("accept") or ""),
+                    data_automation_id=str(item.get("data_automation_id") or ""),
+                    ats=ats,
+                    attributes={
+                        str(k): str(v)
+                        for k, v in (item.get("attributes") or {}).items()
+                    },
                 )
             )
         return specs
 
-    def _click_submit(self, page: Any) -> bool:
-        return self._click_button_by_text(
-            page,
-            ("submit application", "submit", "apply", "send application", "finish"),
-        )
+    def _click_submit_and_capture_response(self, page: Any) -> tuple[bool, Any | None]:
+        try:
+            from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+        except ImportError:
+            PlaywrightTimeoutError = TimeoutError
+
+        locator = self._submit_locator(page)
+        if locator is None:
+            return False, None
+
+        clicked = False
+        try:
+            with page.expect_response(is_probable_submit_response, timeout=15000) as response_info:
+                locator.click(timeout=5000)
+                clicked = True
+            return True, response_info.value
+        except PlaywrightTimeoutError:
+            return clicked, None
+        except Exception:
+            if clicked:
+                return True, None
+            return False, None
 
     def _click_button_by_text(self, page: Any, labels: tuple[str, ...]) -> bool:
-        for label in labels:
-            locator = page.get_by_role("button", name=re.compile(label, re.I))
-            if locator.count():
-                locator.first.click(timeout=5000)
+        locator = self._button_locator_by_text(page, labels)
+        if locator is None:
+            return False
+        locator.click(timeout=5000)
+        return True
+
+    def _click_application_entry(self, page: Any) -> bool:
+        """Open the application surface from a job-detail page."""
+        exact_apply = re.compile(r"^(apply|apply now|start application)$", re.I)
+        buttons = page.get_by_role("button", name=exact_apply)
+        if buttons.count() == 1:
+            buttons.first.click(timeout=5000)
+            self._record("opened application surface via button")
+            return True
+
+        links = page.get_by_role("link", name=exact_apply)
+        if links.count() == 1:
+            href = links.first.get_attribute("href")
+            if href:
+                page.goto(urljoin(page.url, href), wait_until="domcontentloaded", timeout=45000)
+                self._record("opened application surface via exact apply link")
                 return True
-        for label in labels:
-            locator = page.locator(
-                f'input[type="submit" i][value*="{label}" i], button:has-text("{label}")'
-            )
-            if locator.count():
+        return False
+
+    def _dismiss_cookie_banner(self, page: Any) -> None:
+        """Choose the least-permissive exact cookie-banner option when present."""
+        for label in (
+            "decline all",
+            "reject all",
+            "only necessary",
+            "necessary only",
+            "use necessary cookies only",
+        ):
+            locator = page.get_by_role("button", name=re.compile(rf"^{re.escape(label)}$", re.I))
+            if locator.count() != 1:
+                continue
+            try:
                 locator.first.click(timeout=5000)
-                return True
+                self._record(f"cookie banner dismissed with {label!r}")
+            except Exception:
+                self._record(f"cookie banner dismissal failed for {label!r}")
+            return
+
+    def _button_locator_by_text(self, page: Any, labels: tuple[str, ...]) -> Any | None:
+        return self._unique_exact_button(page, labels)
+
+    def _submit_locator(self, page: Any) -> Any | None:
+        """Return one exact final-submit control scoped to the application form."""
+        scope = self._application_form_scope(page)
+        if scope is None:
+            scope = page
+        return self._unique_exact_button(
+            scope,
+            ("submit application", "submit", "send application"),
+        )
+
+    def _progress_locator(self, page: Any) -> Any | None:
+        """Return one exact non-final application progress control."""
+        scope = self._application_form_scope(page)
+        if scope is None:
+            scope = page
+        return self._unique_exact_button(
+            scope,
+            ("next", "continue", "save and continue", "review application"),
+        )
+
+    @staticmethod
+    def _application_form_scope(page: Any) -> Any | None:
+        forms = page.locator("form")
+        count = forms.count()
+        candidates: list[Any] = []
+        application_signals = (
+            'input[type="file"], input[name*="resume" i], '
+            'input[name*="first_name" i], input[autocomplete="given-name"]'
+        )
+        for idx in range(count):
+            form = forms.nth(idx)
+            if form.locator(application_signals).count():
+                candidates.append(form)
+        return candidates[0] if len(candidates) == 1 else None
+
+    @staticmethod
+    def _unique_exact_button(scope: Any, labels: tuple[str, ...]) -> Any | None:
+        pattern = re.compile(
+            rf"^(?:{'|'.join(re.escape(label) for label in labels)})$",
+            re.I,
+        )
+        buttons = scope.get_by_role("button", name=pattern)
+        button_count = buttons.count()
+        if button_count == 1:
+            return buttons.first
+        if button_count > 1:
+            return None
+
+        inputs = scope.locator('input[type="submit" i]')
+        matches: list[Any] = []
+        normalized_labels = {label.casefold() for label in labels}
+        for idx in range(inputs.count()):
+            candidate = inputs.nth(idx)
+            value = (candidate.get_attribute("value") or "").strip().casefold()
+            if value in normalized_labels:
+                matches.append(candidate)
+        return matches[0] if len(matches) == 1 else None
+
+    @staticmethod
+    def _has_validation_errors(page: Any) -> bool:
+        if page.locator('[aria-invalid="true"]').count():
+            return True
+        alerts = page.locator('[role="alert"], .field-error, .error-message')
+        for idx in range(min(alerts.count(), 10)):
+            try:
+                if alerts.nth(idx).is_visible():
+                    return True
+            except Exception:
+                continue
         return False
 
     def _page_text(self, page: Any) -> str:
@@ -614,6 +915,22 @@ class DeterministicApplyController:
             return page.locator("body").inner_text(timeout=5000)
         except Exception:
             return ""
+
+    def _wait_for_page_ready(self, page: Any, timeout: int = 20000) -> None:
+        """Wait for client-rendered ATS pages to expose meaningful body text."""
+        try:
+            page.wait_for_function(
+                "() => {"
+                "  const textReady = document.body && document.body.innerText.trim().length >= 300;"
+                "  const formReady = document.querySelectorAll('input, textarea, select').length > 0;"
+                "  return Boolean(textReady || formReady);"
+                "}",
+                timeout=timeout,
+            )
+            page.wait_for_timeout(750)
+            self._record("page readiness check passed")
+        except Exception:
+            self._record("page readiness check timed out")
 
     def _write_email_draft(self, page_text: str, uploads: dict[str, str]) -> None:
         email = first_email(page_text)
@@ -646,7 +963,14 @@ class DeterministicApplyController:
     def _record(self, message: str) -> None:
         self.events.append(onepassword.redact_text(message, self._secrets))
 
-    def _finish(self, status: str, start: float, *, reason: str = "") -> ControllerResult:
+    def _finish(
+        self,
+        status: str,
+        start: float,
+        *,
+        reason: str = "",
+        verification_confidence: str = "",
+    ) -> ControllerResult:
         duration_ms = int((time.time() - start) * 1000)
         result = ControllerResult(
             status=status,
@@ -654,11 +978,13 @@ class DeterministicApplyController:
             reason=reason,
             artifacts=self.artifacts,
             evidence=self.events,
+            verification_confidence=verification_confidence,
         )
         payload = {
             "finished_at": datetime.now(timezone.utc).isoformat(),
             "status": status,
             "reason": reason,
+            "verification_confidence": verification_confidence,
             "duration_ms": duration_ms,
             "job": {
                 "url": self.job.get("url"),
@@ -685,6 +1011,7 @@ def run_deterministic_controller(
     worker_dir: Path,
     settings: HarnessSettings,
     dry_run: bool,
+    fact_ledger: FactLedger | None = None,
 ) -> ControllerResult:
     """Convenience wrapper used by the launcher."""
     return DeterministicApplyController(
@@ -693,4 +1020,5 @@ def run_deterministic_controller(
         worker_dir=worker_dir,
         settings=settings,
         dry_run=dry_run,
+        fact_ledger=fact_ledger,
     ).run()

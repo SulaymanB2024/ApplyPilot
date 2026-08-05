@@ -1,10 +1,18 @@
+import pytest
+
+from applypilot.apply import controller as controller_mod
 from applypilot.apply.controller import (
+    DeterministicApplyController,
     FieldSpec,
     classify_page_state,
+    file_upload_for_field,
     field_value_for,
     first_email,
     is_email_only_posting,
 )
+from applypilot.apply.harness import load_settings
+from applypilot.autonomy.facts import FactCorrection, FactState, build_fact_ledger
+from applypilot.apply.safety import PageInput, PageState
 from applypilot.apply.onepassword import OnePasswordLogin
 
 
@@ -41,10 +49,93 @@ def resolve(label, field_type="text", credential=None):
     )
 
 
+def test_account_only_page_requires_explicit_account_permission(monkeypatch, tmp_path):
+    class Body:
+        @staticmethod
+        def inner_text(**_kwargs):
+            return "Create account to continue"
+
+    class Page:
+        url = "https://jobs.example.com/register"
+
+        @staticmethod
+        def locator(_selector):
+            return Body()
+
+    monkeypatch.setattr(controller_mod.config, "load_profile", lambda: PROFILE)
+    denied = DeterministicApplyController(
+        job={"url": Page.url, "title": "Analyst"},
+        port=9222,
+        worker_dir=tmp_path,
+        settings=load_settings(allow_account_creation=False),
+    )
+    allowed = DeterministicApplyController(
+        job={"url": Page.url, "title": "Analyst"},
+        port=9222,
+        worker_dir=tmp_path,
+        settings=load_settings(allow_account_creation=True),
+    )
+
+    with pytest.raises(RuntimeError, match="account_required"):
+        denied._credential_for_page(Page())
+    assert allowed._credential_for_page(Page()) is None
+
+
+def test_live_controller_requires_approved_clean_fact_ledger(monkeypatch, tmp_path):
+    monkeypatch.setattr(controller_mod.config, "load_profile", lambda: PROFILE)
+    resume_path = tmp_path / "tailored.txt"
+    resume_path.write_text("Fabricated Employer", encoding="utf-8")
+    profile = {
+        **PROFILE,
+        "availability": {"earliest_start_date": "Immediately"},
+    }
+    ledger = build_fact_ledger(
+        profile,
+        resume_text="Fabricated Employer\nCanonical resume",
+        corrections=(
+            FactCorrection(
+                match="Fabricated Employer",
+                state=FactState.REJECTED,
+                reason="not an applicant fact",
+            ),
+        ),
+    )
+    controller = DeterministicApplyController(
+        job={
+            "url": "https://jobs.example.com/apply",
+            "title": "Analyst",
+            "tailored_resume_path": str(resume_path),
+        },
+        port=9222,
+        worker_dir=tmp_path,
+        settings=load_settings(),
+        dry_run=False,
+        fact_ledger=ledger,
+    )
+
+    with pytest.raises(RuntimeError, match="artifact_fact_validation_failed"):
+        controller._preflight()
+
+
 def test_classify_page_state_fails_closed_for_sso_and_verification():
     assert classify_page_state("https://accounts.google.com/o/oauth", "") == "sso_required"
-    assert classify_page_state("https://example.com", "Check your email for a verification code") == "mfa_required"
+    assert (
+        classify_page_state(
+            PageState(
+                url="https://example.com",
+                inputs=(PageInput(type="text", autocomplete="one-time-code"),),
+            )
+        )
+        == "mfa_required"
+    )
     assert classify_page_state("https://example.com", "Allow camera to continue") == "unsafe_permissions"
+    assert (
+        classify_page_state(
+            "https://jobs.example.com/apply",
+            "Sorry, we couldn't find anything here. The job posting you're looking for might have closed.",
+        )
+        == "expired"
+    )
 
 
 def test_email_only_detection_and_recipient_extraction():
@@ -69,18 +160,18 @@ def test_field_value_for_password_uses_1password_credential():
         item_id="item123",
         title="Example",
         username="candidate@example.com",
-        password="generated-secret",
+        password="pw-test",
         url="https://example.com",
         domain="example.com",
     )
     resolved = resolve("Password", field_type="password", credential=credential)
 
-    assert resolved.value == "generated-secret"
+    assert resolved.value == "pw-test"
     assert resolved.sensitive is True
     assert resolved.source == "1password"
 
 
-def test_required_terms_checkbox_can_be_checked_deterministically():
+def test_required_terms_checkbox_requires_explicit_profile_fact():
     resolved = field_value_for(
         FieldSpec(
             selector="#terms",
@@ -93,4 +184,62 @@ def test_required_terms_checkbox_can_be_checked_deterministically():
         job={"title": "Software Engineer"},
     )
 
-    assert resolved.value is True
+    assert resolved is None
+
+
+def test_optional_privacy_consent_checkbox_is_not_auto_selected():
+    resolved = field_value_for(
+        FieldSpec(
+            selector="#marketing",
+            tag="input",
+            type="checkbox",
+            label="I consent to optional marketing and privacy sharing",
+            required=False,
+        ),
+        profile=PROFILE,
+        job={"title": "Software Engineer"},
+    )
+
+    assert resolved is None
+
+
+def test_file_upload_intent_never_substitutes_resume_for_cover_letter():
+    uploads = {"resume": "/tmp/resume.pdf"}
+
+    assert file_upload_for_field(
+        FieldSpec(selector="#resume", tag="input", type="file", label="Resume/CV"),
+        uploads,
+    ) == "/tmp/resume.pdf"
+    assert file_upload_for_field(
+        FieldSpec(selector="#cover", tag="input", type="file", label="Cover Letter"),
+        uploads,
+    ) is None
+    assert file_upload_for_field(
+        FieldSpec(selector="#sample", tag="input", type="file", label="Writing sample"),
+        uploads,
+    ) is None
+
+
+def test_current_role_uses_confirmed_profile_title_not_target_job():
+    resolved = field_value_for(
+        FieldSpec(selector="#current", tag="input", type="text", label="Current role"),
+        profile=PROFILE,
+        job={"title": "Target Job"},
+    )
+
+    assert resolved is None
+
+
+def test_unconfirmed_availability_is_not_submitted_as_a_fact():
+    profile = {
+        **PROFILE,
+        "availability": {"earliest_start_date": "Unconfirmed"},
+    }
+
+    resolved = field_value_for(
+        FieldSpec(selector="#start", tag="input", type="text", label="Start date"),
+        profile=profile,
+        job={"title": "Target Job"},
+    )
+
+    assert resolved is None

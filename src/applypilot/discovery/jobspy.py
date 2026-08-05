@@ -15,6 +15,7 @@ from jobspy import scrape_jobs
 from tenacity import Retrying, retry_if_exception, stop_after_attempt, wait_exponential
 
 from applypilot import config
+from applypilot.apply.runtime import canonical_job_id, domain_from_job_url, normalized_url_value
 from applypilot.database import get_connection, init_db
 
 log = logging.getLogger(__name__)
@@ -176,15 +177,17 @@ def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str) -> tup
             detail_scraped_at = now
 
         # Extract apply URL if JobSpy provided it
-        apply_url = str(row.get("job_url_direct", "")) if str(row.get("job_url_direct", "")) != "nan" else None
+        apply_url = normalized_url_value(row.get("job_url_direct"))
+        canonical = canonical_job_id(url, apply_url)
+        domain = domain_from_job_url(apply_url or url)
 
         try:
             conn.execute(
                 "INSERT INTO jobs (url, title, salary, description, location, site, strategy, discovered_at, "
-                "full_description, application_url, detail_scraped_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "full_description, application_url, detail_scraped_at, canonical_job_id, apply_domain) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (url, title, salary, description, location_str, site_label, strategy, now,
-                 full_description, apply_url, detail_scraped_at),
+                 full_description, apply_url or None, detail_scraped_at, canonical, domain),
             )
             new += 1
         except sqlite3.IntegrityError:

@@ -11,9 +11,16 @@ import shutil
 import subprocess
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
+from uuid import uuid4
 
 from applypilot import config
+from applypilot.apply.google_passwords import (
+    PROVIDER_NAME as GOOGLE_PASSWORD_MANAGER,
+    choose_chrome_profile_for_google_passwords,
+    configure_google_password_preferences,
+)
 from applypilot.apply.onepassword import DEFAULT_EXTENSION_ID, choose_chrome_profile_for_extension
 
 logger = logging.getLogger(__name__)
@@ -99,11 +106,11 @@ def _kill_on_port(port: int) -> None:
 # ---------------------------------------------------------------------------
 
 def setup_worker_profile(worker_id: int) -> Path:
-    """Create an isolated Chrome profile for a worker.
+    """Create a least-privilege Chrome profile for a worker.
 
-    On first run, clones from an existing worker profile (preferred, since
-    it already has session cookies) or from the user's real Chrome profile.
-    Subsequent runs reuse the existing worker profile.
+    Only the selected Chrome profile's password-store databases and preference
+    files are copied. History, cookies, autofill data, extensions, other Chrome
+    profiles, and browsing telemetry are intentionally excluded.
 
     Args:
         worker_id: Numeric worker identifier.
@@ -111,62 +118,75 @@ def setup_worker_profile(worker_id: int) -> Path:
     Returns:
         Path to the worker's Chrome user-data directory.
     """
-    profile_dir = config.CHROME_WORKER_DIR / f"worker-{worker_id}"
-    if (profile_dir / "Default").exists():
+    source_profile_name = config.get_chrome_profile_directory()
+    profile_dir = config.CHROME_WORKER_DIR / f"worker-{worker_id}-minimal-v1"
+    marker = profile_dir / ".applypilot-minimal-profile"
+    if marker.exists() and (profile_dir / source_profile_name).exists():
         return profile_dir  # Already initialized
 
-    # Find a source: prefer existing worker (has session cookies), else user profile
+    # Reuse another minimal worker as the source when available. Never reuse the
+    # legacy broad worker-N clones, which may contain full browser histories.
     source: Path | None = None
     for wid in range(10):
         if wid == worker_id:
             continue
-        candidate = config.CHROME_WORKER_DIR / f"worker-{wid}"
-        if (candidate / "Default").exists():
+        candidate = config.CHROME_WORKER_DIR / f"worker-{wid}-minimal-v1"
+        if (
+            (candidate / ".applypilot-minimal-profile").exists()
+            and (candidate / source_profile_name).exists()
+        ):
             source = candidate
             break
     if source is None:
         source = config.get_chrome_user_data()
 
-    logger.info("[worker-%d] Copying Chrome profile from %s (first time setup)...",
-                worker_id, source.name)
+    logger.info(
+        "[worker-%d] Creating minimal Chrome profile from %s/%s...",
+        worker_id,
+        source.name,
+        source_profile_name,
+    )
     profile_dir.mkdir(parents=True, exist_ok=True)
 
-    # Copy essential profile dirs -- skip caches and heavy transient data
-    skip = {
-        "ShaderCache", "GrShaderCache", "Service Worker", "Cache",
-        "Code Cache", "GPUCache", "CacheStorage", "Crashpad",
-        "BrowserMetrics", "SafeBrowsing", "Crowd Deny",
-        "MEIPreload", "SSLErrorAssistant", "recovery", "Temp",
-        "SingletonLock", "SingletonSocket", "SingletonCookie",
-    }
+    root_files = ("Local State",)
+    profile_files = (
+        "Preferences",
+        "Secure Preferences",
+        "Login Data",
+        "Login Data-journal",
+        "Login Data For Account",
+        "Login Data For Account-journal",
+    )
+    source_profile = source / source_profile_name
+    destination_profile = profile_dir / source_profile_name
+    destination_profile.mkdir(parents=True, exist_ok=True)
 
-    for item in source.iterdir():
-        if item.name in skip:
-            continue
-        dst = profile_dir / item.name
-        try:
-            if item.is_dir():
-                shutil.copytree(
-                    str(item), str(dst), dirs_exist_ok=True,
-                    ignore=shutil.ignore_patterns(
-                        "Cache", "Code Cache", "GPUCache", "Service Worker",
-                    ),
-                )
-            else:
-                shutil.copy2(str(item), str(dst))
-        except (PermissionError, OSError):
-            pass  # skip locked files
+    for name in root_files:
+        item = source / name
+        if item.is_file():
+            shutil.copy2(item, profile_dir / name)
+    for name in profile_files:
+        item = source_profile / name
+        if item.is_file():
+            shutil.copy2(item, destination_profile / name)
+
+    marker.write_text("minimal-v1\n", encoding="utf-8")
 
     return profile_dir
 
 
-def _suppress_restore_nag(profile_dir: Path) -> None:
+def _patch_chrome_preferences(
+    profile_dir: Path,
+    *,
+    profile_directory: str,
+    credential_provider: str,
+) -> None:
     """Clear Chrome's 'restore pages' nag by fixing Preferences.
 
     Chrome writes exit_type=Crashed when killed, which triggers a
     'Restore pages?' prompt on next launch. This patches it out.
     """
-    prefs_file = profile_dir / "Default" / "Preferences"
+    prefs_file = profile_dir / profile_directory / "Preferences"
     if not prefs_file.exists():
         return
 
@@ -175,10 +195,17 @@ def _suppress_restore_nag(profile_dir: Path) -> None:
         prefs.setdefault("profile", {})["exit_type"] = "Normal"
         prefs.setdefault("session", {})["restore_on_startup"] = 4  # 4 = open blank
         prefs.setdefault("session", {}).pop("startup_urls", None)
-        prefs["credentials_enable_service"] = False
-        prefs.setdefault("password_manager", {})["saving_enabled"] = False
-        prefs.setdefault("autofill", {})["profile_enabled"] = False
+        if credential_provider == GOOGLE_PASSWORD_MANAGER:
+            prefs["credentials_enable_service"] = True
+            prefs.setdefault("password_manager", {})["saving_enabled"] = True
+            prefs.setdefault("autofill", {})["profile_enabled"] = True
+        else:
+            prefs["credentials_enable_service"] = False
+            prefs.setdefault("password_manager", {})["saving_enabled"] = False
+            prefs.setdefault("autofill", {})["profile_enabled"] = False
         prefs_file.write_text(json.dumps(prefs), encoding="utf-8")
+        if credential_provider == GOOGLE_PASSWORD_MANAGER:
+            configure_google_password_preferences(profile_dir / profile_directory)
     except Exception:
         logger.debug("Could not patch Chrome preferences", exc_info=True)
 
@@ -192,6 +219,7 @@ def launch_chrome(
     port: int | None = None,
     headless: bool = False,
     profile_directory: str | None = None,
+    credential_provider: str = GOOGLE_PASSWORD_MANAGER,
     onepassword_extension_id: str = DEFAULT_EXTENSION_ID,
 ) -> subprocess.Popen:
     """Launch a Chrome instance with remote debugging for a worker.
@@ -201,6 +229,7 @@ def launch_chrome(
         port: CDP port. Defaults to BASE_CDP_PORT + worker_id.
         headless: Run Chrome in headless mode (no visible window).
         profile_directory: Chrome profile directory inside the user-data root.
+        credential_provider: Job-site credential provider.
         onepassword_extension_id: Extension id used for automatic profile choice.
 
     Returns:
@@ -214,15 +243,32 @@ def launch_chrome(
     # Kill any zombie Chrome from a previous run on this port
     _kill_on_port(port)
 
-    # Patch preferences to suppress restore nag
-    _suppress_restore_nag(profile_dir)
-
     chrome_exe = config.get_chrome_path()
-    launch_profile = (
-        profile_directory
-        or choose_chrome_profile_for_extension(profile_dir, onepassword_extension_id)
-        or config.get_chrome_profile_directory()
+    if credential_provider == "onepassword":
+        launch_profile = (
+            profile_directory
+            or choose_chrome_profile_for_extension(profile_dir, onepassword_extension_id)
+            or config.get_chrome_profile_directory()
+        )
+    elif credential_provider == GOOGLE_PASSWORD_MANAGER:
+        launch_profile = (
+            profile_directory
+            or choose_chrome_profile_for_google_passwords(profile_dir)
+            or config.get_chrome_profile_directory()
+        )
+    else:
+        launch_profile = profile_directory or config.get_chrome_profile_directory()
+
+    # Patch preferences to suppress restore nag and honor credential provider.
+    _patch_chrome_preferences(
+        profile_dir,
+        profile_directory=launch_profile,
+        credential_provider=credential_provider,
     )
+
+    disable_features = ["InfiniteSessionRestore"]
+    if credential_provider != GOOGLE_PASSWORD_MANAGER:
+        disable_features.append("PasswordManagerOnboarding")
 
     cmd = [
         chrome_exe,
@@ -233,11 +279,9 @@ def launch_chrome(
         "--no-default-browser-check",
         "--window-size=1024,768",
         "--disable-session-crashed-bubble",
-        "--disable-features=InfiniteSessionRestore,PasswordManagerOnboarding",
+        f"--disable-features={','.join(disable_features)}",
         "--hide-crash-restore-bubble",
         "--noerrdialogs",
-        "--password-store=basic",
-        "--disable-save-password-bubble",
         "--disable-popup-blocking",
         # Block dangerous permissions at browser level
         "--use-fake-device-for-media-stream",
@@ -245,6 +289,11 @@ def launch_chrome(
         "--deny-permission-prompts",
         "--disable-notifications",
     ]
+    if credential_provider != GOOGLE_PASSWORD_MANAGER:
+        cmd.extend([
+            "--password-store=basic",
+            "--disable-save-password-bubble",
+        ])
     if headless:
         cmd.append("--headless=new")
 
@@ -298,10 +347,11 @@ def kill_all_chrome() -> None:
 
 
 def reset_worker_dir(worker_id: int) -> Path:
-    """Wipe and recreate a worker's isolated working directory.
+    """Create a unique per-job working directory without deleting evidence.
 
-    Each job gets a fresh working directory so that file conflicts
-    (resume PDFs, MCP configs) don't bleed between jobs.
+    Each job gets a fresh directory so file conflicts do not bleed between
+    jobs, while prior resumes, screenshots, and confirmation artifacts remain
+    available for the campaign audit trail.
 
     Args:
         worker_id: Numeric worker identifier.
@@ -309,9 +359,13 @@ def reset_worker_dir(worker_id: int) -> Path:
     Returns:
         Path to the clean worker directory.
     """
-    worker_dir = config.APPLY_WORKER_DIR / f"worker-{worker_id}"
-    if worker_dir.exists():
-        shutil.rmtree(str(worker_dir), ignore_errors=True)
+    worker_root = config.APPLY_WORKER_DIR / f"worker-{worker_id}"
+    worker_root.mkdir(parents=True, exist_ok=True)
+    run_id = (
+        datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+        + f"-{uuid4().hex[:8]}"
+    )
+    worker_dir = worker_root / run_id
     worker_dir.mkdir(parents=True, exist_ok=True)
     return worker_dir
 

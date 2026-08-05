@@ -253,6 +253,7 @@ _JOBSPY_BOARD_RULES = {
 }
 
 _SMART_SOURCE_RULES = """Smart-extract source rules:
+- Direct-source mode: prefer employer-owned career pages and ATS-native pages (Workday, Greenhouse, Lever, Ashby, SmartRecruiters, iCIMS, Workable, Jobvite, BambooHR) over aggregators.
 - Search result/listing pages: inspect cards, open the best matching job detail, find the Apply/External Apply/Company Site link, then continue on the employer ATS.
 - Static/fresh-role boards: treat date/freshness, company, location, and title as discovery metadata. They are not application evidence.
 - Remote boards: verify the role is full-time salaried and not a contractor marketplace or talent-network profile before applying.
@@ -337,14 +338,27 @@ def _build_source_catalog(search_config: dict) -> str:
         _BOARD_LABELS.get(str(code).lower(), str(code))
         for code in board_codes
     ]
+    discovery_mode = str(search_config.get("discovery_mode", "hybrid"))
+    if config.uses_direct_source_mode(search_config):
+        jobspy_label = "skipped in direct_sources mode"
+    else:
+        jobspy_label = _compact_list(jobspy_boards)
+    direct_ats_sources = [
+        str(source.get("name") or source.get("slug") or source.get("url"))
+        for source in search_config.get("direct_ats_sources", []) or []
+        if source.get("name") or source.get("slug") or source.get("url")
+    ]
 
     sites_cfg = config.load_sites_config()
+    direct_sources: list[str] = []
     searchable_sources: list[str] = []
     static_sources: list[str] = []
     for site in sites_cfg.get("sites", []):
         name = site.get("name")
         if not name:
             continue
+        if site.get("direct_source") is True:
+            direct_sources.append(name)
         if site.get("type") == "search":
             searchable_sources.append(name)
         else:
@@ -356,7 +370,10 @@ def _build_source_catalog(search_config: dict) -> str:
     manual_ats = sites_cfg.get("manual_ats", [])
 
     return f"""Configured discovery and routing catalog:
-- JobSpy boards from searches.yaml: {_compact_list(jobspy_boards)}
+- Discovery mode: {discovery_mode}
+- Configured direct ATS sources from searches.yaml: {_compact_list(direct_ats_sources)}
+- Direct employer/ATS sources from sites.yaml: {_compact_list(direct_sources)}
+- JobSpy boards from searches.yaml: {jobspy_label}
 - Searchable smart-extract sources from sites.yaml: {_compact_list(searchable_sources)}
 - Static/fresh-role smart-extract sources from sites.yaml: {_compact_list(static_sources)}
 - Manual-only ATS domains: {_compact_list(manual_ats)}
@@ -412,6 +429,26 @@ def build_training_manifest(search_config: dict | None = None) -> dict:
         }
         for code in board_codes
     ]
+    direct_sources = [
+        {
+            "name": site.get("name"),
+            "type": site.get("type", "static"),
+            "url": site.get("url"),
+            "source_kind": site.get("source_kind", "direct_ats"),
+        }
+        for site in sites_cfg.get("sites", [])
+        if site.get("name") and site.get("direct_source") is True
+    ]
+    direct_ats_sources = [
+        {
+            "name": source.get("name") or source.get("slug"),
+            "url": source.get("url"),
+            "ats": source.get("ats"),
+            "slug": source.get("slug"),
+        }
+        for source in search_config.get("direct_ats_sources", []) or []
+        if source.get("name") or source.get("url")
+    ]
     smart_sources = [
         {
             "name": site.get("name"),
@@ -424,6 +461,8 @@ def build_training_manifest(search_config: dict | None = None) -> dict:
 
     return {
         "version": "apply-training-v1",
+        "discovery_mode": search_config.get("discovery_mode", "hybrid"),
+        "direct_source_focus": config.uses_direct_source_mode(search_config),
         "required_capabilities": [
             "workday_application_flow",
             "email_only_local_draft",
@@ -435,6 +474,8 @@ def build_training_manifest(search_config: dict | None = None) -> dict:
         ],
         "scenario_names": [scenario["name"] for scenario in _TRAINING_SCENARIOS],
         "jobspy_boards": jobspy_boards,
+        "direct_ats_sources": direct_ats_sources,
+        "direct_sources": direct_sources,
         "smart_extract_sources": smart_sources,
         "manual_ats_domains": sites_cfg.get("manual_ats", []),
         "blocked_sources": sites_cfg.get("blocked", {}),
@@ -495,206 +536,48 @@ Indeed/LinkedIn/native Easy Apply:
 
 
 def _build_captcha_section() -> str:
-    """Build the CAPTCHA detection and solving instructions.
+    """Build CAPTCHA detection and fail-closed instructions."""
+    return """== CAPTCHA ==
+CAPTCHA and anti-bot challenges are fail-closed states. Do not use solver APIs, token injection,
+browser fingerprint workarounds, or manual puzzle attempts.
 
-    Reads the CapSolver API key from environment. The CAPTCHA section
-    contains no personal data -- it's the same for every user.
-    """
-    config.load_env()
-    capsolver_key = config.get_secret("CAPSOLVER_API_KEY")
-
-    return f"""== CAPTCHA ==
-You solve CAPTCHAs via the CapSolver REST API. No browser extension. You control the entire flow.
-API key: {capsolver_key or 'NOT CONFIGURED — skip to MANUAL FALLBACK for all CAPTCHAs'}
-API base: https://api.capsolver.com
-
-CRITICAL RULE: When ANY CAPTCHA appears (hCaptcha, reCAPTCHA, Turnstile -- regardless of what it looks like visually), you MUST:
-1. Run CAPTCHA DETECT to get the type and sitekey
-2. Run CAPTCHA SOLVE (createTask -> poll -> inject) with the CapSolver API
-3. ONLY go to MANUAL FALLBACK if CapSolver returns errorId > 0
-Do NOT skip the API call based on what the CAPTCHA looks like. CapSolver solves CAPTCHAs server-side -- it does NOT need to see or interact with images, puzzles, or games. Even "drag the pipe" or "click all traffic lights" hCaptchas are solved via API token, not visually. ALWAYS try the API first.
+Run CAPTCHA DETECT after navigation, Apply/Submit/Login clicks, or when a page appears stuck.
+If any CAPTCHA, anti-bot challenge, or challenge iframe is detected, output RESULT:CAPTCHA.
 
 --- CAPTCHA DETECT ---
-Run this browser_evaluate after every navigation, Apply/Submit/Login click, or when a page feels stuck.
-IMPORTANT: Detection order matters. hCaptcha elements also have data-sitekey, so check hCaptcha BEFORE reCAPTCHA.
-
-browser_evaluate function: () => {{{{
-  const r = {{}};
-  const url = window.location.href;
-  // 1. hCaptcha (check FIRST -- hCaptcha uses data-sitekey too)
-  const hc = document.querySelector('.h-captcha, [data-hcaptcha-sitekey]');
-  if (hc) {{{{
-    r.type = 'hcaptcha'; r.sitekey = hc.dataset.sitekey || hc.dataset.hcaptchaSitekey;
-  }}}}
-  if (!r.type && document.querySelector('script[src*="hcaptcha.com"], iframe[src*="hcaptcha.com"]')) {{{{
-    const el = document.querySelector('[data-sitekey]');
-    if (el) {{{{ r.type = 'hcaptcha'; r.sitekey = el.dataset.sitekey; }}}}
-  }}}}
-  // 2. Cloudflare Turnstile
-  if (!r.type) {{{{
-    const cf = document.querySelector('.cf-turnstile, [data-turnstile-sitekey]');
-    if (cf) {{{{
-      r.type = 'turnstile'; r.sitekey = cf.dataset.sitekey || cf.dataset.turnstileSitekey;
-      if (cf.dataset.action) r.action = cf.dataset.action;
-      if (cf.dataset.cdata) r.cdata = cf.dataset.cdata;
-    }}}}
-  }}}}
-  if (!r.type && document.querySelector('script[src*="challenges.cloudflare.com"]')) {{{{
-    r.type = 'turnstile_script_only'; r.note = 'Wait 3s and re-detect.';
-  }}}}
-  // 3. reCAPTCHA v3 (invisible, loaded via render= param)
-  if (!r.type) {{{{
-    const s = document.querySelector('script[src*="recaptcha"][src*="render="]');
-    if (s) {{{{
-      const m = s.src.match(/render=([^&]+)/);
-      if (m && m[1] !== 'explicit') {{{{ r.type = 'recaptchav3'; r.sitekey = m[1]; }}}}
-    }}}}
-  }}}}
-  // 4. reCAPTCHA v2 (checkbox or invisible)
-  if (!r.type) {{{{
-    const rc = document.querySelector('.g-recaptcha');
-    if (rc) {{{{ r.type = 'recaptchav2'; r.sitekey = rc.dataset.sitekey; }}}}
-  }}}}
-  if (!r.type && document.querySelector('script[src*="recaptcha"]')) {{{{
-    const el = document.querySelector('[data-sitekey]');
-    if (el) {{{{ r.type = 'recaptchav2'; r.sitekey = el.dataset.sitekey; }}}}
-  }}}}
-  // 5. FunCaptcha (Arkose Labs)
-  if (!r.type) {{{{
-    const fc = document.querySelector('#FunCaptcha, [data-pkey], .funcaptcha');
-    if (fc) {{{{ r.type = 'funcaptcha'; r.sitekey = fc.dataset.pkey; }}}}
-  }}}}
-  if (!r.type && document.querySelector('script[src*="arkoselabs"], script[src*="funcaptcha"]')) {{{{
-    const el = document.querySelector('[data-pkey]');
-    if (el) {{{{ r.type = 'funcaptcha'; r.sitekey = el.dataset.pkey; }}}}
-  }}}}
-  if (r.type) {{{{ r.url = url; return r; }}}}
-  return null;
-}}}}
+browser_evaluate function: () => {
+  const signals = [];
+  const selectors = [
+    '.h-captcha',
+    '[data-hcaptcha-sitekey]',
+    '.g-recaptcha',
+    '.cf-turnstile',
+    '[data-turnstile-sitekey]',
+    '#FunCaptcha',
+    '[data-pkey]',
+    '.funcaptcha'
+  ];
+  for (const selector of selectors) {
+    if (document.querySelector(selector)) signals.push(selector);
+  }
+  for (const frame of document.querySelectorAll('iframe')) {
+    const src = frame.getAttribute('src') || '';
+    if (/hcaptcha|recaptcha|challenges\\.cloudflare|arkoselabs|funcaptcha/i.test(src)) {
+      signals.push(src);
+    }
+  }
+  for (const script of document.querySelectorAll('script[src]')) {
+    const src = script.getAttribute('src') || '';
+    if (/hcaptcha|recaptcha|challenges\\.cloudflare|arkoselabs|funcaptcha/i.test(src)) {
+      signals.push(src);
+    }
+  }
+  return signals.length ? {type: 'captcha', signals, url: window.location.href} : null;
+}
 
 Result actions:
-- null -> no CAPTCHA. Continue normally.
-- "turnstile_script_only" -> browser_wait_for time: 3, re-run detect.
-- Any other type -> proceed to CAPTCHA SOLVE below.
-
---- CAPTCHA SOLVE ---
-Three steps: createTask -> poll -> inject. Do each as a separate browser_evaluate call.
-
-STEP 1 -- CREATE TASK (copy this exactly, fill in the 3 placeholders):
-browser_evaluate function: async () => {{{{
-  const r = await fetch('https://api.capsolver.com/createTask', {{{{
-    method: 'POST',
-    headers: {{{{'Content-Type': 'application/json'}}}},
-    body: JSON.stringify({{{{
-      clientKey: '{capsolver_key}',
-      task: {{{{
-        type: 'TASK_TYPE',
-        websiteURL: 'PAGE_URL',
-        websiteKey: 'SITE_KEY'
-      }}}}
-    }}}})
-  }}}});
-  return await r.json();
-}}}}
-
-TASK_TYPE values (use EXACTLY these strings):
-  hcaptcha     -> HCaptchaTaskProxyLess
-  recaptchav2  -> ReCaptchaV2TaskProxyLess
-  recaptchav3  -> ReCaptchaV3TaskProxyLess
-  turnstile    -> AntiTurnstileTaskProxyLess
-  funcaptcha   -> FunCaptchaTaskProxyLess
-
-PAGE_URL = the url from detect result. SITE_KEY = the sitekey from detect result.
-For recaptchav3: add "pageAction": "submit" to the task object (or the actual action found in page scripts).
-For turnstile: add "metadata": {{"action": "...", "cdata": "..."}} if those were in detect result.
-
-Response: {{"errorId": 0, "taskId": "abc123"}} on success.
-If errorId > 0 -> CAPTCHA SOLVE failed. Go to MANUAL FALLBACK.
-
-STEP 2 -- POLL (replace TASK_ID with the taskId from step 1):
-Loop: browser_wait_for time: 3, then run:
-browser_evaluate function: async () => {{{{
-  const r = await fetch('https://api.capsolver.com/getTaskResult', {{{{
-    method: 'POST',
-    headers: {{{{'Content-Type': 'application/json'}}}},
-    body: JSON.stringify({{{{
-      clientKey: '{capsolver_key}',
-      taskId: 'TASK_ID'
-    }}}})
-  }}}});
-  return await r.json();
-}}}}
-
-- status "processing" -> wait 3s, poll again. Max 10 polls (30s).
-- status "ready" -> extract token:
-    reCAPTCHA: solution.gRecaptchaResponse
-    hCaptcha:  solution.gRecaptchaResponse
-    Turnstile: solution.token
-- errorId > 0 or 30s timeout -> MANUAL FALLBACK.
-
-STEP 3 -- INJECT TOKEN (replace THE_TOKEN with actual token string):
-
-For reCAPTCHA v2/v3:
-browser_evaluate function: () => {{{{
-  const token = 'THE_TOKEN';
-  document.querySelectorAll('[name="g-recaptcha-response"]').forEach(el => {{{{ el.value = token; el.style.display = 'block'; }}}});
-  if (window.___grecaptcha_cfg) {{{{
-    const clients = window.___grecaptcha_cfg.clients;
-    for (const key in clients) {{{{
-      const walk = (obj, d) => {{{{
-        if (d > 4 || !obj) return;
-        for (const k in obj) {{{{
-          if (typeof obj[k] === 'function' && k.length < 3) try {{{{ obj[k](token); }}}} catch(e) {{{{}}}}
-          else if (typeof obj[k] === 'object') walk(obj[k], d+1);
-        }}}}
-      }}}};
-      walk(clients[key], 0);
-    }}}}
-  }}}}
-  return 'injected';
-}}}}
-
-For hCaptcha:
-browser_evaluate function: () => {{{{
-  const token = 'THE_TOKEN';
-  const ta = document.querySelector('[name="h-captcha-response"], textarea[name*="hcaptcha"]');
-  if (ta) ta.value = token;
-  document.querySelectorAll('iframe[data-hcaptcha-response]').forEach(f => f.setAttribute('data-hcaptcha-response', token));
-  const cb = document.querySelector('[data-hcaptcha-widget-id]');
-  if (cb && window.hcaptcha) try {{{{ window.hcaptcha.getResponse(cb.dataset.hcaptchaWidgetId); }}}} catch(e) {{{{}}}}
-  return 'injected';
-}}}}
-
-For Turnstile:
-browser_evaluate function: () => {{{{
-  const token = 'THE_TOKEN';
-  const inp = document.querySelector('[name="cf-turnstile-response"], input[name*="turnstile"]');
-  if (inp) inp.value = token;
-  if (window.turnstile) try {{{{ const w = document.querySelector('.cf-turnstile'); if (w) window.turnstile.getResponse(w); }}}} catch(e) {{{{}}}}
-  return 'injected';
-}}}}
-
-For FunCaptcha:
-browser_evaluate function: () => {{{{
-  const token = 'THE_TOKEN';
-  const inp = document.querySelector('#FunCaptcha-Token, input[name="fc-token"]');
-  if (inp) inp.value = token;
-  if (window.ArkoseEnforcement) try {{{{ window.ArkoseEnforcement.setConfig({{{{data: {{{{blob: token}}}}}}}}) }}}} catch(e) {{{{}}}}
-  return 'injected';
-}}}}
-
-After injecting: browser_wait_for time: 2, then snapshot.
-- Widget gone or green check -> success. Click Submit if needed.
-- No change -> click Submit/Verify/Continue button (some sites need it).
-- Still stuck -> token may have expired (~2 min lifetime). Re-run from STEP 1.
-
---- MANUAL FALLBACK ---
-You should ONLY be here if CapSolver createTask returned errorId > 0. If you haven't tried CapSolver yet, GO BACK and try it first.
-If CapSolver genuinely failed (errorId > 0):
-1. Audio challenge: Look for "audio" or "accessibility" button -> click it for an easier challenge.
-2. Text/logic puzzles: Solve them yourself. Think step by step. Common tricks: "All but 9 die" = 9 left. "3 sisters and 4 brothers, how many siblings?" = 7.
-3. Simple text captchas ("What is 3+7?", "Type the word") -> solve them.
-4. All else fails -> Output RESULT:CAPTCHA."""
+- null -> no CAPTCHA signal. Continue normally.
+- any object -> stop immediately with RESULT:CAPTCHA."""
 
 
 def build_prompt(job: dict, tailored_resume: str,
@@ -819,7 +702,7 @@ Cover Letter PDF (upload if asked): {cl_upload_path or "N/A"}
 == YOUR MISSION ==
 Submit a complete, accurate application. Use the profile and resume as source data -- adapt to fit each form's format.
 
-If something unexpected happens and these instructions don't cover it, figure it out yourself. You are autonomous. Navigate pages, read content, try buttons, explore the site. The goal is always the same: submit the application. Do whatever it takes to reach that goal.
+If something unexpected happens and these instructions do not cover it, fail closed with a specific result code. Do not broaden permissions, improvise credentials, or bypass a safety gate.
 
 {hard_rules}
 
@@ -846,21 +729,21 @@ If something unexpected happens and these instructions don't cover it, figure it
 
 == STEP-BY-STEP ==
 1. browser_navigate to the job URL.
-2. browser_snapshot to read the page. Then run CAPTCHA DETECT (see CAPTCHA section). If a CAPTCHA is found, solve it before continuing.
+2. browser_snapshot to read the page. Then run CAPTCHA DETECT (see CAPTCHA section). If a CAPTCHA is found, output RESULT:CAPTCHA and stop.
 3. LOCATION CHECK. Read the page for location info. If not eligible, output RESULT and stop.
 4. Find and click the Apply button. If email-only (page says "email resume to X"):
    - Do NOT send email and do NOT create an external email draft. Outbound communication requires user review.
    - Write a local file named email_application_draft.md in the current working directory.
    - Include: To, Subject "Application for {job['title']} -- {display_name}", Attachments ["{pdf_path}"{', "' + cl_upload_path + '"' if cl_upload_path else ''}], and a 2-3 sentence factual body using the cover letter text if available.
    - Output RESULT:EMAIL_DRAFT. Done.
-   After clicking Apply: browser_snapshot. Run CAPTCHA DETECT -- many sites trigger CAPTCHAs right after the Apply click. If found, solve before continuing.
+   After clicking Apply: browser_snapshot. Run CAPTCHA DETECT -- many sites trigger CAPTCHAs right after the Apply click. If found, output RESULT:CAPTCHA and stop.
 5. Login wall?
    5a. FIRST: check the URL. If you landed on {', '.join(blocked_sso)}, or any SSO/OAuth page -> STOP. Output RESULT:FAILED:sso_required. Do NOT try to sign in to Google/Microsoft/SSO.
    5b. Check for popups. Run browser_tabs action "list". If a new tab/window appeared (login popup), switch to it with browser_tabs action "select". Check the URL there too -- if it's SSO -> RESULT:FAILED:sso_required.
-   5c. Regular login form (employer's own site)? Try sign in: {personal['email']} / {personal.get('password', '')}
-   5d. After clicking Login/Sign-in: run CAPTCHA DETECT. Login pages frequently have invisible CAPTCHAs that silently block form submissions. If found, solve it then retry login.
-   5e. Sign in failed? Try sign up with same email and password.
-   5f. Need email verification? Use search_emails + read_email to get the code.
+   5c. Regular login form (employer's own site)? Use the configured browser-managed credential provider. Never read, print, paste into the prompt, or persist a password.
+   5d. After clicking Login/Sign-in: run CAPTCHA DETECT. Login pages frequently have invisible CAPTCHAs that silently block form submissions. If found, output RESULT:CAPTCHA and stop.
+   5e. Sign in failed? Stop with RESULT:LOGIN_ISSUE. Do not invent or export credentials.
+   5f. Need email verification, MFA, passkey, or SSO? Stop with RESULT:LOGIN_ISSUE.
    5g. After login, run browser_tabs action "list" again. Switch back to the application tab if needed.
    5h. All failed? Output RESULT:LOGIN_ISSUE. Do not loop.
 6. Upload resume. ALWAYS upload fresh -- delete any existing resume first, then browser_file_upload with the PDF path above. This is the tailored resume for THIS job. Non-negotiable.
@@ -870,7 +753,7 @@ If something unexpected happens and these instructions don't cover it, figure it
    - Compare every other field to the APPLICANT PROFILE. Fix mismatches. Fill empty fields.
 9. Answer screening questions using the rules above.
 10. {submit_instruction}
-11. After submit: browser_snapshot. Run CAPTCHA DETECT -- submit buttons often trigger invisible CAPTCHAs. If found, solve it (the form will auto-submit once the token clears, or you may need to click Submit again). Then check for new tabs (browser_tabs action: "list"). Switch to newest, close old. Snapshot to confirm submission. Look for "thank you" or "application received".
+11. After submit: browser_snapshot. Run CAPTCHA DETECT -- submit buttons often trigger invisible CAPTCHAs. If found, output RESULT:CAPTCHA and stop. Then check for new tabs (browser_tabs action: "list"). Switch to newest, close old. Snapshot to confirm submission. Look for employer/ATS confirmation, not generic success text alone.
 12. Output your result.
 
 == RESULT CODES (output EXACTLY one) ==

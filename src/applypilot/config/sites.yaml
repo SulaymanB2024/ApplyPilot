@@ -55,6 +55,50 @@ base_urls:
   "Runway": "https://app.joinrunway.io"
 
 sites:
+  # ── Direct employer / ATS-native sources ─────────────────────────────
+  # These are preferred when searches.yaml sets discovery_mode: direct_sources.
+  - name: "Anthropic Greenhouse"
+    url: "https://job-boards.greenhouse.io/anthropic"
+    type: static
+    source_kind: direct_ats
+    direct_source: true
+
+  - name: "OpenAI Ashby"
+    url: "https://jobs.ashbyhq.com/openai"
+    type: static
+    source_kind: direct_ats
+    direct_source: true
+
+  - name: "Runway Careers"
+    url: "https://runway.com/careers"
+    type: static
+    source_kind: employer_careers
+    direct_source: true
+
+  - name: "Scale AI Greenhouse"
+    url: "https://job-boards.greenhouse.io/scaleai"
+    type: static
+    source_kind: direct_ats
+    direct_source: true
+
+  - name: "AccuWeather Greenhouse"
+    url: "https://job-boards.greenhouse.io/accuweather"
+    type: static
+    source_kind: direct_ats
+    direct_source: true
+
+  - name: "Renesas SmartRecruiters"
+    url: "https://jobs.smartrecruiters.com/RenesasElectronics"
+    type: static
+    source_kind: direct_ats
+    direct_source: true
+
+  - name: "Stripe University Careers"
+    url: "https://stripe.com/jobs/university"
+    type: static
+    source_kind: employer_careers
+    direct_source: true
+
   # ── Searchable sites (URL includes query + location params) ──────────
   # Canada-specific
   - name: "Eluta"
@@ -107,6 +151,8 @@ sites:
   - name: "Runway"
     url: "https://app.joinrunway.io/explore"
     type: static
+    source_kind: account_backed_recruiter
+    direct_source: true
 
   # Remote-first boards
   - name: "RemoteOK"

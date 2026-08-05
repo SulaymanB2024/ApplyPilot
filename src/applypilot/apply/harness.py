@@ -10,10 +10,12 @@ from typing import Literal
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from applypilot.apply.google_passwords import PROVIDER_NAME as GOOGLE_PASSWORD_MANAGER
 from applypilot.apply.onepassword import DEFAULT_EXTENSION_ID
 
 
 AgentBackend = Literal["claude", "codex"]
+CredentialProvider = Literal["google_password_manager", "onepassword", "none"]
 DEFAULT_CLAUDE_MODEL = "haiku"
 DEFAULT_CODEX_MODEL = "gpt-5.5"
 
@@ -21,23 +23,40 @@ DEFAULT_CODEX_MODEL = "gpt-5.5"
 class HarnessSettings(BaseSettings):
     """Environment-driven harness settings.
 
-    The default backend stays on the existing Claude executor. The Codex
-    backend defaults to the user's configured Codex 5.5 account model and uses
-    the deterministic Python/Playwright controller by default.
+    The default backend is Codex, but production application work remains in
+    the deterministic Python/Playwright controller. Codex is available only as
+    a narrow, schema-constrained fallback for unresolved safe fields.
     """
 
-    agent_backend: AgentBackend = "claude"
+    agent_backend: AgentBackend = "codex"
     executor_model: str = DEFAULT_CODEX_MODEL
     supervisor_model: str = DEFAULT_CODEX_MODEL
     supervisor_poll_seconds: int = Field(default=60, ge=5)
     deterministic_mode: bool = True
     deterministic_controller: bool = True
-    allow_account_creation: bool = True
-    onepassword_enabled: bool = True
+    field_model_call_budget: int = Field(default=0, ge=0, le=2)
+    allow_account_creation: bool = False
+    credential_provider: CredentialProvider = GOOGLE_PASSWORD_MANAGER
+    onepassword_enabled: bool = False
     onepassword_vault: str | None = None
     onepassword_extension_id: str = DEFAULT_EXTENSION_ID
 
     model_config = SettingsConfigDict(env_prefix="APPLYPILOT_", extra="ignore")
+
+    @property
+    def uses_onepassword(self) -> bool:
+        """Return whether legacy 1Password integration should be active."""
+        return self.credential_provider == "onepassword" or self.onepassword_enabled
+
+    @property
+    def uses_google_password_manager(self) -> bool:
+        """Return whether Chrome should use Google Password Manager/autofill."""
+        return self.credential_provider == GOOGLE_PASSWORD_MANAGER and not self.uses_onepassword
+
+    @property
+    def requires_model_cli(self) -> bool:
+        """Return whether the deterministic controller may invoke a model subprocess."""
+        return self.field_model_call_budget > 0
 
 
 def load_settings(
@@ -45,6 +64,7 @@ def load_settings(
     agent_backend: str | None = None,
     executor_model: str | None = None,
     supervisor_model: str | None = None,
+    allow_account_creation: bool | None = None,
 ) -> HarnessSettings:
     """Load harness settings with optional CLI overrides."""
     overrides: dict[str, str] = {}
@@ -54,6 +74,8 @@ def load_settings(
         overrides["executor_model"] = executor_model
     if supervisor_model:
         overrides["supervisor_model"] = supervisor_model
+    if allow_account_creation is not None:
+        overrides["allow_account_creation"] = allow_account_creation
     settings = HarnessSettings(**overrides)
     if not executor_model and settings.agent_backend == "claude":
         settings = settings.model_copy(update={"executor_model": DEFAULT_CLAUDE_MODEL})
@@ -69,12 +91,17 @@ Supervisor model: {settings.supervisor_model}
 Supervisor wait policy: sleep/poll every {settings.supervisor_poll_seconds}s until executor finishes or times out.
 Deterministic mode: {str(settings.deterministic_mode).lower()}
 Deterministic controller: {str(settings.deterministic_controller).lower()}
+Field model-call budget per job: {settings.field_model_call_budget}
 Account creation allowed: {str(settings.allow_account_creation).lower()}
-1Password enabled for job-site logins: {str(settings.onepassword_enabled).lower()}
+Credential provider for job-site auth: {settings.credential_provider}
+Google Password Manager/autofill enabled: {str(settings.uses_google_password_manager).lower()}
+1Password enabled for job-site logins: {str(settings.uses_onepassword).lower()}
 
 Use deterministic checks before judgment. Prefer direct DOM inspection, fixed selectors, page URLs, explicit form values, saved files, and tool outputs over speculation. When a deterministic check can answer a question, run that check instead of asking the model to infer it.
 
 External communication boundary: never send outbound email or create external email drafts from this harness. If a job requires email submission, write a local email_application_draft.md artifact for user review and finish with RESULT:EMAIL_DRAFT.
+
+Credential boundary: Google Password Manager credentials stay inside Chrome. Do not export, print, or persist browser-saved passwords. If browser autofill cannot satisfy a required login/account password field, fail closed instead of inventing or storing a credential.
 
 Finish with exactly one RESULT line."""
 
@@ -109,9 +136,16 @@ def write_contract(
         "supervisor_poll_seconds": settings.supervisor_poll_seconds,
         "deterministic_mode": settings.deterministic_mode,
         "deterministic_controller": settings.deterministic_controller,
+        "field_model_call_budget": settings.field_model_call_budget,
+        "requires_model_cli": settings.requires_model_cli,
         "allow_account_creation": settings.allow_account_creation,
+        "credential_provider": settings.credential_provider,
+        "google_password_manager": {
+            "enabled": settings.uses_google_password_manager,
+            "storage": "browser_profile_only",
+        },
         "onepassword": {
-            "enabled": settings.onepassword_enabled,
+            "enabled": settings.uses_onepassword,
             "vault_configured": bool(settings.onepassword_vault),
             "extension_id": settings.onepassword_extension_id,
         },
@@ -129,7 +163,8 @@ def write_contract(
             "final text contains exactly one RESULT line",
             "training manifest records Workday, email draft, Runway, and board handoff coverage",
             "email-only applications write email_application_draft.md instead of sending",
-            "job-site account credentials are stored in 1Password when account creation is needed",
+            "Google Password Manager credentials stay in Chrome and are never exported into artifacts",
+            "new account creation fails closed unless the configured credential provider can safely satisfy required fields",
             "SSO, passkey, MFA, email verification, unsafe permission, biometric, payment, and tax flows fail closed",
             "database status is updated by deterministic parser",
         ],
