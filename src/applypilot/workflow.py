@@ -172,6 +172,7 @@ class WorkflowStore:
                 material_digest TEXT NOT NULL DEFAULT '',
                 form_review_json TEXT NOT NULL DEFAULT '{}',
                 form_review_digest TEXT NOT NULL DEFAULT '',
+                form_review_generation INTEGER NOT NULL DEFAULT 0,
                 form_action_policy_json TEXT NOT NULL DEFAULT '{}',
                 outcome TEXT NOT NULL DEFAULT '',
                 evidence_path TEXT NOT NULL DEFAULT '',
@@ -278,6 +279,7 @@ class WorkflowStore:
             "opportunity_kind": "TEXT NOT NULL DEFAULT 'unknown'",
             "application_surface": "TEXT NOT NULL DEFAULT 'unknown'",
             "requisition_id": "TEXT NOT NULL DEFAULT ''",
+            "form_review_generation": "INTEGER NOT NULL DEFAULT 0",
             "form_action_policy_json": "TEXT NOT NULL DEFAULT '{}'",
         }
         for column, declaration in candidate_column_defaults.items():
@@ -897,11 +899,17 @@ class WorkflowStore:
             if row["state"] not in {"materials_ready", "dry_run_ready"}:
                 raise WorkflowError(f"candidate {candidate_id} does not have reviewed materials")
             material_paths = self._validated_material_paths(row)
+            generation = int(row["form_review_generation"] or 0)
             request_path = request_dir / f"dry-run.{candidate_id}.request.json"
             response_path = request_path.with_name(request_path.name.replace(".request.json", ".response.json"))
             request = {
                 "schema_version": BROWSER_ACTION_SCHEMA_VERSION,
-                "request_id": _request_id(run_id, candidate_id, "dry_run", row["material_digest"]),
+                "request_id": _request_id(
+                    run_id,
+                    candidate_id,
+                    "dry_run",
+                    _dry_run_binding(str(row["material_digest"]), generation),
+                ),
                 "run_id": run_id,
                 "candidate_id": candidate_id,
                 "mode": "dry_run",
@@ -911,6 +919,7 @@ class WorkflowStore:
                 "material_paths": material_paths,
                 "material_digest": row["material_digest"],
                 "form_fact_digest": form_fact_digest,
+                "form_review_generation": generation,
                 "fact_snapshot_path": str(fact_snapshot_path),
                 "fact_use_policy": [
                     "use_only_records_whose_state_is_confirmed",
@@ -1249,6 +1258,81 @@ class WorkflowStore:
             "last_error": row["last_error"],
         }
 
+    def invalidate_form_review(
+        self,
+        *,
+        run_id: str,
+        candidate_id: str,
+        reason: str,
+    ) -> dict[str, Any]:
+        """Return an unsubmitted candidate to materials after approval expiry.
+
+        This is the one intentional backwards transition in the canonical
+        workflow.  It is limited to candidates without any submission
+        reservation or outcome, clears every form-review binding, and records
+        why a fresh visible-browser dry-run is required.
+        """
+        _safe_file_identifier(candidate_id, "candidate id")
+        row = self._candidate(run_id, candidate_id)
+        if row["state"] in {"submitting", "submitted_unconfirmed", "submitted_confirmed"}:
+            raise WorkflowError("submission state cannot be invalidated")
+        existing = self.connection.execute(
+            "SELECT outcome FROM workflow_submission_registry WHERE canonical_url = ?",
+            (row["canonical_url"],),
+        ).fetchone()
+        if existing is not None:
+            raise WorkflowError("reserved or attempted candidate cannot be invalidated")
+        if not row["material_digest"]:
+            raise WorkflowError("candidate lacks reviewed materials")
+        detail = {
+            "reason": str(reason).strip()[:200] or "form_review_expired",
+            "previous_form_review_digest": str(row["form_review_digest"] or ""),
+        }
+        response_path = (
+            self._run_dir(run_id)
+            / "workflow-handoff"
+            / f"dry-run.{candidate_id}.response.json"
+        )
+        if response_path.is_file():
+            archive_path = (
+                self._run_dir(run_id)
+                / "workflow-evidence"
+                / (
+                    f"expired-form-review.{candidate_id}."
+                    f"{detail['previous_form_review_digest'][:16]}.response.json"
+                )
+            )
+            archive_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            if archive_path.exists():
+                if archive_path.read_bytes() != response_path.read_bytes():
+                    raise WorkflowError("expired form-review archive collision")
+                response_path.unlink()
+            else:
+                response_path.replace(archive_path)
+                archive_path.chmod(0o600)
+        with self.connection:
+            self.connection.execute(
+                """
+                UPDATE workflow_candidates
+                SET state = 'materials_ready', form_review_json = '{}',
+                    form_review_digest = '',
+                    form_review_generation = form_review_generation + 1,
+                    form_action_policy_json = '{}',
+                    last_error = ?, updated_at = ?
+                WHERE run_id = ? AND candidate_id = ?
+                """,
+                (detail["reason"], _now(), run_id, candidate_id),
+            )
+            self._event(
+                run_id,
+                candidate_id,
+                "form_review_invalidated",
+                str(row["state"]),
+                "materials_ready",
+                detail,
+            )
+        return self.candidate_status(run_id, candidate_id)
+
     def approval_status(self, approval_id: str) -> dict[str, Any]:
         row = self._approval(approval_id)
         try:
@@ -1322,11 +1406,14 @@ class WorkflowStore:
             raise WorkflowError("browser request escaped the workflow handoff directory")
         if mode == "dry_run":
             expected_request = request_dir / f"dry-run.{candidate_id}.request.json"
+            generation = int(row["form_review_generation"] or 0)
+            if int(request.get("form_review_generation") or 0) != generation:
+                raise WorkflowError("browser request form-review generation mismatch")
             expected_request_id = _request_id(
                 run_id,
                 candidate_id,
                 "dry_run",
-                row["material_digest"],
+                _dry_run_binding(str(row["material_digest"]), generation),
             )
             if schema_version == BROWSER_ACTION_SCHEMA_VERSION:
                 try:
@@ -1865,6 +1952,25 @@ class WorkflowStore:
 
     def _legacy_outcome_for_url(self, canonical_url: str) -> str:
         """Treat legacy applied/in-flight rows as duplicate-submission evidence."""
+        historical_table = self.connection.execute(
+            """
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'workflow_historical_applications'
+            """
+        ).fetchone()
+        if historical_table is not None:
+            historical = self.connection.execute(
+                """
+                SELECT evidence_state FROM workflow_historical_applications
+                WHERE identity_key = ? OR canonical_url = ?
+                ORDER BY CASE evidence_state
+                    WHEN 'ambiguous_claim' THEN 0 ELSE 1 END
+                LIMIT 1
+                """,
+                ("url:" + canonical_url, canonical_url),
+            ).fetchone()
+            if historical is not None:
+                return "historical_" + str(historical["evidence_state"])
         legacy_path = self.path.parent / "applypilot.db"
         if not legacy_path.is_file():
             return ""
@@ -1951,6 +2057,11 @@ def _artifact_bundle_digest(paths: Any) -> str:
 
 def _request_id(run_id: str, candidate_id: str, mode: str, binding: str) -> str:
     return hashlib.sha256(f"{run_id}\0{candidate_id}\0{mode}\0{binding}".encode()).hexdigest()
+
+
+def _dry_run_binding(material_digest: str, generation: int) -> str:
+    """Keep generation-zero request ids compatible while supporting re-review."""
+    return material_digest if generation == 0 else f"{material_digest}:review-{generation}"
 
 
 def _sha256_text(value: str) -> str:

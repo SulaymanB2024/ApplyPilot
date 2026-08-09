@@ -47,6 +47,11 @@ campaign_app = typer.Typer(
     help="Durable, evidence-bound multi-application campaign state.",
     no_args_is_help=True,
 )
+campaign_run_app = typer.Typer(
+    name="campaign-run",
+    help="Canonical 30-receipt campaign controller for one replaceable goal worker.",
+    no_args_is_help=True,
+)
 opportunities_app = typer.Typer(
     name="opportunities",
     help="Evidence-bound startup opportunity research and outreach preparation.",
@@ -55,6 +60,7 @@ opportunities_app = typer.Typer(
 app.add_typer(improve_app, name="improve")
 app.add_typer(autonomy_app, name="autonomy")
 app.add_typer(campaign_app, name="campaign")
+app.add_typer(campaign_run_app, name="campaign-run")
 app.add_typer(opportunities_app, name="opportunities")
 console = Console()
 log = logging.getLogger(__name__)
@@ -1907,6 +1913,17 @@ def _workflow_fact_snapshot(
     return ledger.digest, profile
 
 
+def _campaign_run_fact_digest(store: WorkflowStore, run_id: str) -> str:
+    """Resolve and persist only the digest needed by the campaign controller."""
+    digest, profile = _confirmed_form_fact_snapshot(store, run_id)
+    store.reconcile_candidate_eligibility(
+        run_id=run_id,
+        profile=profile,
+        fact_digest=digest,
+    )
+    return digest
+
+
 @app.command()
 def run(
     stages: Optional[list[str]] = typer.Argument(
@@ -2728,6 +2745,312 @@ def autonomy_run(
     console.print_json(data=result)
     if result.get("status") not in {"review_ready", "no_eligible_verified_roles"}:
         raise typer.Exit(code=1)
+
+
+@campaign_run_app.command("start")
+def campaign_run_start(
+    campaign_id: str = typer.Option(
+        "second-mac-30-confirmed-202608",
+        "--campaign-id",
+        help="Canonical campaign identifier.",
+    ),
+    target: int = typer.Option(30, "--target", min=1),
+    review_size: int = typer.Option(5, "--review-size", min=1, max=5),
+    max_submissions: int = typer.Option(
+        3,
+        "--max-submissions",
+        min=1,
+        max=3,
+    ),
+    search_config: Optional[Path] = typer.Option(
+        None,
+        "--search-config",
+        help="Tiered searches.yaml; defaults to the active ApplyPilot config.",
+    ),
+    history_ledger: Optional[list[Path]] = typer.Option(
+        None,
+        "--history-ledger",
+        help="Prior receipt ledger to import. Repeatable; defaults to campaign Markdown ledgers.",
+    ),
+    include_run: Optional[list[str]] = typer.Option(
+        None,
+        "--include-run",
+        help="Existing canonical workflow run to enroll. Repeatable.",
+    ),
+) -> None:
+    """Create or idempotently reopen the host-bound canonical campaign."""
+    _bootstrap_config_only()
+    from applypilot import config
+    from applypilot.campaign_run import CampaignRunController
+    from applypilot.workflow import WorkflowStore
+
+    ledgers = list(
+        history_ledger
+        if history_ledger is not None
+        else sorted(config.CAMPAIGN_DIR.glob("*.md"))
+    )
+    try:
+        with WorkflowStore(config.APP_DIR / "workflow.sqlite3") as store:
+            controller = CampaignRunController(store, data_root=config.APP_DIR)
+            result = controller.start(
+                campaign_id=campaign_id,
+                target_confirmed=target,
+                review_size=review_size,
+                max_submissions=max_submissions,
+                search_config_path=search_config or config.SEARCH_CONFIG_PATH,
+                history_ledgers=ledgers,
+                include_runs=include_run or (),
+            )
+            console.print_json(data=result)
+    except Exception as exc:
+        console.print(
+            f"[red]Campaign start failed:[/red] {type(exc).__name__}: {str(exc)[:240]}"
+        )
+        raise typer.Exit(code=1) from exc
+
+
+@campaign_run_app.command("step")
+def campaign_run_step(
+    campaign_id: str = typer.Option(
+        "second-mac-30-confirmed-202608",
+        "--campaign-id",
+    ),
+    workflow_run_id: str = typer.Option(
+        "",
+        "--workflow-run-id",
+        help="Attach the workflow run created from the active discovery plan.",
+    ),
+) -> None:
+    """Perform exactly one idempotent campaign transition."""
+    _bootstrap_config_only()
+    from applypilot import config
+    from applypilot.campaign_run import CampaignRunController
+    from applypilot.workflow import WorkflowStore
+
+    try:
+        with WorkflowStore(config.APP_DIR / "workflow.sqlite3") as store:
+            controller = CampaignRunController(store, data_root=config.APP_DIR)
+            console.print_json(
+                data=controller.step(
+                    campaign_id=campaign_id,
+                    workflow_run_id=workflow_run_id,
+                    fact_digest_resolver=lambda run_id: _campaign_run_fact_digest(
+                        store,
+                        run_id,
+                    ),
+                )
+            )
+    except Exception as exc:
+        console.print(
+            f"[red]Campaign step failed:[/red] {type(exc).__name__}: {str(exc)[:240]}"
+        )
+        raise typer.Exit(code=1) from exc
+
+
+@campaign_run_app.command("status")
+def campaign_run_status(
+    campaign_id: str = typer.Option(
+        "second-mac-30-confirmed-202608",
+        "--campaign-id",
+    ),
+) -> None:
+    """Read canonical progress without acquiring the mutable-host lease."""
+    _bootstrap_config_only()
+    from applypilot import config
+    from applypilot.campaign_run import CampaignRunController
+
+    try:
+        console.print_json(
+            data=CampaignRunController.observe(
+                database_path=config.APP_DIR / "workflow.sqlite3",
+                data_root=config.APP_DIR,
+                campaign_id=campaign_id,
+            )
+        )
+    except Exception as exc:
+        console.print(
+            f"[red]Campaign status failed:[/red] {type(exc).__name__}: {str(exc)[:240]}"
+        )
+        raise typer.Exit(code=1) from exc
+
+
+@campaign_run_app.command("record-browser-result")
+def campaign_run_record_browser_result(
+    request: Path = typer.Option(
+        ...,
+        "--request",
+        help="Exact active browser request returned by campaign-run step.",
+    ),
+    status: str = typer.Option(..., "--status"),
+    campaign_id: str = typer.Option(
+        "second-mac-30-confirmed-202608",
+        "--campaign-id",
+    ),
+    evidence: Optional[list[Path]] = typer.Option(
+        None,
+        "--evidence",
+        help="Visible-browser evidence artifact. Repeatable.",
+    ),
+    detail: str = typer.Option("", "--detail"),
+    ats_family: str = typer.Option("", "--ats-family"),
+    confirmation_kind: str = typer.Option("", "--confirmation-kind"),
+    confirmation_text: str = typer.Option("", "--confirmation-text"),
+    performed_intervention: Optional[list[str]] = typer.Option(
+        None,
+        "--performed-intervention",
+    ),
+    accepted_confirmation_sha256: Optional[list[str]] = typer.Option(
+        None,
+        "--accepted-confirmation-sha256",
+    ),
+    auth_blocker_code: str = typer.Option("", "--auth-blocker-code"),
+    account_created_with_google_password_manager: bool = typer.Option(
+        False,
+        "--account-created-with-google-password-manager",
+    ),
+) -> None:
+    """Validate and durably import one active visible-browser result."""
+    _bootstrap_config_only()
+    from applypilot import config
+    from applypilot.campaign_run import CampaignRunController
+    from applypilot.workflow import WorkflowStore
+
+    try:
+        with WorkflowStore(config.APP_DIR / "workflow.sqlite3") as store:
+            controller = CampaignRunController(store, data_root=config.APP_DIR)
+            console.print_json(
+                data=controller.record_browser_result(
+                    campaign_id=campaign_id,
+                    request_path=request,
+                    status=status,
+                    evidence_paths=evidence or (),
+                    detail=detail,
+                    ats_family=ats_family,
+                    confirmation_kind=confirmation_kind,
+                    confirmation_text=confirmation_text,
+                    performed_interventions=performed_intervention or (),
+                    accepted_confirmation_sha256=accepted_confirmation_sha256 or (),
+                    auth_blocker_code=auth_blocker_code,
+                    account_created_with_google_password_manager=(
+                        account_created_with_google_password_manager
+                    ),
+                )
+            )
+    except Exception as exc:
+        console.print(
+            "[red]Browser result import failed:[/red] "
+            f"{type(exc).__name__}: {str(exc)[:240]}"
+        )
+        raise typer.Exit(code=1) from exc
+
+
+@campaign_run_app.command("review")
+def campaign_run_review(
+    packet_digest: str = typer.Option(..., "--packet-digest"),
+    approve: Optional[list[str]] = typer.Option(
+        None,
+        "--approve",
+        help="Approved RUN_ID/CANDIDATE_ID. Repeatable; maximum three total.",
+    ),
+    reject: Optional[list[str]] = typer.Option(
+        None,
+        "--reject",
+        help="Rejected RUN_ID/CANDIDATE_ID. Repeatable.",
+    ),
+    defer: Optional[list[str]] = typer.Option(
+        None,
+        "--defer",
+        help="Deferred RUN_ID/CANDIDATE_ID. Repeatable.",
+    ),
+    campaign_id: str = typer.Option(
+        "second-mac-30-confirmed-202608",
+        "--campaign-id",
+    ),
+    applicant_confirmation: Optional[list[str]] = typer.Option(
+        None,
+        "--applicant-confirmation",
+        help="Exact reviewed certification or privacy confirmation. Repeatable.",
+    ),
+) -> None:
+    """Record a newly authorized exhaustive decision for one five-role packet."""
+    _bootstrap_config_only()
+    from applypilot import config
+    from applypilot.campaign_run import CampaignRunController
+    from applypilot.workflow import WorkflowStore
+
+    try:
+        with WorkflowStore(config.APP_DIR / "workflow.sqlite3") as store:
+            controller = CampaignRunController(store, data_root=config.APP_DIR)
+            console.print_json(
+                data=controller.review(
+                    campaign_id=campaign_id,
+                    packet_digest=packet_digest,
+                    approve=approve or (),
+                    reject=reject or (),
+                    defer=defer or (),
+                    applicant_confirmations=applicant_confirmation or (),
+                    fact_digest_resolver=lambda run_id: _campaign_run_fact_digest(
+                        store,
+                        run_id,
+                    ),
+                )
+            )
+    except Exception as exc:
+        console.print(
+            f"[red]Campaign review failed:[/red] {type(exc).__name__}: {str(exc)[:240]}"
+        )
+        raise typer.Exit(code=1) from exc
+
+
+@campaign_run_app.command("pause")
+def campaign_run_pause(
+    campaign_id: str = typer.Option(
+        "second-mac-30-confirmed-202608",
+        "--campaign-id",
+    ),
+    reason: str = typer.Option("operator_requested", "--reason"),
+) -> None:
+    """Durably pause the campaign on its mutable host."""
+    _bootstrap_config_only()
+    from applypilot import config
+    from applypilot.campaign_run import CampaignRunController
+    from applypilot.workflow import WorkflowStore
+
+    try:
+        with WorkflowStore(config.APP_DIR / "workflow.sqlite3") as store:
+            controller = CampaignRunController(store, data_root=config.APP_DIR)
+            console.print_json(
+                data=controller.pause(campaign_id=campaign_id, reason=reason)
+            )
+    except Exception as exc:
+        console.print(
+            f"[red]Campaign pause failed:[/red] {type(exc).__name__}: {str(exc)[:240]}"
+        )
+        raise typer.Exit(code=1) from exc
+
+
+@campaign_run_app.command("resume")
+def campaign_run_resume(
+    campaign_id: str = typer.Option(
+        "second-mac-30-confirmed-202608",
+        "--campaign-id",
+    ),
+) -> None:
+    """Resume an explicitly paused campaign on its mutable host."""
+    _bootstrap_config_only()
+    from applypilot import config
+    from applypilot.campaign_run import CampaignRunController
+    from applypilot.workflow import WorkflowStore
+
+    try:
+        with WorkflowStore(config.APP_DIR / "workflow.sqlite3") as store:
+            controller = CampaignRunController(store, data_root=config.APP_DIR)
+            console.print_json(data=controller.resume(campaign_id=campaign_id))
+    except Exception as exc:
+        console.print(
+            f"[red]Campaign resume failed:[/red] {type(exc).__name__}: {str(exc)[:240]}"
+        )
+        raise typer.Exit(code=1) from exc
 
 
 @campaign_app.command("create")

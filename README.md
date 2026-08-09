@@ -48,8 +48,10 @@ applypilot execute --approval-id APPROVAL_ID
 
 See [the canonical workflow contract](docs/CANONICAL_WORKFLOW.md) for exact
 commands, browser handoffs, approval semantics, resumability, and evidence
-requirements. The older `run`, `apply`, `autonomy`, and `campaign` commands remain
-compatibility and diagnostic surfaces; they do not own new workflow state.
+requirements. For the bounded 30-receipt goal worker, see the
+[campaign goal operator runbook](docs/CAMPAIGN_GOAL_OPERATOR.md). The older
+`run`, `apply`, `autonomy`, and `campaign` commands remain compatibility and
+diagnostic surfaces; they do not own new workflow state.
 
 ---
 
@@ -273,6 +275,12 @@ applypilot workflow-status --run-id ID  # Inspect canonical state and shortlist
 applypilot dry-run --run-id ID [--no-autonomous-auth]
 applypilot approve --run-id ID --candidate CANDIDATE_ID [INTERVENTION OPTIONS]
 applypilot execute --approval-id ID      # Resume one approved submission at a time
+applypilot campaign-run start            # Bind the canonical 30-receipt campaign to this host
+applypilot campaign-run step             # Perform one durable state transition
+applypilot campaign-run status           # Read the compact canonical campaign status
+applypilot campaign-run record-browser-result --request PATH --status STATUS
+applypilot campaign-run review --packet-digest DIGEST [EXHAUSTIVE DECISIONS]
+applypilot campaign-run pause --reason REASON
 applypilot aggregate --query QUERY --term TERM --mode quick --watch
 applypilot aggregate-status --run-id ID --watch --json
 applypilot prepare --query QUERY --aggregation-snapshot RUN_ID@REVISION

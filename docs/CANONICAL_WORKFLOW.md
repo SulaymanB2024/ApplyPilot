@@ -232,6 +232,11 @@ approval or request for any reserved, unknown, or confirmed URL.
 Before each submission request, ApplyPilot rebuilds the current monotonic fact
 snapshot and refuses execution if it differs from the approved dry-run binding.
 
+For the bounded 30-receipt campaign, `applypilot campaign-run` adds a host-bound
+state machine, serialized browser jobs, five-candidate review packets, and
+compact replacement-task checkpoints to this same canonical database. See the
+[campaign goal operator runbook](CAMPAIGN_GOAL_OPERATOR.md).
+
 ## Compatibility commands
 
 `applypilot run`, `applypilot apply`, `applypilot autonomy`, and
